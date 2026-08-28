@@ -26,7 +26,7 @@ The button looks up the text that originally opened the dictionary popup, not a 
 
 Online results from both providers are merged and cached. US/UK and other regional labels are retained when the provider supplies enough information to identify them.
 
-Generated results never replace a sourced result. Generation is completely self-contained: it does not execute an external phonemizer, install native libraries, or depend on a platform-specific binary. A compact CMU Flite US-English letter-to-sound model is interpreted directly in Lua and handles arbitrary Latin-script spellings, including unfamiliar names and invented or fantasy words. These results are estimates—the spelling alone cannot reveal an author's intended pronunciation.
+Generated results never replace a sourced result. Generation is completely self-contained: it does not execute an external phonemizer, install native libraries, or depend on a platform-specific executable. Montreal Forced Aligner's weighted US-English ARPA G2P model is packaged in a compact format and interpreted directly in Lua. It handles arbitrary Latin-script spellings, including unfamiliar names and invented or fantasy words. These results are estimates—the spelling alone cannot reveal an author's intended pronunciation.
 
 In **Auto** mode, a word-specific language hint is preferred, followed by the current book's metadata language. If no matching portable backend is bundled, the final fallback is explicitly labeled US English. The generated-language menu contains only **Auto** and **US English**; choosing US English bypasses automatic language hints. Generated caches include this choice, so an estimate made in one book cannot leak into another language context.
 
@@ -40,11 +40,19 @@ The bundled generator is US English. Auto mode is retained so additional ordinar
 - Online readable spellings are generated from IPA and explicitly labeled `approx.`.
 - Automatically derived plurals, possessives, past forms, and gerunds are labeled as derived and receive a lower confidence score.
 - Spelling-to-IPA estimates are labeled `generated`, identify their language or region, and receive the lowest confidence scores.
-- The bundled US-English decision trees infer ARPABET first, preserving enough phone information for readable output and English inflection handling.
+- The bundled weighted US-English G2P graph infers ARPABET first, preserving enough phone information for readable output and English inflection handling.
 
 ## Install
 
-Copy this complete directory to:
+Build the minimal release archive from the repository root:
+
+```sh
+python3 tools/build_release.py
+```
+
+The deterministic archive contains only runtime files and required
+license/provenance material; tests, build inputs, and developer tools are
+excluded. Extract it so the device contains:
 
 ```text
 koreader/plugins/pronunciation.koplugin/
@@ -72,17 +80,20 @@ WikiPron inputs are repeatable: add another `--wikipron TSV CODE NAME` argument 
 
 ## Portable generated-pronunciation data
 
-The general out-of-vocabulary backend is `data/cmu_flite_lts.bin`, a compact re-encoding of CMU Flite's US-English letter-to-sound decision trees. It is data, not an executable, and the runtime interpreter is ordinary Lua compatible with old KOReader/Kindle builds.
+The general out-of-vocabulary backend is `data/mfa_english_g2p.bin`, a compact repacking of Montreal Forced Aligner's English US ARPA Pynini model. It is model data, not an executable. The shortest-path decoder is ordinary Lua and remains compatible with older KOReader/Kindle builds; Pynini, OpenFst, Python, and native libraries are needed only to rebuild the packaged data. The model index is loaded only after a generated lookup is needed, while graph arcs are read on demand to keep resident memory low.
 
-Rebuild it from the pinned upstream revision:
+Download the pinned official model release and rebuild it with Python's standard library:
 
 ```sh
-git clone https://github.com/festvox/flite.git /path/to/flite
-git -C /path/to/flite checkout 6c9f20dc915b17f5619340069889db0aa007fcdc
-python3 tools/build_lts_model.py --flite /path/to/flite
+curl -L \
+  https://github.com/MontrealCorpusTools/mfa-models/releases/download/g2p-english_us_arpa-v2.0.0/english_us_arpa.zip \
+  -o /path/to/english_us_arpa.zip
+python3 tools/build_g2p_model.py --model-archive /path/to/english_us_arpa.zip
 ```
 
-Input hashes, the exact revision, and the repeatable command are recorded in `data/cmu_flite_lts.SOURCE.txt`. A future language can be distributed as another compact model plus a language definition, or as a small reviewed rule module for languages with sufficiently regular spelling. It must include provenance, licensing, and regression fixtures.
+The exact release, input/output hashes, graph dimensions, format changes, and repeatable command are recorded in `data/mfa_english_g2p.SOURCE.txt`. A future language can be distributed as another compact model plus a language definition. It must include provenance, licensing, and regression fixtures.
+
+The pronunciation database also normalizes repeated source metadata and uses primary-key storage instead of redundant word indexes. Its public `pronunciations` view remains unchanged, so this packaging optimization does not alter records or runtime behavior.
 
 ## Validation
 
@@ -91,14 +102,15 @@ From the plugin directory:
 ```sh
 luajit tests/test_plugin.lua
 python3 tests/test_database.py
+python3 tools/build_release.py
 ```
 
-The Lua suite covers old/new button registration, query-word selection, saved-layout behavior, IPA-only inflection derivation, foreign-language derivation guards, readable generation, English-only IPA parsing, etymology hints, book-language routing, language-aware cache keys, single-connection offline lookup, and portable unfamiliar-word generation. The database suite also verifies the compact LTS model's format, provenance, hash, and size.
+The Lua suite covers old/new button registration, query-word selection, saved-layout behavior, IPA-only inflection derivation, foreign-language derivation guards, readable generation, English-only IPA parsing, etymology hints, book-language routing, language-aware cache keys, single-connection offline lookup, and portable unfamiliar-word generation. The database suite also verifies the compact G2P model's format, provenance, hash, dimensions, and size.
 
 ## Data licensing
 
-Plugin code is MIT licensed. CMUdict retains its BSD-3-Clause terms. WikiPron-derived records came from English Wiktionary and are distributed under CC BY-SA 4.0. The portable English decision trees and the adapted Lua interpreter retain CMU Flite's permissive license. Exact revisions, hashes, attribution, modifications, and applicable terms are recorded in `LICENSES.txt`, `data/cmu_flite_lts.SOURCE.txt`, and the database metadata.
+Plugin code is MIT licensed. CMUdict retains its BSD-3-Clause terms. WikiPron-derived records came from English Wiktionary and are distributed under CC BY-SA 4.0. Montreal Corpus Tools distributes the English US ARPA G2P model under CC BY 4.0; this plugin's custom packed representation remains under those terms. Exact releases, hashes, attribution, modifications, and applicable terms are recorded in `LICENSES.txt`, `data/mfa_english_g2p.SOURCE.txt`, and the database metadata.
 
 ## Limitations
 
-CMUdict and the portable LTS model are General American resources, and the currently bundled WikiPron addition is not a complete multilingual dictionary. Language selection uses a user preference, explicit bundled hints, Wiktionary etymology markup, or book metadata; none can determine an author's intended pronunciation for an invented name. Unsupported book languages fall back to a clearly labeled US-English adaptation. Generated IPA and readable spellings are aids, not authoritative transcriptions; leave **Generated fallback** disabled if only sourced results are desired.
+CMUdict and the portable G2P model are General American resources, and the currently bundled WikiPron addition is not a complete multilingual dictionary. Language selection uses a user preference, explicit bundled hints, Wiktionary etymology markup, or book metadata; none can determine an author's intended pronunciation for an invented name. Unsupported book languages fall back to a clearly labeled US-English adaptation. Generated IPA and readable spellings are aids, not authoritative transcriptions; leave **Generated fallback** disabled if only sourced results are desired.

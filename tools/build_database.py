@@ -250,19 +250,34 @@ def sha256(path: Path) -> str:
 
 
 SCHEMA = """
-CREATE TABLE pronunciations (
-    word TEXT NOT NULL,
-    ipa TEXT NOT NULL,
-    arpabet TEXT,
-    simple TEXT,
-    source TEXT NOT NULL,
-    confidence INTEGER NOT NULL DEFAULT 80,
+CREATE TABLE pronunciation_sources (
+    id INTEGER NOT NULL PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE
+) WITHOUT ROWID;
+CREATE TABLE pronunciation_profiles (
+    id INTEGER NOT NULL PRIMARY KEY,
+    source_id INTEGER NOT NULL,
+    confidence INTEGER NOT NULL,
     note TEXT,
     region TEXT,
-    simple_approx INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (word, ipa, source)
-);
-CREATE INDEX idx_pron_word ON pronunciations(word);
+    simple_approx INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE pronunciation_entries (
+    word TEXT NOT NULL,
+    ipa TEXT NOT NULL,
+    source_id INTEGER NOT NULL,
+    arpabet TEXT,
+    simple TEXT,
+    profile_id INTEGER NOT NULL,
+    PRIMARY KEY (word, ipa, source_id)
+) WITHOUT ROWID;
+CREATE VIEW pronunciations AS
+SELECT e.word, e.ipa, e.arpabet, e.simple, s.name AS source,
+       p.confidence, p.note, p.region, p.simple_approx
+  FROM pronunciation_entries AS e
+  JOIN pronunciation_sources AS s ON s.id = e.source_id
+  JOIN pronunciation_profiles AS p
+    ON p.id = e.profile_id AND p.source_id = e.source_id;
 CREATE TABLE language_hints (
     word TEXT NOT NULL,
     language_code TEXT NOT NULL,
@@ -270,11 +285,64 @@ CREATE TABLE language_hints (
     source TEXT NOT NULL,
     note TEXT,
     PRIMARY KEY (word, language_code, source)
-);
-CREATE INDEX idx_language_hint_word ON language_hints(word);
-CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-PRAGMA user_version = 4;
+) WITHOUT ROWID;
+CREATE TABLE metadata (
+    key TEXT NOT NULL PRIMARY KEY,
+    value TEXT NOT NULL
+) WITHOUT ROWID;
+PRAGMA user_version = 5;
 """
+
+
+def insert_pronunciations(
+    connection: sqlite3.Connection,
+    rows,
+    source_ids: dict[str, int],
+    profile_ids: dict[tuple, int],
+) -> int:
+    """Normalize repeated source metadata while streaming pronunciation rows."""
+    insert = """
+        INSERT OR IGNORE INTO pronunciation_entries
+            (word, ipa, source_id, arpabet, simple, profile_id)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """
+    batch = []
+    inserted = 0
+
+    def flush() -> None:
+        nonlocal inserted
+        if not batch:
+            return
+        cursor = connection.executemany(insert, batch)
+        inserted += max(cursor.rowcount, 0)
+        batch.clear()
+
+    for row in rows:
+        word, ipa, arpabet, simple, source, confidence, note, region, approx = row
+        source_id = source_ids.get(source)
+        if source_id is None:
+            source_id = len(source_ids) + 1
+            source_ids[source] = source_id
+            connection.execute(
+                "INSERT INTO pronunciation_sources(id, name) VALUES (?, ?)",
+                (source_id, source),
+            )
+
+        profile = (source_id, confidence, note, region, approx)
+        profile_id = profile_ids.get(profile)
+        if profile_id is None:
+            profile_id = len(profile_ids) + 1
+            profile_ids[profile] = profile_id
+            connection.execute(
+                "INSERT INTO pronunciation_profiles VALUES (?, ?, ?, ?, ?, ?)",
+                (profile_id, *profile),
+            )
+
+        batch.append((word, ipa, source_id, arpabet, simple, profile_id))
+        if len(batch) >= 5000:
+            flush()
+    flush()
+    return inserted
 
 
 def build_database(
@@ -296,21 +364,22 @@ def build_database(
         connection.execute("PRAGMA journal_mode=OFF")
         connection.execute("PRAGMA synchronous=OFF")
         connection.executescript(SCHEMA)
-        insert = """
-            INSERT OR IGNORE INTO pronunciations
-                (word, ipa, arpabet, simple, source, confidence, note,
-                 region, simple_approx)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """
-        connection.executemany(insert, parse_cmudict(cmudict))
-        connection.executemany(insert, parse_supplement(supplement))
+        source_ids: dict[str, int] = {}
+        profile_ids: dict[tuple, int] = {}
+        insert_pronunciations(
+            connection, parse_cmudict(cmudict), source_ids, profile_ids
+        )
+        insert_pronunciations(
+            connection, parse_supplement(supplement), source_ids, profile_ids
+        )
         wikipron_counts = {}
         for path, language_code, language_name in wikipron_sources:
-            before = connection.total_changes
-            connection.executemany(
-                insert, parse_wikipron(path, language_code, language_name)
+            wikipron_counts[language_code] = insert_pronunciations(
+                connection,
+                parse_wikipron(path, language_code, language_name),
+                source_ids,
+                profile_ids,
             )
-            wikipron_counts[language_code] = connection.total_changes - before
         connection.executemany(
             """
             INSERT OR IGNORE INTO language_hints
@@ -320,7 +389,7 @@ def build_database(
             parse_language_hints(language_hints),
         )
         headwords, records = connection.execute(
-            "SELECT COUNT(DISTINCT word), COUNT(*) FROM pronunciations"
+            "SELECT COUNT(DISTINCT word), COUNT(*) FROM pronunciation_entries"
         ).fetchone()
         metadata = {
             "name": "KOReader Pronunciation",
@@ -334,7 +403,7 @@ def build_database(
             "language_hints_sha256": sha256(language_hints),
             "headwords": str(headwords),
             "records": str(records),
-            "converter": "tools/build_database.py multilingual schema v2",
+            "converter": "tools/build_database.py compact profile schema v3",
         }
         if wikipron_sources:
             metadata.update({

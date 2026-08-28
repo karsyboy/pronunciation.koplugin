@@ -6,6 +6,8 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 import sys
+import tempfile
+import zipfile
 from pathlib import Path
 
 
@@ -13,7 +15,18 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(ROOT / "tools"))
 
-from build_database import arpabet_to_ipa, arpabet_to_readable  # noqa: E402
+from build_database import (  # noqa: E402
+    arpabet_to_ipa,
+    arpabet_to_readable,
+    build_database,
+)
+from build_release import (  # noqa: E402
+    DATABASE_SHA256,
+    G2P_SHA256,
+    PLUGIN_DIRECTORY,
+    RELEASE_FILES,
+    build_release,
+)
 
 
 def check_conversion() -> None:
@@ -29,14 +42,26 @@ def check_conversion() -> None:
 
 def check_database() -> None:
     database = ROOT / "data" / "pronunciations.sqlite3"
+    assert hashlib.sha256(database.read_bytes()).hexdigest() == DATABASE_SHA256
     connection = sqlite3.connect(database)
     try:
         assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         columns = {
             row[1] for row in connection.execute("PRAGMA table_info(pronunciations)")
         }
         assert {"region", "simple_approx"} <= columns
+        object_types = dict(connection.execute(
+            "SELECT name, type FROM sqlite_schema"
+        ))
+        assert object_types["pronunciations"] == "view"
+        assert object_types["pronunciation_entries"] == "table"
+        assert connection.execute(
+            "SELECT COUNT(*) FROM pronunciation_sources"
+        ).fetchone()[0] == 3
+        assert connection.execute(
+            "SELECT COUNT(*) FROM pronunciation_profiles"
+        ).fetchone()[0] == 7
         headwords, records = connection.execute(
             "SELECT COUNT(DISTINCT word), COUNT(*) FROM pronunciations"
         ).fetchone()
@@ -87,28 +112,89 @@ def check_database() -> None:
             "9e4301ed2f86e060a43fa8fb06f9b2590df284c9a54ed373bbae2d002a0bfac0"
         )
         assert metadata["wikipron_eus_records"] == "20058"
+        assert metadata["converter"] == (
+            "tools/build_database.py compact profile schema v3"
+        )
+        assert database.stat().st_size < 9_000_000
     finally:
         connection.close()
 
 
-def check_lts_model() -> None:
-    model = ROOT / "data" / "cmu_flite_lts.bin"
+def check_compact_database_build() -> None:
+    with tempfile.TemporaryDirectory(prefix="pronunciation-db-test-") as directory:
+        directory = Path(directory)
+        cmudict = directory / "cmudict.dict"
+        cmudict.write_text("cat K AE1 T\n", encoding="utf-8")
+        wikipron = directory / "eus.tsv"
+        wikipron.write_text("euskara\te u̯ s̺ k a ɾ a\n", encoding="utf-8")
+        output = directory / "pronunciations.sqlite3"
+        headwords, records = build_database(
+            cmudict,
+            ROOT / "data" / "supplemental.tsv",
+            ROOT / "data" / "language_hints.tsv",
+            [(wikipron, "eus", "Basque")],
+            output,
+            "test-cmudict-revision",
+            "test-wikipron-revision",
+        )
+        assert headwords > 2 and records > 2
+        connection = sqlite3.connect(output)
+        try:
+            assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+            assert connection.execute(
+                "SELECT ipa, arpabet, simple FROM pronunciations WHERE word='cat'"
+            ).fetchone() == ("/ˈkæt/", "K AE1 T", "KAT")
+            assert connection.execute(
+                "SELECT COUNT(*) FROM pronunciation_sources"
+            ).fetchone()[0] == 3
+            assert connection.execute(
+                "SELECT COUNT(*) FROM pronunciation_profiles"
+            ).fetchone()[0] == 7
+        finally:
+            connection.close()
+
+
+def check_g2p_model() -> None:
+    assert not (ROOT / "data" / "cmu_flite_lts.bin").exists()
+    assert not (ROOT / "data" / "cmu_flite_lts.SOURCE.txt").exists()
+    assert not (ROOT / "tools" / "build_lts_model.py").exists()
+    model = ROOT / "data" / "mfa_english_g2p.bin"
     data = model.read_bytes()
-    assert data[:8] == b"KPLTS1\0\0"
-    state_count = int.from_bytes(data[8:10], "little")
-    assert state_count == 25_505
-    assert data[10] == 26
-    assert data[11] == 75
-    assert len(data) < 200_000
-    assert hashlib.sha256(data).hexdigest() == (
-        "f2d7c39eee26212e34db62fc712f88365de5033fa7b4ade817bc27d3896aa2a1"
-    )
-    source = (ROOT / "data" / "cmu_flite_lts.SOURCE.txt").read_text()
-    assert "6c9f20dc915b17f5619340069889db0aa007fcdc" in source
+    assert data[:8] == b"KPG2P3\0\0"
+    assert int.from_bytes(data[8:12], "little") == 532_450
+    assert int.from_bytes(data[12:16], "little") == 1_450_681
+    assert int.from_bytes(data[16:20], "little") == 1
+    assert int.from_bytes(data[20:22], "little") == 1_024
+    assert data[22:26] == bytes((69, 2, 6, 0))
+    assert int.from_bytes(data[26:30], "little") == 81_768
+    assert len(data) == 10_011_830
+    assert hashlib.sha256(data).hexdigest() == G2P_SHA256
+    source = (ROOT / "data" / "mfa_english_g2p.SOURCE.txt").read_text()
+    assert "g2p-english_us_arpa-v2.0.0" in source
+    assert "f079ae88f792458fa7c123b256e5b86cc55c29ac2ffc457c673e6c60c36cd143" in source
+
+
+def check_release_build() -> None:
+    with tempfile.TemporaryDirectory(prefix="pronunciation-release-test-") as directory:
+        output = Path(directory) / "release.zip"
+        second_output = Path(directory) / "release-again.zip"
+        installed_size, archive_size = build_release(output)
+        build_release(second_output)
+        assert output.read_bytes() == second_output.read_bytes()
+        assert installed_size < 20_000_000
+        assert archive_size < installed_size
+        with zipfile.ZipFile(output) as archive:
+            assert archive.namelist() == [
+                f"{PLUGIN_DIRECTORY}/{relative}" for relative in RELEASE_FILES
+            ]
+            assert all("flite" not in name.lower() for name in archive.namelist())
 
 
 if __name__ == "__main__":
     check_conversion()
     check_database()
-    check_lts_model()
+    check_compact_database_build()
+    check_g2p_model()
+    check_release_build()
     print("database regression tests: OK")

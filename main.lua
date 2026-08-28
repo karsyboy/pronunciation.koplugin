@@ -1,24 +1,45 @@
 local DataStorage = require("datastorage")
-local InfoMessage = require("ui/widget/infomessage")
-local InputDialog = require("ui/widget/inputdialog")
-local JSON = require("json")
 local LuaSettings = require("luasettings")
-local NetworkMgr = require("ui/network/manager")
-local SQ3 = require("lua-ljsqlite3/init")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local DictQuickLookup = require("ui/widget/dictquicklookup")
 local logger = require("logger")
-local ltn12 = require("ltn12")
-local socket = require("socket")
-local http = require("socket.http")
-local socketutil = require("socketutil")
-local url = require("socket.url")
 local _ = require("gettext")
+
+-- Keep database, network, JSON, and dialog modules out of the plugin's startup
+-- footprint. They are loaded only when the corresponding feature is used.
+local InfoMessage, InputDialog, JSON, NetworkMgr, SQ3
+local ltn12, socket, http, socketutil, url
+
+local function sqliteModule()
+    if not SQ3 then SQ3 = require("lua-ljsqlite3/init") end
+    return SQ3
+end
+
+local function openDatabase(path)
+    return sqliteModule().open(path, "ro")
+end
+
+local function newInfoMessage(options)
+    if not InfoMessage then InfoMessage = require("ui/widget/infomessage") end
+    return InfoMessage:new(options)
+end
+
+local function loadOnlineModules()
+    if http then return end
+    JSON = require("json")
+    ltn12 = require("ltn12")
+    socket = require("socket")
+    http = require("socket.http")
+    socketutil = require("socketutil")
+    url = require("socket.url")
+end
 
 local PLUGIN_VERSION = "0.5.0"
 local CACHE_VERSION = 5
-local GENERATOR_VERSION = 1
+local GENERATOR_VERSION = 2
+local GENERATED_CACHE_LIMIT = 128
+local GENERATED_CACHE_PREFIX = "generator:" .. GENERATOR_VERSION .. "|"
 
 local Pronunciation = WidgetContainer:extend{
     name = "pronunciation",
@@ -30,9 +51,25 @@ local function trim(value)
     return value:gsub("^%s+", ""):gsub("%s+$", "")
 end
 
+local LATIN_LOWERCASE = {
+    ["À"] = "à", ["Á"] = "á", ["Â"] = "â", ["Ã"] = "ã",
+    ["Ä"] = "ä", ["Å"] = "å", ["Æ"] = "æ", ["Ç"] = "ç",
+    ["È"] = "è", ["É"] = "é", ["Ê"] = "ê", ["Ë"] = "ë",
+    ["Ì"] = "ì", ["Í"] = "í", ["Î"] = "î", ["Ï"] = "ï",
+    ["Ñ"] = "ñ", ["Ò"] = "ò", ["Ó"] = "ó", ["Ô"] = "ô",
+    ["Õ"] = "õ", ["Ö"] = "ö", ["Ø"] = "ø", ["Œ"] = "œ",
+    ["Ù"] = "ù", ["Ú"] = "ú", ["Û"] = "û", ["Ü"] = "ü",
+    ["Ý"] = "ý", ["Ÿ"] = "ÿ",
+}
+
 local function normalizeWord(word)
-    word = trim(word):lower():gsub("Ñ", "ñ"):gsub("Ü", "ü")
-        :gsub("‘", "'"):gsub("’", "'")
+    word = trim(word):lower()
+    if word:find("[\128-\255]") then
+        for upper, lower in pairs(LATIN_LOWERCASE) do
+            word = word:gsub(upper, lower)
+        end
+    end
+    word = word:gsub("‘", "'"):gsub("’", "'")
         :gsub("^“", ""):gsub("^”", ""):gsub("^«", ""):gsub("^»", "")
         :gsub("“$", ""):gsub("”$", ""):gsub("«$", ""):gsub("»$", "")
     return word:gsub("^[%p%s]+", ""):gsub("[%p%s]+$", "")
@@ -449,76 +486,166 @@ local function readLittleEndian16(data, position)
     return low + high * 256
 end
 
--- Portable US-English letter-to-sound inference. The model is a compact
--- re-encoding of CMU Flite's decision trees; this Lua interpreter is adapted
--- from Flite's cst_lts.c so KOReader never needs a native helper executable.
-function Pronunciation:_loadEnglishLtsModel()
-    if self.english_lts_model ~= nil then
-        return self.english_lts_model or nil
+local function readLittleEndian24(data, position)
+    local low, middle, high = data:byte(position, position + 2)
+    if not low or not middle or not high then return nil end
+    return low + middle * 256 + high * 65536
+end
+
+local function readLittleEndian32(data, position)
+    local low, middle_low, middle_high, high = data:byte(position, position + 3)
+    if not low or not middle_low or not middle_high or not high then return nil end
+    return low + middle_low * 256 + middle_high * 65536 + high * 16777216
+end
+
+local function readSignedLittleEndian16(data, position)
+    local value = readLittleEndian16(data, position)
+    if not value then return nil end
+    return value >= 32768 and value - 65536 or value
+end
+
+local G2P_HEADER_SIZE = 30
+local G2P_STATE_RECORD_SIZE = 2
+local G2P_ARC_RECORD_SIZE = 6
+local G2P_RANK_RECORD_SIZE = 3
+local G2P_INFINITE_FINAL = 65535
+local G2P_PACKED_LIMIT = 16777216
+local G2P_STATE_OFFSET_BLOCK = 256
+local G2P_FINAL_RANK_BLOCK = 256
+local G2P_MAX_WORD_BYTES = 64
+local G2P_MAX_RELAXATIONS = 500000
+
+local G2P_POPCOUNT = {}
+for value = 0, 255 do
+    local count = 0
+    local remaining = value
+    while remaining > 0 do
+        count = count + remaining % 2
+        remaining = math.floor(remaining / 2)
+    end
+    G2P_POPCOUNT[value] = count
+end
+
+-- Portable US-English inference from Montreal Forced Aligner's weighted
+-- Pynini G2P graph. The bundled graph is repacked into fixed-width records;
+-- this loader retains only its compact index and reads arc blocks on demand.
+function Pronunciation:_loadEnglishG2pModel()
+    if self.english_g2p_model ~= nil then
+        return self.english_g2p_model or nil
     end
     if not self.path then
-        self.english_lts_model = false
+        self.english_g2p_model = false
         return nil
     end
 
-    local handle = io.open(self.path .. "/data/cmu_flite_lts.bin", "rb")
+    local model_path = self.path .. "/data/mfa_english_g2p.bin"
+    local handle = io.open(model_path, "rb")
     if not handle then
-        self.english_lts_model = false
-        return nil
-    end
-    local data = handle:read("*all")
-    handle:close()
-
-    if data:sub(1, 8) ~= "KPLTS1\0\0" then
-        logger.warn("Pronunciation: invalid bundled English LTS model header")
-        self.english_lts_model = false
-        return nil
-    end
-    local position = 9
-    local state_count = readLittleEndian16(data, position)
-    local letter_count = data:byte(position + 2)
-    local phone_count = data:byte(position + 3)
-    position = position + 4
-    if not state_count or letter_count ~= 26 or not phone_count then
-        self.english_lts_model = false
+        self.english_g2p_model = false
         return nil
     end
 
-    local letter_index = {}
-    for index = 1, letter_count do
-        letter_index[index] = readLittleEndian16(data, position)
-        if not letter_index[index] then
-            self.english_lts_model = false
-            return nil
-        end
-        position = position + 2
+    local header = handle:read(G2P_HEADER_SIZE)
+    if not header or #header ~= G2P_HEADER_SIZE
+            or header:sub(1, 8) ~= "KPG2P3\0\0" then
+        handle:close()
+        logger.warn("Pronunciation: invalid bundled English G2P model header")
+        self.english_g2p_model = false
+        return nil
+    end
+
+    local state_count = readLittleEndian32(header, 9)
+    local arc_count = readLittleEndian32(header, 13)
+    local start_state = readLittleEndian32(header, 17)
+    local weight_scale = readLittleEndian16(header, 21)
+    local phone_count = header:byte(23)
+    local state_record_size = header:byte(24)
+    local arc_record_size = header:byte(25)
+    local final_count = readLittleEndian32(header, 27)
+    if not state_count or state_count == 0 or not arc_count or arc_count == 0
+            or state_count >= G2P_PACKED_LIMIT
+            or arc_count >= G2P_PACKED_LIMIT
+            or not start_state or start_state >= state_count
+            or not weight_scale or weight_scale == 0 or not phone_count
+            or phone_count == 0
+            or state_record_size ~= G2P_STATE_RECORD_SIZE
+            or arc_record_size ~= G2P_ARC_RECORD_SIZE
+            or header:byte(26) ~= 0
+            or not final_count or final_count > state_count then
+        handle:close()
+        logger.warn("Pronunciation: unsupported bundled English G2P model")
+        self.english_g2p_model = false
+        return nil
     end
 
     local phone_table = {}
     for index = 1, phone_count do
-        local length = data:byte(position)
-        if not length then
-            self.english_lts_model = false
+        local length_data = handle:read(1)
+        local length = length_data and length_data:byte(1)
+        local phone = length and handle:read(length)
+        if not phone or #phone ~= length or not phone:match("^[A-Z]+[012]?$") then
+            handle:close()
+            logger.warn("Pronunciation: invalid English G2P phone table")
+            self.english_g2p_model = false
             return nil
         end
-        position = position + 1
-        phone_table[index] = data:sub(position, position + length - 1)
-        position = position + length
+        phone_table[index] = phone
     end
-    if #data - position + 1 ~= state_count * 6 then
-        logger.warn("Pronunciation: bundled English LTS model is truncated")
-        self.english_lts_model = false
+
+    local state_offset_base_count = math.floor(
+        state_count / G2P_STATE_OFFSET_BLOCK) + 1
+    local state_offset_bases = handle:read(
+        state_offset_base_count * 3)
+    local state_offset_deltas = handle:read(
+        (state_count + 1) * state_record_size)
+    local final_bitmap_size = math.floor((state_count + 7) / 8)
+    local final_bitmap = handle:read(final_bitmap_size)
+    local final_rank_count = math.floor(
+        (state_count + G2P_FINAL_RANK_BLOCK - 1) / G2P_FINAL_RANK_BLOCK) + 1
+    local final_ranks = handle:read(final_rank_count * G2P_RANK_RECORD_SIZE)
+    local final_weights = handle:read(final_count * 2)
+    local arc_table_offset = handle:seek()
+    local file_size = handle:seek("end")
+    handle:close()
+    local final_state_offset_base = state_offset_bases and readLittleEndian24(
+        state_offset_bases, (state_offset_base_count - 1) * 3 + 1)
+    local final_state_offset_delta = state_offset_deltas and readLittleEndian16(
+        state_offset_deltas, state_count * state_record_size + 1)
+    if not state_offset_bases
+            or #state_offset_bases ~= state_offset_base_count * 3
+            or not state_offset_deltas
+            or #state_offset_deltas ~= (state_count + 1) * state_record_size
+            or not final_bitmap or #final_bitmap ~= final_bitmap_size
+            or not final_ranks
+            or #final_ranks ~= final_rank_count * G2P_RANK_RECORD_SIZE
+            or not final_weights or #final_weights ~= final_count * 2
+            or not arc_table_offset or not file_size
+            or file_size ~= arc_table_offset + arc_count * arc_record_size
+            or not final_state_offset_base or not final_state_offset_delta
+            or final_state_offset_base + final_state_offset_delta ~= arc_count
+            or readLittleEndian24(final_ranks,
+                (final_rank_count - 1) * G2P_RANK_RECORD_SIZE + 1)
+                ~= final_count then
+        logger.warn("Pronunciation: bundled English G2P model is truncated")
+        self.english_g2p_model = false
         return nil
     end
 
-    self.english_lts_model = {
-        data = data,
+    self.english_g2p_model = {
+        path = model_path,
+        state_offset_bases = state_offset_bases,
+        state_offset_deltas = state_offset_deltas,
+        final_bitmap = final_bitmap,
+        final_ranks = final_ranks,
+        final_weights = final_weights,
         state_count = state_count,
-        letter_index = letter_index,
+        arc_count = arc_count,
+        start_state = start_state,
+        weight_scale = weight_scale,
         phone_table = phone_table,
-        model_start = position,
+        arc_table_offset = arc_table_offset,
     }
-    return self.english_lts_model
+    return self.english_g2p_model
 end
 
 local LATIN_ASCII_FOLD = {
@@ -541,7 +668,9 @@ local function foldEnglishSpelling(word)
             output[#output + 1] = character
         elseif LATIN_ASCII_FOLD[character] then
             output[#output + 1] = LATIN_ASCII_FOLD[character]
-        elseif character ~= "'" and character ~= "-" and character ~= " " then
+        elseif character == "'" then
+            output[#output + 1] = character
+        elseif character ~= "-" and character ~= " " then
             return nil
         end
         position = position + #character
@@ -550,63 +679,195 @@ local function foldEnglishSpelling(word)
     return folded ~= "" and folded or nil
 end
 
-local function flitePhoneToArpabet(phone)
-    local base, stress = phone:match("^([a-z]+)([012]?)$")
-    if not base then return nil end
-    if base == "ax" then base = "ah" end
-    return base:upper() .. stress
-end
-
-function Pronunciation:_englishLtsPhones(word)
-    local model = self:_loadEnglishLtsModel()
+function Pronunciation:_englishG2pPhones(word)
+    local model = self:_loadEnglishG2pModel()
     local spelling = foldEnglishSpelling(word)
-    if not model or not spelling then return nil end
+    if not model or not spelling or #spelling > G2P_MAX_WORD_BYTES then return nil end
 
-    local full = "000#" .. spelling .. "#000"
-    local output = {}
-    for letter_position = 1, #spelling do
-        local full_position = 4 + letter_position
-        local features = full:sub(full_position - 4, full_position - 1)
-            .. full:sub(full_position + 1, full_position + 4)
-        local letter = spelling:byte(letter_position) - string.byte("a") + 1
-        local state = model.letter_index[letter]
-        local steps = 0
-        local generated_phone
-        while state and state < model.state_count and steps <= model.state_count do
-            local offset = model.model_start + state * 6
-            local feature = model.data:byte(offset)
-            local value = model.data:byte(offset + 1)
-            if feature == 255 then
-                generated_phone = model.phone_table[value + 1]
-                break
-            end
-            local on_true = readLittleEndian16(model.data, offset + 2)
-            local on_false = readLittleEndian16(model.data, offset + 4)
-            state = features:byte(feature + 1) == value and on_true or on_false
-            steps = steps + 1
+    local handle = io.open(model.path, "rb")
+    if not handle then return nil end
+    local arc_cache = {}
+    local decode_failed = false
+
+    local function stateOffset(state)
+        local block = math.floor(state / G2P_STATE_OFFSET_BLOCK)
+        local base = readLittleEndian24(
+            model.state_offset_bases, block * 3 + 1)
+        local delta = readLittleEndian16(
+            model.state_offset_deltas, state * G2P_STATE_RECORD_SIZE + 1)
+        if not base or not delta then return nil end
+        return base + delta
+    end
+
+    local function stateInfo(state, need_final_weight)
+        if state < 0 or state >= model.state_count then
+            decode_failed = true
+            return
         end
-        if not generated_phone then return nil end
-        if generated_phone ~= "epsilon" then
-            for part in generated_phone:gmatch("[^-]+") do
-                local arpabet = flitePhoneToArpabet(part)
-                if not arpabet then return nil end
-                output[#output + 1] = arpabet
+        local first_arc = stateOffset(state)
+        local next_arc = stateOffset(state + 1)
+        if not first_arc or not next_arc or next_arc < first_arc then
+            decode_failed = true
+            return
+        end
+
+        local final_weight = G2P_INFINITE_FINAL
+        if need_final_weight then
+            local byte_position = math.floor(state / 8) + 1
+            local bit_position = state % 8
+            local byte = model.final_bitmap:byte(byte_position)
+            local bit_value = 2 ^ bit_position
+            if math.floor(byte / bit_value) % 2 == 1 then
+                local block = math.floor(state / G2P_FINAL_RANK_BLOCK)
+                local rank = readLittleEndian24(
+                    model.final_ranks, block * G2P_RANK_RECORD_SIZE + 1)
+                local first_byte = block * (G2P_FINAL_RANK_BLOCK / 8) + 1
+                for index = first_byte, byte_position - 1 do
+                    rank = rank + G2P_POPCOUNT[model.final_bitmap:byte(index)]
+                end
+                rank = rank + G2P_POPCOUNT[byte % bit_value]
+                final_weight = readLittleEndian16(
+                    model.final_weights, rank * 2 + 1)
+                if not final_weight then
+                    decode_failed = true
+                    return
+                end
+            end
+        end
+        return first_arc, next_arc - first_arc, final_weight
+    end
+
+    local function stateArcs(state, first_arc, arc_count)
+        local cached = arc_cache[state]
+        if cached then return cached end
+        if not first_arc or not arc_count
+                or first_arc + arc_count > model.arc_count
+                or not handle:seek("set", model.arc_table_offset
+                    + first_arc * G2P_ARC_RECORD_SIZE) then
+            decode_failed = true
+            return
+        end
+        local data = handle:read(arc_count * G2P_ARC_RECORD_SIZE)
+        if not data or #data ~= arc_count * G2P_ARC_RECORD_SIZE then
+            decode_failed = true
+            return
+        end
+        arc_cache[state] = data
+        return data
+    end
+
+    local start_key = model.start_state
+    local distances = { [start_key] = 0 }
+    local predecessors = {}
+    local queue = { [1] = start_key }
+    local queued = { [start_key] = true }
+    local head, tail = 1, 1
+    local relaxations = 0
+    local best_cost
+    local best_key
+
+    while head <= tail and not decode_failed do
+        local key = queue[head]
+        queue[head] = nil
+        head = head + 1
+        queued[key] = nil
+
+        local state = key % model.state_count
+        local input_position = (key - state) / model.state_count
+        local cost = distances[key]
+        local at_end = input_position == #spelling
+        local first_arc, arc_count, final_weight = stateInfo(state, at_end)
+        if decode_failed then break end
+
+        if at_end and final_weight ~= G2P_INFINITE_FINAL then
+            local total_cost = cost + final_weight
+            if not best_cost or total_cost < best_cost then
+                best_cost = total_cost
+                best_key = key
+            end
+        end
+
+        local arcs = stateArcs(state, first_arc, arc_count)
+        if decode_failed then break end
+        local wanted = spelling:byte(input_position + 1)
+        for position = 1, #arcs, G2P_ARC_RECORD_SIZE do
+            local packed_input = arcs:byte(position)
+            local input_code = packed_input % 32
+            local input_label = input_code == 0 and 0
+                or (input_code == 1 and 39 or input_code + 95)
+            if input_label == 0 or input_label == wanted then
+                local packed_output = arcs:byte(position + 1)
+                local output_label = packed_output % 128
+                local weight = readSignedLittleEndian16(arcs, position + 2)
+                local next_state_low = readLittleEndian16(arcs, position + 4)
+                local next_state = next_state_low and next_state_low
+                    + (math.floor(packed_input / 32)
+                        + math.floor(packed_output / 128) * 8) * 65536
+                if not weight or not next_state
+                        or next_state >= model.state_count
+                        or output_label > #model.phone_table then
+                    decode_failed = true
+                    break
+                end
+                local next_input_position = input_position
+                    + (input_label == 0 and 0 or 1)
+                local next_key = next_input_position * model.state_count
+                    + next_state
+                local next_cost = cost + weight
+                local old_cost = distances[next_key]
+                if not old_cost or next_cost < old_cost then
+                    distances[next_key] = next_cost
+                    predecessors[next_key] = key * 128 + output_label
+                    relaxations = relaxations + 1
+                    if relaxations > G2P_MAX_RELAXATIONS then
+                        logger.warn("Pronunciation: English G2P decode limit exceeded")
+                        decode_failed = true
+                        break
+                    end
+                    if not queued[next_key] then
+                        tail = tail + 1
+                        queue[tail] = next_key
+                        queued[next_key] = true
+                    end
+                end
             end
         end
     end
-    return #output > 0 and output or nil
+    handle:close()
+    if decode_failed or not best_key then return nil end
+
+    local output = {}
+    local key = best_key
+    local path_steps = 0
+    while key ~= start_key do
+        local packed = predecessors[key]
+        if not packed then return nil end
+        local output_label = packed % 128
+        if output_label ~= 0 then
+            output[#output + 1] = model.phone_table[output_label]
+        end
+        key = math.floor(packed / 128)
+        path_steps = path_steps + 1
+        if path_steps > G2P_MAX_RELAXATIONS then return nil end
+    end
+    if #output == 0 then return nil end
+    for left = 1, math.floor(#output / 2) do
+        local right = #output - left + 1
+        output[left], output[right] = output[right], output[left]
+    end
+    return output
 end
 
 local PORTABLE_GENERATORS = {
     en = function(plugin, word)
-        local phones = plugin:_englishLtsPhones(word)
+        local phones = plugin:_englishG2pPhones(word)
         if not phones then return nil end
         return {
             ipa = arpabetPhonesToIpa(phones),
             arpabet = table.concat(phones, " "),
-            source = "Bundled CMU Flite letter-to-sound model (generated)",
-            confidence = 40,
-            note = "Portable US English spelling-to-pronunciation estimate; invented names may have another intended pronunciation.",
+            source = "Bundled MFA/Pynini English G2P model (generated)",
+            confidence = 45,
+            note = "Portable weighted US English spelling-to-pronunciation estimate; invented names may have another intended pronunciation.",
         }
     end,
 }
@@ -701,12 +962,41 @@ function Pronunciation:generationCacheKey(word, hints)
         .. "|word:" .. normalizeWord(word)
 end
 
+local function pruneGeneratedCache(cache, protected_key)
+    if type(cache) ~= "table" then return false end
+    local count = 0
+    local changed = false
+    for key in pairs(cache or {}) do
+        if type(key) ~= "string"
+                or key:sub(1, #GENERATED_CACHE_PREFIX)
+                    ~= GENERATED_CACHE_PREFIX then
+            cache[key] = nil
+            changed = true
+        else
+            count = count + 1
+        end
+    end
+    if count <= GENERATED_CACHE_LIMIT then return changed end
+    for key in pairs(cache) do
+        if count <= GENERATED_CACHE_LIMIT then break end
+        if key ~= protected_key then
+            cache[key] = nil
+            count = count - 1
+            changed = true
+        end
+    end
+    return changed
+end
+
 function Pronunciation:init()
     self.db_path = self.path .. "/data/pronunciations.sqlite3"
     self.settings = LuaSettings:open(DataStorage:getSettingsDir() .. "/pronunciation.lua")
     self.overrides = self.settings:readSetting("overrides", {})
     self.cache = self.settings:readSetting("cache", {})
     self.generated_cache = self.settings:readSetting("generated_cache", {})
+    if type(self.overrides) ~= "table" then self.overrides = {} end
+    if type(self.cache) ~= "table" then self.cache = {} end
+    if type(self.generated_cache) ~= "table" then self.generated_cache = {} end
     self.online_fallback = self.settings:readSetting("online_fallback", true)
     self.generated_fallback = self.settings:readSetting("generated_fallback", true)
     self.generated_language = self.settings:readSetting("generated_language", "auto")
@@ -725,6 +1015,11 @@ function Pronunciation:init()
         self.settings:saveSetting("cache", self.cache)
         self.settings:saveSetting("generated_cache", self.generated_cache)
         self.settings:saveSetting("cache_version", CACHE_VERSION)
+        self.settings:flush()
+    elseif pruneGeneratedCache(self.generated_cache) then
+        -- Old generator formats are never reused, and generated entries can
+        -- always be recreated offline. Keep their startup footprint bounded.
+        self.settings:saveSetting("generated_cache", self.generated_cache)
         self.settings:flush()
     end
 
@@ -891,8 +1186,8 @@ function Pronunciation:addToMainMenu(menu_items)
             {
                 text = _("About pronunciation dictionary"),
                 callback = function()
-                    UIManager:show(InfoMessage:new{
-                        text = _("Offline CMUdict and multilingual WikiPron IPA data, a portable US English letter-to-sound model for unfamiliar and invented words, language-aware generated fallbacks, local learning, and personal overrides. Long-press Pronunciation to save an override.")
+                    UIManager:show(newInfoMessage{
+                        text = _("Offline CMUdict and multilingual WikiPron IPA data, a portable weighted US English G2P model for unfamiliar and invented words, language-aware generated fallbacks, local learning, and personal overrides. Long-press Pronunciation to save an override.")
                             .. "\n\n" .. _("Version") .. ": " .. PLUGIN_VERSION,
                     })
                 end,
@@ -935,16 +1230,35 @@ local function closeSqlResource(resource)
     if resource then pcall(function() resource:close() end) end
 end
 
-function Pronunciation:_queryConnection(connection, word)
-    local statement
+local function boldHeading(text)
+    -- TextBoxWidget's inline-bold markers were added after the oldest KOReader
+    -- versions supported by this plugin. Use them when available and degrade
+    -- to an unchanged plain heading on older builds.
+    local ok, TextBoxWidget = pcall(require, "ui/widget/textboxwidget")
+    if not ok or not TextBoxWidget.PTF_HEADER
+            or not TextBoxWidget.PTF_BOLD_START
+            or not TextBoxWidget.PTF_BOLD_END then
+        return text
+    end
+    return TextBoxWidget.PTF_HEADER .. TextBoxWidget.PTF_BOLD_START
+        .. text .. TextBoxWidget.PTF_BOLD_END
+end
+
+local PRONUNCIATION_QUERY = [[
+    SELECT ipa, arpabet, simple, source, confidence, note,
+           region, simple_approx
+      FROM pronunciations
+     WHERE word = ?
+  ORDER BY confidence DESC, source, region, ipa
+]]
+
+function Pronunciation:_queryConnection(connection, word, statement)
     local ok, results = pcall(function()
-        statement = connection:prepare([[
-            SELECT ipa, arpabet, simple, source, confidence, note,
-                   region, simple_approx
-              FROM pronunciations
-             WHERE word = ?
-          ORDER BY confidence DESC, source, region, ipa
-        ]])
+        if statement then
+            statement:reset()
+        else
+            statement = connection:prepare(PRONUNCIATION_QUERY)
+        end
         statement:bind(word)
         local rows = {}
         while true do
@@ -965,9 +1279,9 @@ function Pronunciation:_queryConnection(connection, word)
         end
         return rows
     end)
-    closeSqlResource(statement)
     if not ok then
-        return nil, results
+        closeSqlResource(statement)
+        return nil, results, nil
     end
     if #results > 0 then
         ensureReadables(results)
@@ -979,18 +1293,20 @@ function Pronunciation:_queryConnection(connection, word)
                 english[#english + 1] = result
             end
         end
-        return #english > 0 and english or results
+        return #english > 0 and english or results, nil, statement
     end
+    return nil, nil, statement
 end
 
 function Pronunciation:query(word)
-    local opened, connection = pcall(SQ3.open, self.db_path)
+    local opened, connection = pcall(openDatabase, self.db_path)
     if not opened or not connection then
         logger.err("Pronunciation: database open failed:", connection)
         return nil
     end
-    local results, query_error = self:_queryConnection(connection,
+    local results, query_error, statement = self:_queryConnection(connection,
         normalizeWord(word))
+    closeSqlResource(statement)
     closeSqlResource(connection)
     if query_error then
         logger.err("Pronunciation: database lookup failed:", query_error)
@@ -1002,7 +1318,7 @@ function Pronunciation:queryLanguageHints(word)
     local connection
     local statement
     local ok, results = pcall(function()
-        connection = SQ3.open(self.db_path)
+        connection = openDatabase(self.db_path)
         statement = connection:prepare([[
             SELECT language_code, language_name, source, note
               FROM language_hints
@@ -1187,23 +1503,33 @@ function Pronunciation:lookupOffline(word)
     -- Reuse one SQLite connection while checking the exact word and all
     -- possible inflection bases. Opening the bundled database repeatedly is
     -- noticeably expensive on low-memory e-ink devices.
-    local opened, connection = pcall(SQ3.open, self.db_path)
+    local opened, connection = pcall(openDatabase, self.db_path)
     if not opened then
         logger.err("Pronunciation: database open failed:", connection)
         connection = nil
     end
+    local statement
     local function queryDatabase(candidate_word)
         if not connection then return nil end
-        local rows, query_error = self:_queryConnection(connection,
-            candidate_word)
+        local rows, query_error, reusable_statement = self:_queryConnection(
+            connection, candidate_word, statement)
+        if reusable_statement then
+            statement = reusable_statement
+        elseif query_error then
+            statement = nil
+        end
         if query_error then
             logger.err("Pronunciation: database lookup failed:", query_error)
+            closeSqlResource(statement)
+            statement = nil
             closeSqlResource(connection)
             connection = nil
         end
         return rows
     end
     local function finish(found, matched)
+        closeSqlResource(statement)
+        statement = nil
         closeSqlResource(connection)
         connection = nil
         return found, matched
@@ -1227,6 +1553,7 @@ function Pronunciation:lookupOffline(word)
 end
 
 local function httpGet(request_url)
+    loadOnlineModules()
     local sink = {}
     socketutil:set_timeout()
     local ok, code, headers, status = pcall(function()
@@ -1373,6 +1700,7 @@ function Pronunciation:parseDictionaryApi(decoded)
 end
 
 function Pronunciation:dictApi(word)
+    loadOnlineModules()
     local body = httpGet("https://api.dictionaryapi.dev/api/v2/entries/en/"
         .. url.escape(word))
     if not body then return nil end
@@ -1463,6 +1791,7 @@ function Pronunciation:parseWiktionaryHtml(html)
 end
 
 function Pronunciation:wiktionary(word)
+    loadOnlineModules()
     local body = httpGet("https://en.wiktionary.org/w/api.php"
         .. "?action=parse&format=json&formatversion=2&redirects=1&prop=text&page="
         .. url.escape(word))
@@ -1500,13 +1829,14 @@ end
 function Pronunciation:saveGeneratedCache(key, results)
     self.generated_cache = self.generated_cache or {}
     self.generated_cache[key] = results
+    pruneGeneratedCache(self.generated_cache, key)
     self.settings:saveSetting("generated_cache", self.generated_cache)
     self.settings:saveSetting("cache_version", CACHE_VERSION)
     self.settings:flush()
 end
 
 function Pronunciation:format(original, results, matched)
-    local lines = { original }
+    local lines = { boldHeading(original) }
     if matched and normalizeWord(original) ~= matched then
         lines[#lines + 1] = "Matched/derived from: " .. matched
     end
@@ -1532,7 +1862,6 @@ function Pronunciation:format(original, results, matched)
         if result.confidence then
             lines[#lines + 1] = "Confidence: " .. result.confidence .. "/100"
         end
-        if result.note and result.note ~= "" then lines[#lines + 1] = result.note end
         if index < #results then lines[#lines + 1] = "" end
     end
     return table.concat(lines, "\n")
@@ -1554,24 +1883,25 @@ function Pronunciation:lookupAndShow(word)
     if word == "" then return end
     local results, matched = self:lookupOffline(word)
     if results then
-        UIManager:show(InfoMessage:new{ text = self:format(word, results, matched) })
+        UIManager:show(newInfoMessage{ text = self:format(word, results, matched) })
         return
     end
     if not self.online_fallback then
         local generated = self:generatedForWord(normalizeWord(word))
         if generated then
-            UIManager:show(InfoMessage:new{
+            UIManager:show(newInfoMessage{
                 text = self:format(word, generated, normalizeWord(word)),
             })
             return
         end
-        UIManager:show(InfoMessage:new{
+        UIManager:show(newInfoMessage{
             text = word .. "\n\nNo offline pronunciation found. "
                 .. "Long-press Pronunciation to add a personal override.",
         })
         return
     end
 
+    if not NetworkMgr then NetworkMgr = require("ui/network/manager") end
     NetworkMgr:runWhenOnline(function()
         local normalized = normalizeWord(word)
         local online, language_hints = self:lookupOnline(normalized)
@@ -1588,17 +1918,17 @@ function Pronunciation:lookupAndShow(word)
         end
         if online then
             self:saveCache(normalized, online)
-            UIManager:show(InfoMessage:new{
+            UIManager:show(newInfoMessage{
                 text = self:format(word, online, online_match),
             })
         else
             local generated = self:generatedForWord(normalized, language_hints)
             if generated then
-                UIManager:show(InfoMessage:new{
+                UIManager:show(newInfoMessage{
                     text = self:format(word, generated, normalized),
                 })
             else
-                UIManager:show(InfoMessage:new{
+                UIManager:show(newInfoMessage{
                     text = word .. "\n\nNo pronunciation found offline or online. "
                         .. "Long-press Pronunciation to save your own IPA/readable pronunciation.",
                 })
@@ -1612,6 +1942,7 @@ function Pronunciation:editOverride(word)
     if word == "" then return end
     local existing = self.overrides[word] or {}
     local dialog
+    if not InputDialog then InputDialog = require("ui/widget/inputdialog") end
     dialog = InputDialog:new{
         title = "Pronunciation override: " .. word,
         input = (existing.ipa or "") .. "\n" .. (existing.simple or ""),

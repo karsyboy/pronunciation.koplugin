@@ -1,0 +1,59 @@
+Montreal Forced Aligner English US ARPA G2P model
+=================================================
+
+Publisher: Montreal Corpus Tools
+Model catalog: https://mfa-models.readthedocs.io/en/latest/g2p/English/index.html
+Release tag: g2p-english_us_arpa-v2.0.0
+Release archive:
+  https://github.com/MontrealCorpusTools/mfa-models/releases/download/g2p-english_us_arpa-v2.0.0/english_us_arpa.zip
+Archive SHA-256:
+  f079ae88f792458fa7c123b256e5b86cc55c29ac2ffc457c673e6c60c36cd143
+Archive size: 10,988,515 bytes
+License: Creative Commons Attribution 4.0 International (CC BY 4.0)
+  https://creativecommons.org/licenses/by/4.0/
+
+Upstream metadata
+-----------------
+
+Architecture: Pynini
+Training date: 2022-03-25
+Training words: 179,873
+Graphemes: 29
+Phones: 69
+Reported evaluation words: 19,985
+Reported word error rate: 21.260945709281962%
+Reported phone error rate: 46.67957820369334%
+Original model.fst size: 29,600,362 bytes
+
+Packaged representation
+-----------------------
+
+The release archive's OpenFst vector graph was converted to compact,
+little-endian records for a dependency-free Lua decoder. State arc counts are
+derived from block bases plus 16-bit deltas; final states use a bitmap, rank
+index, and dense weight array; and the high bits of destination states occupy
+unused label bits.
+Floating-point tropical weights were rounded to signed integers at 1/1024
+precision. Graph topology, input/output labels, final states, weights, and
+shortest-path semantics were retained. Pynini, OpenFst, Python, native code,
+and speech-synthesis assets are not distributed or required on the KOReader
+device.
+
+Output: data/mfa_english_g2p.bin
+Output size: 10,011,830 bytes
+Output SHA-256:
+  9b4d3730a451c530da2a81f2c378a9e4635ec706e14f43d22fee945effd17f84
+States: 532,450
+Arcs: 1,450,681
+Final states: 81,768
+
+Repeatable conversion
+---------------------
+
+  python3 tools/build_g2p_model.py \
+    --model-archive /path/to/english_us_arpa.zip
+
+The converter uses only the Python standard library. The custom packer and
+Lua decoder are original plugin code under the plugin's MIT license. The
+converted model remains attributed to Montreal Corpus Tools and distributed
+under CC BY 4.0; modifications are described above and in LICENSES.txt.

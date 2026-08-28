@@ -14,6 +14,12 @@ local NetworkMgr = {
 preload("datastorage", {})
 preload("ui/widget/infomessage", { new = function(_, value) return value end })
 preload("ui/widget/inputdialog", { new = function(_, value) return value end })
+local TextBoxWidget = {
+    PTF_HEADER = "<formatted>",
+    PTF_BOLD_START = "<bold>",
+    PTF_BOLD_END = "</bold>",
+}
+preload("ui/widget/textboxwidget", TextBoxWidget)
 preload("json", { decode = function() return {} end })
 preload("luasettings", {})
 preload("ui/network/manager", NetworkMgr)
@@ -44,6 +50,13 @@ preload("gettext", function(value) return value end)
 local Plugin = dofile("main.lua")
 Plugin.path = "."
 Plugin.generated_fallback = true
+
+-- Heavy feature modules stay out of the startup path on memory-limited devices.
+assert(package.loaded["json"] == nil, "JSON was loaded during plugin startup")
+assert(package.loaded["lua-ljsqlite3/init"] == nil,
+    "SQLite was loaded during plugin startup")
+assert(package.loaded["socket.http"] == nil,
+    "HTTP was loaded during plugin startup")
 
 local function equal(actual, expected, message)
     if actual ~= expected then
@@ -159,7 +172,7 @@ equal(Plugin:readableFromIpa("/laminak/"), "lah-mee-nahk",
 equal(#Plugin:queryLanguageHints("unlisted-word"), 0,
     "missing legacy language-hint table was not handled safely")
 
--- The bundled, pure-Lua English LTS path handles arbitrary spellings without
+-- The bundled, pure-Lua weighted G2P path handles arbitrary spellings without
 -- an installed executable or a dictionary entry.
 local fantasy = Plugin:generatePronunciations("zyrathion", {})
 truthy(fantasy, "portable English fantasy-word fallback is missing")
@@ -170,16 +183,23 @@ truthy(fantasy[1].ipa and fantasy[1].ipa:match("^/.+/$"),
     "fantasy fallback IPA is malformed")
 truthy(fantasy[1].arpabet and fantasy[1].arpabet ~= "",
     "fantasy fallback lost its inferred phones")
-equal(fantasy[1].arpabet, "Z AY1 R AE1 TH IY0 AH0 N",
-    "portable model diverged from the pinned Flite LTS output")
-truthy(fantasy[1].source:find("CMU Flite", 1, true),
+equal(fantasy[1].arpabet, "Z ER0 AE1 TH IY0 AO0 N",
+    "portable model diverged from the pinned MFA/Pynini output")
+truthy(fantasy[1].source:find("MFA/Pynini", 1, true),
     "fantasy fallback provenance is missing")
+local laminak = Plugin:generatePronunciations("laminak", {})
+truthy(laminak and laminak[1], "laminak G2P regression is missing")
+equal(laminak[1].arpabet, "L AE1 M AH0 N AH0 K",
+    "laminak diverged from the pinned MFA/Pynini output")
 
 local accented_fantasy = Plugin:generatePronunciations("Faërun", {})
 truthy(accented_fantasy and accented_fantasy[1].ipa,
     "portable English fallback did not fold a Latin-script name")
-equal(accented_fantasy[1].arpabet, "F EH1 ER0 AH0 N",
-    "Latin folding changed the pinned Flite LTS output")
+equal(accented_fantasy[1].arpabet, "F EH1 R AH0 N",
+    "Latin folding changed the pinned MFA/Pynini output")
+equal(Plugin:generatePronunciations("FAËRUN", {})[1].arpabet,
+    accented_fantasy[1].arpabet,
+    "uppercase accented Latin spelling was not normalized")
 equal(Plugin:generatePronunciations("“Faërun”", {})[1].arpabet,
     accented_fantasy[1].arpabet,
     "typographic query wrappers were not normalized")
@@ -222,6 +242,23 @@ equal(Plugin.generated_language, "en",
     "generated-language menu did not select US English")
 Plugin.generated_language = "auto"
 
+-- Generated entries are reproducible offline, so stale formats and excessive
+-- history must not grow the startup settings table without bound.
+Plugin.generated_cache = { ["generator:1|old"] = {{ ipa = "/oʊld/" }} }
+for index = 1, 140 do
+    Plugin.generated_cache["generator:2|test:" .. index] = {{ ipa = "/tɛst/" }}
+end
+Plugin:saveGeneratedCache("generator:2|test:current", {{ ipa = "/kɝənt/" }})
+local generated_cache_count = 0
+for key in pairs(Plugin.generated_cache) do
+    generated_cache_count = generated_cache_count + 1
+    truthy(key:find("generator:2|", 1, true) == 1,
+        "stale generator cache version survived pruning")
+end
+truthy(generated_cache_count <= 128, "generated cache limit was not enforced")
+truthy(Plugin.generated_cache["generator:2|test:current"],
+    "new generated cache entry was pruned")
+
 truthy(hasCandidate("running", "run", "ing"), "running -> run missing")
 truthy(hasCandidate("stopped", "stop", "past"), "stopped -> stop missing")
 truthy(hasCandidate("heroes", "hero", "plural"), "heroes -> hero missing")
@@ -235,7 +272,9 @@ local original_query_connection = Plugin._queryConnection
 local original_overrides = Plugin.overrides
 local original_cache = Plugin.cache
 local open_count, close_count = 0, 0
-SQ3.open = function()
+local database_mode
+SQ3.open = function(_, mode)
+    database_mode = mode
     open_count = open_count + 1
     return { close = function() close_count = close_count + 1 end }
 end
@@ -255,12 +294,55 @@ Plugin.cache = {}
 local offline_derived, offline_match = Plugin:lookupOffline("running")
 equal(open_count, 1, "offline candidates reopened the database")
 equal(close_count, 1, "offline lookup did not close the database")
+equal(database_mode, "ro", "bundled database was not opened read-only")
 equal(offline_match, "run", "offline candidate matched the wrong base")
 equal(offline_derived[1].ipa, "/ɹʌnɪŋ/", "offline candidate derivation changed")
 SQ3.open = original_open
 Plugin._queryConnection = original_query_connection
 Plugin.overrides = original_overrides
 Plugin.cache = original_cache
+
+-- The real query path prepares once and resets the same statement for each
+-- inflection candidate checked on a connection.
+local prepare_count, reset_count, statement_close_count = 0, 0, 0
+local active_word
+local fake_statement = {
+    reset = function(self)
+        reset_count = reset_count + 1
+        return self
+    end,
+    bind = function(self, word)
+        active_word = word
+        self.returned = false
+    end,
+    step = function(self)
+        if active_word == "cat" and not self.returned then
+            self.returned = true
+            return { "/ˈkæt/", "K AE1 T", "KAT", "CMUdict", 80,
+                "test", "US", 0 }
+        end
+    end,
+    close = function() statement_close_count = statement_close_count + 1 end,
+}
+local fake_connection = {
+    prepare = function()
+        prepare_count = prepare_count + 1
+        return fake_statement
+    end,
+}
+local missing, missing_error, reusable = Plugin:_queryConnection(
+    fake_connection, "missing")
+equal(missing, nil, "missing reusable query returned a row")
+equal(missing_error, nil, "missing reusable query returned an error")
+local found, found_error, reused = Plugin:_queryConnection(
+    fake_connection, "cat", reusable)
+truthy(found and found[1], "reused query lost a pronunciation")
+equal(found_error, nil, "reused query returned an error")
+equal(reused, reusable, "query did not return the reusable statement")
+equal(prepare_count, 1, "candidate queries prepared more than once")
+equal(reset_count, 1, "reused candidate statement was not reset")
+reused:close()
+equal(statement_close_count, 1, "reused statement did not close")
 
 local wiktionary_fixture = [[
 <div class="mw-heading mw-heading2"><h2 id="English">English</h2></div>
@@ -303,9 +385,21 @@ equal(#language_hints, 1, "Spanish etymology hint missing")
 equal(language_hints[1].code, "es", "Spanish etymology code")
 
 local formatted = Plugin:format("resume", parsed, "resume")
+truthy(formatted:find("<formatted><bold>resume</bold>", 1, true) == 1,
+    "queried word was not bolded")
 truthy(formatted:find("IPA (US):", 1, true), "formatted US label missing")
 truthy(formatted:find("Readable (approx.):", 1, true),
     "approximate readable label missing")
+truthy(formatted:find("Source: Wiktionary", 1, true),
+    "compact formatting lost source attribution")
+truthy(not formatted:find("learned online and cached locally", 1, true),
+    "source description was not removed")
+local ptf_header = TextBoxWidget.PTF_HEADER
+TextBoxWidget.PTF_HEADER = nil
+local legacy_formatted = Plugin:format("resume", parsed, "resume")
+equal(legacy_formatted:sub(1, #"resume"), "resume",
+    "old KOReader heading fallback changed the query")
+TextBoxWidget.PTF_HEADER = ptf_header
 local generated_formatted = Plugin:format("zyrathion", fantasy, "zyrathion")
 truthy(generated_formatted:find("IPA (generated; US English):", 1, true),
     "generated IPA label missing")
@@ -328,7 +422,7 @@ end
 Plugin.online_fallback = true
 Plugin:lookupAndShow("zyrathion")
 truthy(shown_widget and shown_widget.text, "missing-word result was not shown")
-truthy(shown_widget.text:find("CMU Flite", 1, true),
+truthy(shown_widget.text:find("MFA/Pynini", 1, true),
     "missing-word flow lost generated provenance")
 truthy(shown_widget.text:find("generated; US English", 1, true),
     "missing-word flow lost generated provenance")

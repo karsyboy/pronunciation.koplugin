@@ -86,53 +86,28 @@ original curated records. Each record retains its source label, and the
 database metadata records the exact source revisions and input hash.
 
 
-CMU Flite US-English letter-to-sound model
-==========================================
+Montreal Forced Aligner English US ARPA G2P model (CC BY 4.0)
+================================================================
 
-The portable decision-tree data in data/cmu_flite_lts.bin is derived from
-CMU Flite, and the corresponding interpreter section in main.lua is an
-adaptation of Flite's letter-to-sound runtime:
+The portable graph in data/mfa_english_g2p.bin is derived from the English US
+ARPA G2P model published by Montreal Corpus Tools for Montreal Forced Aligner:
 
-  Flite: https://github.com/festvox/flite
-  Pinned revision: 6c9f20dc915b17f5619340069889db0aa007fcdc
-  Upstream model:
-    lang/cmulex/cmu_lts_model.c
-    lang/cmulex/cmu_lts_model.h
-    lang/cmulex/cmu_lts_rules.c
-  Upstream interpreter:
-    src/lexicon/cst_lts.c
+  Model catalog: https://mfa-models.readthedocs.io/en/latest/g2p/English/index.html
+  Release: g2p-english_us_arpa-v2.0.0
+  Archive: english_us_arpa.zip
+  Archive SHA-256:
+    f079ae88f792458fa7c123b256e5b86cc55c29ac2ffc457c673e6c60c36cd143
+  Copyright/attribution: Montreal Corpus Tools and model contributors
 
-Modifications are clearly marked in main.lua. The C decision trees and phone
-table were re-encoded into a compact, architecture-independent binary format;
-the relevant inference algorithm was adapted to Lua; speech synthesis, audio,
-the compiled Flite runtime, and Flite's lexicon are not included. Exact input
-hashes and the repeatable conversion command are in
-data/cmu_flite_lts.SOURCE.txt.
+Montreal Corpus Tools distributes the model under the Creative Commons
+Attribution 4.0 International license:
 
-The applicable CMU Flite notice is retained below:
+  https://creativecommons.org/licenses/by/4.0/
 
-Language Technologies Institute
-Carnegie Mellon University
-Copyright (c) 1999-2017
-All Rights Reserved.
-
-Permission is hereby granted, free of charge, to use and distribute this
-software and its documentation without restriction, including without
-limitation the rights to use, copy, modify, merge, publish, distribute,
-sublicense, and/or sell copies of this work, and to permit persons to whom
-this work is furnished to do so, subject to the following conditions:
-
-1. The code must retain the above copyright notice, this list of conditions
-   and the following disclaimer.
-2. Any modifications must be clearly marked as such.
-3. Original authors' names are not deleted.
-4. The authors' names are not used to endorse or promote products derived
-   from this software without specific prior written permission.
-
-CARNEGIE MELLON UNIVERSITY AND THE CONTRIBUTORS TO THIS WORK DISCLAIM ALL
-WARRANTIES WITH REGARD TO THIS SOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF
-MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL CARNEGIE MELLON UNIVERSITY NOR
-THE CONTRIBUTORS BE LIABLE FOR ANY SPECIAL, INDIRECT OR CONSEQUENTIAL DAMAGES
-OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER
-IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
-OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+Changes: the OpenFst vector graph was converted to a custom fixed-width,
+little-endian format; floating-point tropical weights were rounded to signed
+integers at 1/1024 precision; graph topology, labels, and shortest-path
+semantics were retained. The plugin includes neither Pynini nor OpenFst code.
+The dependency-free decoder and conversion tool are original plugin code under
+the MIT license above. Complete dimensions, hashes, and build instructions are
+in data/mfa_english_g2p.SOURCE.txt.
