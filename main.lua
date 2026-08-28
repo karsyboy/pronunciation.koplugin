@@ -26,13 +26,26 @@ local Pronunciation = WidgetContainer:extend{
 }
 
 local function trim(value)
-    return (value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if type(value) ~= "string" then return "" end
+    return value:gsub("^%s+", ""):gsub("%s+$", "")
 end
 
 local function normalizeWord(word)
     word = trim(word):lower():gsub("Ñ", "ñ"):gsub("Ü", "ü")
-        :gsub("’", "'")
+        :gsub("‘", "'"):gsub("’", "'")
+        :gsub("^“", ""):gsub("^”", ""):gsub("^«", ""):gsub("^»", "")
+        :gsub("“$", ""):gsub("”$", ""):gsub("«$", ""):gsub("»$", "")
     return word:gsub("^[%p%s]+", ""):gsub("[%p%s]+$", "")
+end
+
+-- KOReader keeps the originally queried text in `word` and the currently
+-- displayed dictionary headword in `lookupword`. Very old/custom builds may
+-- expose only the latter, so retain it strictly as a compatibility fallback.
+local function popupQueryWord(dict_popup)
+    if type(dict_popup) ~= "table" then return nil end
+    local query_word = trim(dict_popup.word)
+    if query_word ~= "" then return query_word end
+    return trim(dict_popup.lookupword)
 end
 
 local function stripIpaWrappers(ipa)
@@ -125,6 +138,17 @@ local function nextUtf8Character(text, position)
     return tail:match("^([%z\1-\127\194-\244][\128-\191]*)")
 end
 
+local IPA_PHONE_SPECS_BY_FIRST = {}
+for _, spec in ipairs(IPA_PHONE_SPECS) do
+    local first = nextUtf8Character(spec[1], 1)
+    local bucket = IPA_PHONE_SPECS_BY_FIRST[first]
+    if not bucket then
+        bucket = {}
+        IPA_PHONE_SPECS_BY_FIRST[first] = bucket
+    end
+    bucket[#bucket + 1] = spec
+end
+
 local function tokenizeIpa(ipa)
     local core = stripIpaWrappers(ipa):gsub("͡", "")
     local phones = {}
@@ -142,7 +166,8 @@ local function tokenizeIpa(ipa)
             position = position + #"ˌ"
         else
             local matched
-            for _, spec in ipairs(IPA_PHONE_SPECS) do
+            local first_character = nextUtf8Character(rest, 1)
+            for _, spec in ipairs(IPA_PHONE_SPECS_BY_FIRST[first_character] or {}) do
                 if rest:sub(1, #spec[1]) == spec[1] then
                     matched = spec
                     break
@@ -163,7 +188,7 @@ local function tokenizeIpa(ipa)
                 phones[#phones + 1] = phone
                 position = position + #matched[1]
             else
-                local character = nextUtf8Character(core, position)
+                local character = first_character
                 if not character then break end
                 if character == "." or character == "-" or character == " " then
                     pending_break = true
@@ -718,10 +743,10 @@ function Pronunciation:_dictionaryButtonSpec()
             return not dict_popup.is_wiki_fullpage
         end,
         callback = function(dict_popup)
-            self:lookupAndShow(dict_popup.lookupword or dict_popup.word)
+            self:lookupAndShow(popupQueryWord(dict_popup))
         end,
         hold_callback = function(dict_popup)
-            self:editOverride(dict_popup.lookupword or dict_popup.word)
+            self:editOverride(popupQueryWord(dict_popup))
         end,
     }
 end
@@ -767,10 +792,10 @@ function Pronunciation:_insertLegacyButton(dict_popup, buttons)
         id = "pronunciation_lookup",
         text = _("Pronunciation"),
         callback = function()
-            self:lookupAndShow(dict_popup.lookupword or dict_popup.word)
+            self:lookupAndShow(popupQueryWord(dict_popup))
         end,
         hold_callback = function()
-            self:editOverride(dict_popup.lookupword or dict_popup.word)
+            self:editOverride(popupQueryWord(dict_popup))
         end,
     }})
 end
@@ -899,24 +924,20 @@ function Pronunciation:getOverride(word)
     end
 end
 
-function Pronunciation:getCache(word, generated_only)
+function Pronunciation:getCache(word)
     local cached = self.cache[normalizeWord(word)]
-    if cached and type(cached) == "table" and #cached > 0 then
-        local filtered = {}
-        for _, result in ipairs(cached) do
-            if (result.generated == true) == (generated_only == true) then
-                filtered[#filtered + 1] = result
-            end
-        end
-        if #filtered > 0 then return ensureReadables(filtered) end
+    if type(cached) == "table" and #cached > 0 then
+        return ensureReadables(cached)
     end
 end
 
-function Pronunciation:query(word)
-    local connection
+local function closeSqlResource(resource)
+    if resource then pcall(function() resource:close() end) end
+end
+
+function Pronunciation:_queryConnection(connection, word)
     local statement
     local ok, results = pcall(function()
-        connection = SQ3.open(self.db_path)
         statement = connection:prepare([[
             SELECT ipa, arpabet, simple, source, confidence, note,
                    region, simple_approx
@@ -944,11 +965,9 @@ function Pronunciation:query(word)
         end
         return rows
     end)
-    if statement then pcall(function() statement:close() end) end
-    if connection then pcall(function() connection:close() end) end
+    closeSqlResource(statement)
     if not ok then
-        logger.err("Pronunciation: database lookup failed:", results)
-        return nil
+        return nil, results
     end
     if #results > 0 then
         ensureReadables(results)
@@ -962,6 +981,21 @@ function Pronunciation:query(word)
         end
         return #english > 0 and english or results
     end
+end
+
+function Pronunciation:query(word)
+    local opened, connection = pcall(SQ3.open, self.db_path)
+    if not opened or not connection then
+        logger.err("Pronunciation: database open failed:", connection)
+        return nil
+    end
+    local results, query_error = self:_queryConnection(connection,
+        normalizeWord(word))
+    closeSqlResource(connection)
+    if query_error then
+        logger.err("Pronunciation: database lookup failed:", query_error)
+    end
+    return results
 end
 
 function Pronunciation:queryLanguageHints(word)
@@ -989,8 +1023,8 @@ function Pronunciation:queryLanguageHints(word)
         end
         return rows
     end)
-    if statement then pcall(function() statement:close() end) end
-    if connection then pcall(function() connection:close() end) end
+    closeSqlResource(statement)
+    closeSqlResource(connection)
     -- Older v0.3 databases do not have language_hints; treat that as no hint.
     if not ok then return {} end
     return mergeLanguageHints(results)
@@ -1149,20 +1183,47 @@ function Pronunciation:lookupOffline(word)
     word = normalizeWord(word)
     local results = self:getOverride(word)
     if results then return results, word end
-    results = self:query(word)
-    if results then return results, word end
+
+    -- Reuse one SQLite connection while checking the exact word and all
+    -- possible inflection bases. Opening the bundled database repeatedly is
+    -- noticeably expensive on low-memory e-ink devices.
+    local opened, connection = pcall(SQ3.open, self.db_path)
+    if not opened then
+        logger.err("Pronunciation: database open failed:", connection)
+        connection = nil
+    end
+    local function queryDatabase(candidate_word)
+        if not connection then return nil end
+        local rows, query_error = self:_queryConnection(connection,
+            candidate_word)
+        if query_error then
+            logger.err("Pronunciation: database lookup failed:", query_error)
+            closeSqlResource(connection)
+            connection = nil
+        end
+        return rows
+    end
+    local function finish(found, matched)
+        closeSqlResource(connection)
+        connection = nil
+        return found, matched
+    end
+
+    results = queryDatabase(word)
+    if results then return finish(results, word) end
     results = self:getCache(word)
-    if results then return results, word end
+    if results then return finish(results, word) end
 
     for _, candidate in ipairs(self:candidates(word)) do
         local base = self:getOverride(candidate.word)
-            or self:query(candidate.word)
+            or queryDatabase(candidate.word)
             or self:getCache(candidate.word)
         if base then
             local derived = self:derive(base, candidate.kind, candidate.word)
-            if derived then return derived, candidate.word end
+            if derived then return finish(derived, candidate.word) end
         end
     end
+    return finish()
 end
 
 local function httpGet(request_url)

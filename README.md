@@ -12,6 +12,8 @@ The plugin supports all three KOReader dictionary-popup extension systems that h
 
 On newer versions, Pronunciation is registered as a conditional runtime button. It therefore appears even if KOReader already has a saved/customized dictionary-button layout.
 
+The button looks up the text that originally opened the dictionary popup, not a dictionary result's normalized headword. The plugin reads KOReader's query field first and falls back to the result field only for older or customized builds that do not expose the query field.
+
 ## Lookup order
 
 1. Personal override
@@ -91,7 +93,7 @@ luajit tests/test_plugin.lua
 python3 tests/test_database.py
 ```
 
-The Lua suite covers old/new button registration, saved-layout behavior, IPA-only inflection derivation, foreign-language derivation guards, readable generation, English-only IPA parsing, etymology hints, book-language routing, language-aware cache keys, and portable fantasy-word generation. The database suite also verifies the compact LTS model's format, provenance, hash, and size.
+The Lua suite covers old/new button registration, query-word selection, saved-layout behavior, IPA-only inflection derivation, foreign-language derivation guards, readable generation, English-only IPA parsing, etymology hints, book-language routing, language-aware cache keys, single-connection offline lookup, and portable unfamiliar-word generation. The database suite also verifies the compact LTS model's format, provenance, hash, and size.
 
 ## Data licensing
 

@@ -17,7 +17,8 @@ preload("ui/widget/inputdialog", { new = function(_, value) return value end })
 preload("json", { decode = function() return {} end })
 preload("luasettings", {})
 preload("ui/network/manager", NetworkMgr)
-preload("lua-ljsqlite3/init", {})
+local SQ3 = {}
+preload("lua-ljsqlite3/init", SQ3)
 preload("ui/uimanager", UIManager)
 preload("ui/widget/container/widgetcontainer", {
     extend = function(_, value) return value end,
@@ -87,6 +88,23 @@ equal(legacy_buttons[1][1].id, "pronunciation_lookup", "legacy button id")
 Plugin:onDictButtonsReady({ lookupword = "cat" }, legacy_buttons)
 equal(#legacy_buttons, 1, "legacy event inserted a duplicate button")
 
+-- Buttons use the original query, not a dictionary result/headword. The
+-- lookupword-only fallback keeps old/custom KOReader builds working.
+local tapped_word
+local held_word
+local original_lookup_and_show = Plugin.lookupAndShow
+local original_edit_override = Plugin.editOverride
+Plugin.lookupAndShow = function(_, word) tapped_word = word end
+Plugin.editOverride = function(_, word) held_word = word end
+pre_event_popup.word = "cats"
+pre_event_popup.lookupword = "cat"
+pre_event_popup.test_buttons[1][1].callback()
+pre_event_popup.test_buttons[1][1].hold_callback()
+equal(tapped_word, "cats", "legacy tap used the dictionary headword")
+equal(held_word, "cats", "legacy hold used the dictionary headword")
+legacy_buttons[1][1].callback()
+equal(tapped_word, "cat", "legacy lookupword compatibility fallback failed")
+
 -- Modern registration is conditional, so saved layouts cannot hide the button.
 local modern_spec
 Plugin.ui = { dictionary = {
@@ -100,6 +118,12 @@ equal(modern_spec.show_func({ is_wiki_fullpage = false }), true,
     "modern button should appear in dictionary popups")
 equal(modern_spec.show_func({ is_wiki_fullpage = true }), false,
     "modern button should not appear in full-page Wikipedia")
+modern_spec.callback({ word = "geese", lookupword = "goose" })
+modern_spec.hold_callback({ word = "geese", lookupword = "goose" })
+equal(tapped_word, "geese", "modern tap used the dictionary headword")
+equal(held_word, "geese", "modern hold used the dictionary headword")
+Plugin.lookupAndShow = original_lookup_and_show
+Plugin.editOverride = original_edit_override
 local duplicate_buttons = {}
 Plugin:onDictButtonsReady({ lookupword = "cat" }, duplicate_buttons)
 equal(#duplicate_buttons, 0, "modern KOReader received a duplicate legacy button")
@@ -156,6 +180,9 @@ truthy(accented_fantasy and accented_fantasy[1].ipa,
     "portable English fallback did not fold a Latin-script name")
 equal(accented_fantasy[1].arpabet, "F EH1 ER0 AH0 N",
     "Latin folding changed the pinned Flite LTS output")
+equal(Plugin:generatePronunciations("“Faërun”", {})[1].arpabet,
+    accented_fantasy[1].arpabet,
+    "typographic query wrappers were not normalized")
 
 -- Auto mode uses safe, optional book metadata on old and new KOReader builds.
 Plugin.queryLanguageHints = function() return {} end
@@ -200,6 +227,40 @@ truthy(hasCandidate("stopped", "stop", "past"), "stopped -> stop missing")
 truthy(hasCandidate("heroes", "hero", "plural"), "heroes -> hero missing")
 truthy(hasCandidate("knives", "knife", "plural"), "knives -> knife missing")
 truthy(hasCandidate("lying", "lie", "ing"), "lying -> lie missing")
+
+-- A single offline lookup reuses one database connection for the exact word
+-- and all inflection candidates.
+local original_open = SQ3.open
+local original_query_connection = Plugin._queryConnection
+local original_overrides = Plugin.overrides
+local original_cache = Plugin.cache
+local open_count, close_count = 0, 0
+SQ3.open = function()
+    open_count = open_count + 1
+    return { close = function() close_count = close_count + 1 end }
+end
+Plugin._queryConnection = function(_, _, word)
+    if word == "run" then
+        return {{
+            ipa = "/ɹʌn/",
+            arpabet = "R AH1 N",
+            source = "CMUdict",
+            confidence = 80,
+            region = "US",
+        }}
+    end
+end
+Plugin.overrides = {}
+Plugin.cache = {}
+local offline_derived, offline_match = Plugin:lookupOffline("running")
+equal(open_count, 1, "offline candidates reopened the database")
+equal(close_count, 1, "offline lookup did not close the database")
+equal(offline_match, "run", "offline candidate matched the wrong base")
+equal(offline_derived[1].ipa, "/ɹʌnɪŋ/", "offline candidate derivation changed")
+SQ3.open = original_open
+Plugin._queryConnection = original_query_connection
+Plugin.overrides = original_overrides
+Plugin.cache = original_cache
 
 local wiktionary_fixture = [[
 <div class="mw-heading mw-heading2"><h2 id="English">English</h2></div>

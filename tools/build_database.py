@@ -187,7 +187,7 @@ def parse_supplement(path: Path):
     with path.open(encoding="utf-8", newline="") as source:
         for row in csv.DictReader(source, delimiter="\t"):
             yield (
-                row["word"].strip().lower(),
+                row["word"].strip().casefold(),
                 row["ipa"].strip(),
                 None,
                 row["simple"].strip(),
