@@ -1,0 +1,138 @@
+CMU Pronouncing Dictionary (BSD-3-Clause)
+=========================================
+
+Copyright (C) 1993-2015 Carnegie Mellon University. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice,
+   this list of conditions and the following disclaimer. The contents of this
+   file are deemed to be source code.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+This work was supported in part by funding from the Defense Advanced Research
+Projects Agency, the Office of Naval Research and the National Science
+Foundation of the United States of America, and by member companies of the
+Carnegie Mellon Sphinx Speech Consortium. We acknowledge the contributions of
+many volunteers to the expansion and improvement of this dictionary.
+
+THIS SOFTWARE IS PROVIDED BY CARNEGIE MELLON UNIVERSITY ``AS IS'' AND ANY
+EXPRESSED OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL CARNEGIE MELLON UNIVERSITY NOR ITS EMPLOYEES BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE
+GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
+OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+Plugin code (MIT License)
+=========================
+
+Copyright (c) 2026 Pronunciation Dictionary contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+WikiPron-derived Wiktionary data (CC BY-SA 4.0)
+================================================
+
+The Basque pronunciation records in data/pronunciations.sqlite3 were extracted
+from the English Wiktionary by WikiPron:
+
+  WikiPron: https://github.com/CUNY-CL/wikipron
+  Pinned revision: d282e848a211ea31cfd730f0ced8bc8cdab9e83d
+  Input: data/scrape/tsv/eus_latn_broad.tsv
+  Input SHA-256: 9e4301ed2f86e060a43fa8fb06f9b2590df284c9a54ed373bbae2d002a0bfac0
+  Wiktionary: https://en.wiktionary.org/
+  Wiktionary attribution and license information:
+  https://en.wiktionary.org/wiki/Wiktionary:Copyrights
+
+Those records and adaptations of them are available under the Creative Commons
+Attribution-ShareAlike 4.0 International license:
+
+  https://creativecommons.org/licenses/by-sa/4.0/
+
+Attribution: Wiktionary contributors; extraction by the WikiPron project
+(Jackson L. Lee, Lucas F.E. Ashby, M. Elizabeth Garza, Yeonju Lee-Sikka, Sean
+Miller, Alan Wong, Arya D. McCarthy, and Kyle Gorman). No WikiPron program code
+is bundled in this plugin.
+
+The pronunciation database is a collection containing CMUdict records under
+their BSD-3-Clause terms, WikiPron/Wiktionary records under CC BY-SA 4.0, and
+original curated records. Each record retains its source label, and the
+database metadata records the exact source revisions and input hash.
+
+
+CMU Flite US-English letter-to-sound model
+==========================================
+
+The portable decision-tree data in data/cmu_flite_lts.bin is derived from
+CMU Flite, and the corresponding interpreter section in main.lua is an
+adaptation of Flite's letter-to-sound runtime:
+
+  Flite: https://github.com/festvox/flite
+  Pinned revision: 6c9f20dc915b17f5619340069889db0aa007fcdc
+  Upstream model:
+    lang/cmulex/cmu_lts_model.c
+    lang/cmulex/cmu_lts_model.h
+    lang/cmulex/cmu_lts_rules.c
+  Upstream interpreter:
+    src/lexicon/cst_lts.c
+
+Modifications are clearly marked in main.lua. The C decision trees and phone
+table were re-encoded into a compact, architecture-independent binary format;
+the relevant inference algorithm was adapted to Lua; speech synthesis, audio,
+the compiled Flite runtime, and Flite's lexicon are not included. Exact input
+hashes and the repeatable conversion command are in
+data/cmu_flite_lts.SOURCE.txt.
+
+The applicable CMU Flite notice is retained below:
+
+Language Technologies Institute
+Carnegie Mellon University
+Copyright (c) 1999-2017
+All Rights Reserved.
+
+Permission is hereby granted, free of charge, to use and distribute this
+software and its documentation without restriction, including without
+limitation the rights to use, copy, modify, merge, publish, distribute,
+sublicense, and/or sell copies of this work, and to permit persons to whom
+this work is furnished to do so, subject to the following conditions:
+
+1. The code must retain the above copyright notice, this list of conditions
+   and the following disclaimer.
+2. Any modifications must be clearly marked as such.
+3. Original authors' names are not deleted.
+4. The authors' names are not used to endorse or promote products derived
+   from this software without specific prior written permission.
+
+CARNEGIE MELLON UNIVERSITY AND THE CONTRIBUTORS TO THIS WORK DISCLAIM ALL
+WARRANTIES WITH REGARD TO THIS SOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL CARNEGIE MELLON UNIVERSITY NOR
+THE CONTRIBUTORS BE LIABLE FOR ANY SPECIAL, INDIRECT OR CONSEQUENTIAL DAMAGES
+OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER
+IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.

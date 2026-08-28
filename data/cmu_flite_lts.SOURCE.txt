@@ -1,0 +1,26 @@
+CMU Flite US-English letter-to-sound model
+==========================================
+
+Upstream: https://github.com/festvox/flite
+Pinned revision: 6c9f20dc915b17f5619340069889db0aa007fcdc
+
+Inputs:
+
+  lang/cmulex/cmu_lts_model.c
+  SHA-256: a211a7b28d37041edeae5dd4be983431ef6d3b4c6e2adc84ee05c26f227f8fc9
+
+  lang/cmulex/cmu_lts_model.h
+  SHA-256: bf65916623ea4dbcc40ae2782657e265d1d582e19ec513ec8a3ae75700633f1b
+
+  lang/cmulex/cmu_lts_rules.c
+  SHA-256: 148777abbaeff9c566ee4fd18886f829d0d56c8a751800467aa7e6e0c0fef8bd
+
+Rebuild:
+
+  git clone https://github.com/festvox/flite.git /path/to/flite
+  git -C /path/to/flite checkout 6c9f20dc915b17f5619340069889db0aa007fcdc
+  python3 tools/build_lts_model.py --flite /path/to/flite
+
+The generated data/cmu_flite_lts.bin file is a byte-for-byte re-encoding
+of the upstream decision trees and phone table. It contains no executable
+code and is interpreted directly by main.lua.

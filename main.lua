@@ -1,0 +1,1596 @@
+local DataStorage = require("datastorage")
+local InfoMessage = require("ui/widget/infomessage")
+local InputDialog = require("ui/widget/inputdialog")
+local JSON = require("json")
+local LuaSettings = require("luasettings")
+local NetworkMgr = require("ui/network/manager")
+local SQ3 = require("lua-ljsqlite3/init")
+local UIManager = require("ui/uimanager")
+local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local DictQuickLookup = require("ui/widget/dictquicklookup")
+local logger = require("logger")
+local ltn12 = require("ltn12")
+local socket = require("socket")
+local http = require("socket.http")
+local socketutil = require("socketutil")
+local url = require("socket.url")
+local _ = require("gettext")
+
+local PLUGIN_VERSION = "0.5.0"
+local CACHE_VERSION = 5
+local GENERATOR_VERSION = 1
+
+local Pronunciation = WidgetContainer:extend{
+    name = "pronunciation",
+    is_doc_only = true,
+}
+
+local function trim(value)
+    return (value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function normalizeWord(word)
+    word = trim(word):lower():gsub("Ñ", "ñ"):gsub("Ü", "ü")
+        :gsub("’", "'")
+    return word:gsub("^[%p%s]+", ""):gsub("[%p%s]+$", "")
+end
+
+local function stripIpaWrappers(ipa)
+    local core = trim(ipa)
+    local first = core:sub(1, 1)
+    if first == "/" or first == "[" then
+        core = core:sub(2)
+    end
+    local last = core:sub(-1)
+    if last == "/" or last == "]" then
+        core = core:sub(1, -2)
+    end
+    return trim(core)
+end
+
+local function wrapIpa(ipa)
+    local core = stripIpaWrappers(ipa)
+    if core == "" then return nil end
+    return "/" .. core .. "/"
+end
+
+-- Ordered longest-first so diphthongs and affricates remain single phones.
+local IPA_PHONE_SPECS = {
+    { "t͡ʃ", "ch", false }, { "d͡ʒ", "j", false },
+    { "tʃ", "ch", false }, { "dʒ", "j", false },
+    { "aɪ", "eye", true }, { "aʊ", "ow", true },
+    { "eɪ", "ay", true }, { "oʊ", "oh", true },
+    { "əʊ", "oh", true }, { "ɔɪ", "oy", true },
+    { "ɪə", "ear", true }, { "eə", "air", true },
+    { "ɛə", "air", true }, { "ʊə", "oor", true },
+    { "iː", "ee", true }, { "uː", "oo", true },
+    { "ɑː", "ah", true }, { "ɔː", "aw", true },
+    { "ɜː", "er", true }, { "ɝː", "er", true },
+    { "n̩", "uhn", true }, { "l̩", "uhl", true },
+    { "m̩", "uhm", true },
+    { "i", "ee", true }, { "ɪ", "ih", true },
+    { "e", "eh", true }, { "ɛ", "eh", true },
+    { "æ", "a", true }, { "a", "ah", true },
+    { "ə", "uh", true }, { "ɐ", "uh", true },
+    { "ʌ", "uh", true }, { "ɜ", "er", true },
+    { "ɝ", "er", true }, { "ɚ", "er", true },
+    { "ɑ", "ah", true }, { "ɒ", "ah", true },
+    { "ɔ", "aw", true }, { "o", "oh", true },
+    { "ʊ", "uu", true }, { "u", "oo", true },
+    { "ɵ", "uh", true }, { "ɞ", "ur", true },
+    { "p", "p", false }, { "b", "b", false },
+    { "t", "t", false }, { "d", "d", false },
+    { "k", "k", false }, { "ɡ", "g", false }, { "g", "g", false },
+    { "f", "f", false }, { "v", "v", false },
+    { "θ", "th", false }, { "ð", "th", false },
+    { "s", "s", false }, { "z", "z", false },
+    { "ʃ", "sh", false }, { "ʒ", "zh", false },
+    { "h", "h", false }, { "x", "kh", false },
+    { "m", "m", false }, { "n", "n", false },
+    { "ɲ", "ny", false },
+    { "ŋ", "ng", false },
+    { "l", "l", false }, { "ɫ", "l", false }, { "ʎ", "ly", false },
+    { "ɹ", "r", false }, { "r", "r", false },
+    { "ɻ", "r", false }, { "ɾ", "r", false }, { "ʁ", "r", false },
+    { "j", "y", false }, { "w", "w", false },
+    { "ɟ", "gy", false }, { "β", "v", false }, { "ɣ", "gh", false },
+    { "ʍ", "hw", false }, { "ʔ", "", false },
+}
+
+local IPA_ONSETS = {
+    ["pr"] = true, ["pl"] = true, ["pj"] = true,
+    ["br"] = true, ["bl"] = true, ["bj"] = true,
+    ["tr"] = true, ["tw"] = true, ["tj"] = true,
+    ["dr"] = true, ["dw"] = true, ["dj"] = true,
+    ["kr"] = true, ["kl"] = true, ["kw"] = true, ["kj"] = true,
+    ["ɡr"] = true, ["ɡl"] = true, ["ɡw"] = true, ["ɡj"] = true,
+    ["gr"] = true, ["gl"] = true, ["gw"] = true, ["gj"] = true,
+    ["fr"] = true, ["fl"] = true, ["fj"] = true,
+    ["vr"] = true, ["vj"] = true, ["θr"] = true,
+    ["ʃr"] = true, ["tʃr"] = true, ["dʒr"] = true,
+    ["sp"] = true, ["st"] = true, ["sk"] = true,
+    ["sm"] = true, ["sn"] = true, ["sl"] = true, ["sw"] = true,
+    ["spr"] = true, ["spl"] = true, ["str"] = true,
+    ["skr"] = true, ["skw"] = true,
+}
+
+local IPA_INVALID_SINGLE_ONSETS = { ["ŋ"] = true }
+local IPA_LAX_VOWELS = {
+    ["ɪ"] = true, ["ɛ"] = true, ["æ"] = true,
+    ["ə"] = true, ["ʌ"] = true, ["ʊ"] = true,
+}
+
+local function nextUtf8Character(text, position)
+    local tail = text:sub(position)
+    return tail:match("^([%z\1-\127\194-\244][\128-\191]*)")
+end
+
+local function tokenizeIpa(ipa)
+    local core = stripIpaWrappers(ipa):gsub("͡", "")
+    local phones = {}
+    local position = 1
+    local pending_stress
+    local pending_break = false
+
+    while position <= #core do
+        local rest = core:sub(position)
+        if rest:sub(1, #"ˈ") == "ˈ" then
+            pending_stress = 1
+            position = position + #"ˈ"
+        elseif rest:sub(1, #"ˌ") == "ˌ" then
+            pending_stress = 2
+            position = position + #"ˌ"
+        else
+            local matched
+            for _, spec in ipairs(IPA_PHONE_SPECS) do
+                if rest:sub(1, #spec[1]) == spec[1] then
+                    matched = spec
+                    break
+                end
+            end
+            if matched then
+                local phone = {
+                    symbol = matched[1]:gsub("͡", ""),
+                    readable = matched[2],
+                    vowel = matched[3],
+                    break_before = pending_break,
+                }
+                pending_break = false
+                if phone.vowel and pending_stress then
+                    phone.stress = pending_stress
+                    pending_stress = nil
+                end
+                phones[#phones + 1] = phone
+                position = position + #matched[1]
+            else
+                local character = nextUtf8Character(core, position)
+                if not character then break end
+                if character == "." or character == "-" or character == " " then
+                    pending_break = true
+                end
+                -- Ignore punctuation, optional-phone markers, length marks and diacritics.
+                position = position + #character
+            end
+        end
+    end
+    return phones
+end
+
+local function onsetKey(phones, first, last)
+    local parts = {}
+    for i = first, last do
+        parts[#parts + 1] = phones[i].symbol
+    end
+    return table.concat(parts)
+end
+
+local function chooseIpaOnsetLength(phones, previous_vowel, vowel_index)
+    local cluster_length = vowel_index - previous_vowel - 1
+    if cluster_length <= 0 then return 0 end
+
+    local maximum = math.min(3, cluster_length)
+    local previous = phones[previous_vowel]
+    if previous.stress == 1 and IPA_LAX_VOWELS[previous.symbol] then
+        maximum = math.min(maximum, cluster_length - 1)
+    end
+
+    for length = maximum, 1, -1 do
+        local first = vowel_index - length
+        if length == 1 then
+            if not IPA_INVALID_SINGLE_ONSETS[phones[first].symbol] then
+                return 1
+            end
+        elseif IPA_ONSETS[onsetKey(phones, first, vowel_index - 1)] then
+            return length
+        end
+    end
+    return 0
+end
+
+local function readableFromIpa(ipa)
+    local phones = tokenizeIpa(ipa)
+    if #phones == 0 then return nil end
+
+    local vowels = {}
+    for i, phone in ipairs(phones) do
+        if phone.vowel then vowels[#vowels + 1] = i end
+    end
+    if #vowels == 0 then return nil end
+
+    local starts = { 1 }
+    for v = 2, #vowels do
+        local previous_vowel = vowels[v - 1]
+        local vowel_index = vowels[v]
+        local explicit_start
+        for i = previous_vowel + 1, vowel_index do
+            if phones[i].break_before then explicit_start = i end
+        end
+        starts[#starts + 1] = explicit_start
+            or (vowel_index - chooseIpaOnsetLength(phones, previous_vowel, vowel_index))
+    end
+
+    local syllables = {}
+    for s = 1, #starts do
+        local first = starts[s]
+        local last = (starts[s + 1] or (#phones + 1)) - 1
+        local spelling = {}
+        local stress
+        for i = first, last do
+            local readable = phones[i].readable
+            if phones[i].symbol == "ɪ" and phones[i].stress == 1 then
+                readable = "i"
+            end
+            spelling[#spelling + 1] = readable
+            if phones[i].stress then stress = phones[i].stress end
+        end
+        local text = table.concat(spelling)
+        if stress == 1 or (#starts == 1 and not stress) then
+            text = text:upper()
+        end
+        if text ~= "" then syllables[#syllables + 1] = text end
+    end
+    if #syllables == 0 then return nil end
+    return table.concat(syllables, "-")
+end
+
+function Pronunciation:readableFromIpa(ipa)
+    return readableFromIpa(ipa)
+end
+
+local function ensureReadable(result)
+    if result and (not result.simple or result.simple == "") and result.ipa then
+        result.simple = readableFromIpa(result.ipa)
+        result.simple_approx = result.simple ~= nil
+    end
+    return result
+end
+
+local function ensureReadables(results)
+    for _, result in ipairs(results or {}) do ensureReadable(result) end
+    return results
+end
+
+local normalizeOnlineIpa
+
+local LANGUAGE_DEFINITIONS = {
+    basque = { code = "eu", name = "Basque" },
+    catalan = { code = "ca", name = "Catalan" },
+    dutch = { code = "nl", name = "Dutch" },
+    english = { code = "en", name = "English", region = "US" },
+    french = { code = "fr", name = "French" },
+    german = { code = "de", name = "German" },
+    italian = { code = "it", name = "Italian" },
+    latin = { code = "la", name = "Latin" },
+    portuguese = { code = "pt", name = "Portuguese" },
+    spanish = { code = "es", name = "Spanish" },
+    welsh = { code = "cy", name = "Welsh" },
+}
+
+local LANGUAGE_BY_CODE = {}
+for _, definition in pairs(LANGUAGE_DEFINITIONS) do
+    LANGUAGE_BY_CODE[definition.code] = definition
+end
+
+local LANGUAGE_CODE_ALIASES = {
+    cat = "ca", cym = "cy", dut = "nl", nld = "nl", eng = "en",
+    eus = "eu", baq = "eu", fra = "fr", fre = "fr", deu = "de",
+    ger = "de", ita = "it", lat = "la", por = "pt", spa = "es",
+}
+
+local function normalizeLanguageKey(value)
+    if type(value) ~= "string" then return "" end
+    local key = trim(value):lower():gsub("_", "-")
+    key = trim(key:match("^([^,;]+)") or key)
+    return key
+end
+
+local function languageDefinition(name, code)
+    local function resolve(value)
+        if value and value ~= "" then
+            local key = normalizeLanguageKey(value)
+            local definition = LANGUAGE_DEFINITIONS[key]
+                or LANGUAGE_BY_CODE[LANGUAGE_CODE_ALIASES[key] or key]
+            if definition then return definition end
+
+            local base = key:match("^([a-z][a-z][a-z]?)%-")
+            if base then
+                definition = LANGUAGE_BY_CODE[LANGUAGE_CODE_ALIASES[base] or base]
+                if definition then return definition end
+            end
+        end
+    end
+    return resolve(code) or resolve(name)
+end
+
+local function mergeLanguageHints(...)
+    local merged = {}
+    local seen = {}
+    for index = 1, select("#", ...) do
+        for _, hint in ipairs(select(index, ...) or {}) do
+            local definition = languageDefinition(hint.name, hint.code)
+            if definition and not seen[definition.code] then
+                seen[definition.code] = true
+                merged[#merged + 1] = {
+                    code = definition.code,
+                    name = definition.name,
+                    region = definition.region,
+                    source = hint.source,
+                    note = hint.note,
+                }
+            end
+        end
+    end
+    return merged
+end
+
+local GENERATION_LANGUAGE_ORDER = { "english" }
+local SELECTABLE_GENERATION_LANGUAGES = { en = true }
+
+local ARPABET_IPA = {
+    AA = "ɑ", AE = "æ", AO = "ɔ", AW = "aʊ", AY = "aɪ",
+    EH = "ɛ", EY = "eɪ", IH = "ɪ", IY = "i", OW = "oʊ",
+    OY = "ɔɪ", UH = "ʊ", UW = "u",
+    B = "b", CH = "tʃ", D = "d", DH = "ð", F = "f",
+    G = "ɡ", HH = "h", JH = "dʒ", K = "k", L = "l",
+    M = "m", N = "n", NG = "ŋ", P = "p", R = "ɹ",
+    S = "s", SH = "ʃ", T = "t", TH = "θ", V = "v",
+    W = "w", Y = "j", Z = "z", ZH = "ʒ",
+}
+
+local ARPABET_VOWELS = {
+    AA = true, AE = true, AH = true, AO = true, AW = true,
+    AY = true, EH = true, ER = true, EY = true, IH = true,
+    IY = true, OW = true, OY = true, UH = true, UW = true,
+}
+
+local function arpabetBase(phone)
+    return phone:gsub("[012]$", "")
+end
+
+local function arpabetPhonesToIpa(arpabet)
+    local phones = {}
+    local vowels = {}
+    for _, phone in ipairs(arpabet) do
+        local base = arpabetBase(phone)
+        local phone_stress = tonumber(phone:match("([012])$"))
+        local vowel = ARPABET_VOWELS[base] == true
+        local symbol
+        if base == "AH" then
+            symbol = phone_stress == 0 and "ə" or "ʌ"
+        elseif base == "ER" then
+            symbol = phone_stress == 0 and "ɚ" or "ɝ"
+        else
+            symbol = ARPABET_IPA[base]
+        end
+        if not symbol then return nil end
+        phones[#phones + 1] = {
+            symbol = symbol,
+            vowel = vowel,
+            stress = phone_stress,
+        }
+        if vowel then vowels[#vowels + 1] = #phones end
+    end
+    if #phones == 0 then return nil end
+
+    local starts = {}
+    if #vowels > 0 then
+        starts[1] = 1
+        for index = 2, #vowels do
+            local previous_vowel = vowels[index - 1]
+            local vowel_index = vowels[index]
+            starts[index] = vowel_index
+                - chooseIpaOnsetLength(phones, previous_vowel, vowel_index)
+        end
+    end
+
+    local stress_at = {}
+    for index, start in ipairs(starts) do
+        local stress = phones[vowels[index]].stress
+        if stress == 1 then stress_at[start] = "ˈ"
+        elseif stress == 2 then stress_at[start] = "ˌ" end
+    end
+
+    local output = {}
+    for index, phone in ipairs(phones) do
+        if stress_at[index] then output[#output + 1] = stress_at[index] end
+        output[#output + 1] = phone.symbol
+    end
+    return "/" .. table.concat(output) .. "/"
+end
+
+local function readLittleEndian16(data, position)
+    local low, high = data:byte(position, position + 1)
+    if not low or not high then return nil end
+    return low + high * 256
+end
+
+-- Portable US-English letter-to-sound inference. The model is a compact
+-- re-encoding of CMU Flite's decision trees; this Lua interpreter is adapted
+-- from Flite's cst_lts.c so KOReader never needs a native helper executable.
+function Pronunciation:_loadEnglishLtsModel()
+    if self.english_lts_model ~= nil then
+        return self.english_lts_model or nil
+    end
+    if not self.path then
+        self.english_lts_model = false
+        return nil
+    end
+
+    local handle = io.open(self.path .. "/data/cmu_flite_lts.bin", "rb")
+    if not handle then
+        self.english_lts_model = false
+        return nil
+    end
+    local data = handle:read("*all")
+    handle:close()
+
+    if data:sub(1, 8) ~= "KPLTS1\0\0" then
+        logger.warn("Pronunciation: invalid bundled English LTS model header")
+        self.english_lts_model = false
+        return nil
+    end
+    local position = 9
+    local state_count = readLittleEndian16(data, position)
+    local letter_count = data:byte(position + 2)
+    local phone_count = data:byte(position + 3)
+    position = position + 4
+    if not state_count or letter_count ~= 26 or not phone_count then
+        self.english_lts_model = false
+        return nil
+    end
+
+    local letter_index = {}
+    for index = 1, letter_count do
+        letter_index[index] = readLittleEndian16(data, position)
+        if not letter_index[index] then
+            self.english_lts_model = false
+            return nil
+        end
+        position = position + 2
+    end
+
+    local phone_table = {}
+    for index = 1, phone_count do
+        local length = data:byte(position)
+        if not length then
+            self.english_lts_model = false
+            return nil
+        end
+        position = position + 1
+        phone_table[index] = data:sub(position, position + length - 1)
+        position = position + length
+    end
+    if #data - position + 1 ~= state_count * 6 then
+        logger.warn("Pronunciation: bundled English LTS model is truncated")
+        self.english_lts_model = false
+        return nil
+    end
+
+    self.english_lts_model = {
+        data = data,
+        state_count = state_count,
+        letter_index = letter_index,
+        phone_table = phone_table,
+        model_start = position,
+    }
+    return self.english_lts_model
+end
+
+local LATIN_ASCII_FOLD = {
+    ["á"] = "a", ["à"] = "a", ["â"] = "a", ["ä"] = "a", ["ã"] = "a",
+    ["å"] = "a", ["æ"] = "ae", ["ç"] = "c", ["é"] = "e", ["è"] = "e",
+    ["ê"] = "e", ["ë"] = "e", ["í"] = "i", ["ì"] = "i", ["î"] = "i",
+    ["ï"] = "i", ["ñ"] = "n", ["ó"] = "o", ["ò"] = "o", ["ô"] = "o",
+    ["ö"] = "o", ["õ"] = "o", ["ø"] = "o", ["œ"] = "oe", ["ú"] = "u",
+    ["ù"] = "u", ["û"] = "u", ["ü"] = "u", ["ý"] = "y", ["ÿ"] = "y",
+}
+
+local function foldEnglishSpelling(word)
+    local lower = normalizeWord(word)
+    local output = {}
+    local position = 1
+    while position <= #lower do
+        local character = nextUtf8Character(lower, position)
+        if not character then return nil end
+        if character:match("^[a-z]$") then
+            output[#output + 1] = character
+        elseif LATIN_ASCII_FOLD[character] then
+            output[#output + 1] = LATIN_ASCII_FOLD[character]
+        elseif character ~= "'" and character ~= "-" and character ~= " " then
+            return nil
+        end
+        position = position + #character
+    end
+    local folded = table.concat(output)
+    return folded ~= "" and folded or nil
+end
+
+local function flitePhoneToArpabet(phone)
+    local base, stress = phone:match("^([a-z]+)([012]?)$")
+    if not base then return nil end
+    if base == "ax" then base = "ah" end
+    return base:upper() .. stress
+end
+
+function Pronunciation:_englishLtsPhones(word)
+    local model = self:_loadEnglishLtsModel()
+    local spelling = foldEnglishSpelling(word)
+    if not model or not spelling then return nil end
+
+    local full = "000#" .. spelling .. "#000"
+    local output = {}
+    for letter_position = 1, #spelling do
+        local full_position = 4 + letter_position
+        local features = full:sub(full_position - 4, full_position - 1)
+            .. full:sub(full_position + 1, full_position + 4)
+        local letter = spelling:byte(letter_position) - string.byte("a") + 1
+        local state = model.letter_index[letter]
+        local steps = 0
+        local generated_phone
+        while state and state < model.state_count and steps <= model.state_count do
+            local offset = model.model_start + state * 6
+            local feature = model.data:byte(offset)
+            local value = model.data:byte(offset + 1)
+            if feature == 255 then
+                generated_phone = model.phone_table[value + 1]
+                break
+            end
+            local on_true = readLittleEndian16(model.data, offset + 2)
+            local on_false = readLittleEndian16(model.data, offset + 4)
+            state = features:byte(feature + 1) == value and on_true or on_false
+            steps = steps + 1
+        end
+        if not generated_phone then return nil end
+        if generated_phone ~= "epsilon" then
+            for part in generated_phone:gmatch("[^-]+") do
+                local arpabet = flitePhoneToArpabet(part)
+                if not arpabet then return nil end
+                output[#output + 1] = arpabet
+            end
+        end
+    end
+    return #output > 0 and output or nil
+end
+
+local PORTABLE_GENERATORS = {
+    en = function(plugin, word)
+        local phones = plugin:_englishLtsPhones(word)
+        if not phones then return nil end
+        return {
+            ipa = arpabetPhonesToIpa(phones),
+            arpabet = table.concat(phones, " "),
+            source = "Bundled CMU Flite letter-to-sound model (generated)",
+            confidence = 40,
+            note = "Portable US English spelling-to-pronunciation estimate; invented names may have another intended pronunciation.",
+        }
+    end,
+}
+
+function Pronunciation:generatePronunciations(word, hints)
+    if not self.generated_fallback then return nil end
+    local results = {}
+    local seen = {}
+
+    local function add(generated, definition)
+        if not generated then return end
+        local ipa = normalizeOnlineIpa(generated.ipa)
+        if not ipa then return end
+        local key = stripIpaWrappers(ipa) .. "\0" .. definition.code
+        if seen[key] then return end
+        seen[key] = true
+        results[#results + 1] = {
+            ipa = ipa,
+            arpabet = generated.arpabet,
+            simple = readableFromIpa(ipa),
+            simple_approx = true,
+            language = definition.name,
+            region = definition.region,
+            source = generated.source,
+            confidence = generated.confidence,
+            generated = true,
+            note = generated.note,
+        }
+    end
+
+    for _, hint in ipairs(mergeLanguageHints(hints)) do
+        local generator = PORTABLE_GENERATORS[hint.code]
+        if generator then add(generator(self, word), hint) end
+    end
+
+    -- An unknown or unsupported book language still gets the portable US
+    -- English reading as an explicitly labeled adaptation.
+    if #results == 0 then
+        local english = LANGUAGE_DEFINITIONS.english
+        add(PORTABLE_GENERATORS.en(self, word), english)
+    end
+    if #results > 0 then return results end
+end
+
+function Pronunciation:documentLanguageHints()
+    local document = self.ui and self.ui.document
+    if not document or type(document.getProps) ~= "function" then return {} end
+    local ok, properties = pcall(document.getProps, document)
+    if not ok or type(properties) ~= "table"
+            or type(properties.language) ~= "string" then return {} end
+
+    local hints = {}
+    for value in properties.language:gmatch("[^,;]+") do
+        local definition = languageDefinition(nil, value)
+        if definition then
+            hints[#hints + 1] = {
+                code = definition.code,
+                name = definition.name,
+                source = "Book metadata",
+            }
+        end
+    end
+    return mergeLanguageHints(hints)
+end
+
+function Pronunciation:generationHints(word, online_hints)
+    if self.generated_language and self.generated_language ~= "auto" then
+        local selected = languageDefinition(nil, self.generated_language)
+        if selected then
+            return mergeLanguageHints({{
+                code = selected.code,
+                name = selected.name,
+                source = "User-selected generated language",
+            }})
+        end
+    end
+    return mergeLanguageHints(
+        self:queryLanguageHints(word),
+        online_hints,
+        self:documentLanguageHints()
+    )
+end
+
+function Pronunciation:generationCacheKey(word, hints)
+    local languages = {}
+    for _, hint in ipairs(hints or {}) do
+        languages[#languages + 1] = hint.code
+    end
+    return "generator:" .. GENERATOR_VERSION
+        .. "|preference:" .. (self.generated_language or "auto")
+        .. "|languages:" .. table.concat(languages, ",")
+        .. "|word:" .. normalizeWord(word)
+end
+
+function Pronunciation:init()
+    self.db_path = self.path .. "/data/pronunciations.sqlite3"
+    self.settings = LuaSettings:open(DataStorage:getSettingsDir() .. "/pronunciation.lua")
+    self.overrides = self.settings:readSetting("overrides", {})
+    self.cache = self.settings:readSetting("cache", {})
+    self.generated_cache = self.settings:readSetting("generated_cache", {})
+    self.online_fallback = self.settings:readSetting("online_fallback", true)
+    self.generated_fallback = self.settings:readSetting("generated_fallback", true)
+    self.generated_language = self.settings:readSetting("generated_language", "auto")
+    if self.generated_language ~= "auto" then
+        local selected = languageDefinition(nil, self.generated_language)
+        self.generated_language = selected
+            and SELECTABLE_GENERATION_LANGUAGES[selected.code]
+            and selected.code or "auto"
+    end
+
+    -- v0.5 separates sourced and generated caches and keys generated entries
+    -- by language choice so results cannot leak between books.
+    if self.settings:readSetting("cache_version") ~= CACHE_VERSION then
+        self.cache = {}
+        self.generated_cache = {}
+        self.settings:saveSetting("cache", self.cache)
+        self.settings:saveSetting("generated_cache", self.generated_cache)
+        self.settings:saveSetting("cache_version", CACHE_VERSION)
+        self.settings:flush()
+    end
+
+    self.ui.menu:registerToMainMenu(self)
+    self:registerDictionaryButton()
+end
+
+function Pronunciation:_dictionaryButtonSpec()
+    return {
+        id = "pronunciation_lookup",
+        text = _("Pronunciation"),
+        -- Conditional buttons are appended even when a user has an older saved layout.
+        conditional = true,
+        row_group = "pronunciation",
+        show_func = function(dict_popup)
+            return not dict_popup.is_wiki_fullpage
+        end,
+        callback = function(dict_popup)
+            self:lookupAndShow(dict_popup.lookupword or dict_popup.word)
+        end,
+        hold_callback = function(dict_popup)
+            self:editOverride(dict_popup.lookupword or dict_popup.word)
+        end,
+    }
+end
+
+function Pronunciation:registerDictionaryButton()
+    local dictionary = self.ui and self.ui.dictionary
+    if dictionary and type(dictionary.addToDictButtons) == "function" then
+        self.uses_modern_dictionary_buttons = true
+        dictionary:addToDictButtons(self:_dictionaryButtonSpec())
+    else
+        -- KOReader v2022.06-v2024.04 called a tweak_buttons_func method on
+        -- each popup. Patch init once so we can chain whichever plugin owns
+        -- that old single-callback slot when a popup is actually created.
+        DictQuickLookup._pronunciation_plugin_instance = self
+        if not DictQuickLookup._pronunciation_original_init then
+            DictQuickLookup._pronunciation_original_init = DictQuickLookup.init
+            DictQuickLookup.init = function(dict_popup, ...)
+                local previous_tweak = dict_popup.tweak_buttons_func
+                dict_popup.tweak_buttons_func = function(popup, buttons)
+                    if previous_tweak then previous_tweak(popup, buttons) end
+                    local plugin = DictQuickLookup._pronunciation_plugin_instance
+                    if plugin then plugin:_insertLegacyButton(popup, buttons) end
+                end
+                return DictQuickLookup._pronunciation_original_init(dict_popup, ...)
+            end
+        end
+    end
+end
+
+local function containsButton(buttons, id)
+    for _, row in ipairs(buttons or {}) do
+        for _, button in ipairs(row) do
+            if button.id == id then return true end
+        end
+    end
+    return false
+end
+
+function Pronunciation:_insertLegacyButton(dict_popup, buttons)
+    if not dict_popup or dict_popup.is_wiki_fullpage
+            or containsButton(buttons, "pronunciation_lookup") then return end
+    table.insert(buttons, 1, {{
+        id = "pronunciation_lookup",
+        text = _("Pronunciation"),
+        callback = function()
+            self:lookupAndShow(dict_popup.lookupword or dict_popup.word)
+        end,
+        hold_callback = function()
+            self:editOverride(dict_popup.lookupword or dict_popup.word)
+        end,
+    }})
+end
+
+-- KOReader v2024.05-v2026.03 use this event instead of addToDictButtons().
+function Pronunciation:onDictButtonsReady(dict_popup, buttons)
+    if self.uses_modern_dictionary_buttons
+            or (self.ui and self.ui.dictionary
+                and type(self.ui.dictionary.addToDictButtons) == "function") then
+        return
+    end
+    self:_insertLegacyButton(dict_popup, buttons)
+end
+
+function Pronunciation:addToMainMenu(menu_items)
+    local generated_language_items = {
+        {
+            text = _("Auto (word or book language)"),
+            checked_func = function() return self.generated_language == "auto" end,
+            callback = function() self:setGeneratedLanguage("auto") end,
+        },
+    }
+    for _, key in ipairs(GENERATION_LANGUAGE_ORDER) do
+        local definition = LANGUAGE_DEFINITIONS[key]
+        generated_language_items[#generated_language_items + 1] = {
+            text = definition.region
+                and definition.region .. " " .. definition.name
+                or definition.name,
+            checked_func = function()
+                return self.generated_language == definition.code
+            end,
+            callback = function()
+                self:setGeneratedLanguage(definition.code)
+            end,
+        }
+    end
+
+    menu_items.pronunciation = {
+        text = _("Pronunciation dictionary"),
+        sub_item_table = {
+            {
+                text_func = function()
+                    return self.online_fallback
+                        and _("Online fallback: on") or _("Online fallback: off")
+                end,
+                keep_menu_open = true,
+                callback = function()
+                    self.online_fallback = not self.online_fallback
+                    self.settings:saveSetting("online_fallback", self.online_fallback)
+                    self.settings:flush()
+                end,
+            },
+            {
+                text_func = function()
+                    return self.generated_fallback
+                        and _("Generated fallback: on") or _("Generated fallback: off")
+                end,
+                keep_menu_open = true,
+                callback = function()
+                    self.generated_fallback = not self.generated_fallback
+                    self.settings:saveSetting("generated_fallback",
+                        self.generated_fallback)
+                    self.settings:flush()
+                end,
+            },
+            {
+                text_func = function()
+                    if self.generated_language == "auto" then
+                        return _("Generated language") .. ": " .. _("Auto")
+                    end
+                    local definition = languageDefinition(nil,
+                        self.generated_language)
+                    local label = definition and definition.name
+                        or self.generated_language
+                    if definition and definition.region then
+                        label = definition.region .. " " .. label
+                    end
+                    return _("Generated language") .. ": " .. label
+                end,
+                sub_item_table = generated_language_items,
+            },
+            {
+                text = _("Clear cached pronunciations"),
+                callback = function()
+                    self.cache = {}
+                    self.generated_cache = {}
+                    self.settings:saveSetting("cache", self.cache)
+                    self.settings:saveSetting("generated_cache",
+                        self.generated_cache)
+                    self.settings:flush()
+                end,
+            },
+            {
+                text = _("About pronunciation dictionary"),
+                callback = function()
+                    UIManager:show(InfoMessage:new{
+                        text = _("Offline CMUdict and multilingual WikiPron IPA data, a portable US English letter-to-sound model for unfamiliar and invented words, language-aware generated fallbacks, local learning, and personal overrides. Long-press Pronunciation to save an override.")
+                            .. "\n\n" .. _("Version") .. ": " .. PLUGIN_VERSION,
+                    })
+                end,
+            },
+        },
+    }
+end
+
+function Pronunciation:setGeneratedLanguage(code)
+    if code ~= "auto" and not SELECTABLE_GENERATION_LANGUAGES[code] then return end
+    self.generated_language = code
+    self.generated_cache = {}
+    self.settings:saveSetting("generated_language", code)
+    self.settings:saveSetting("generated_cache", self.generated_cache)
+    self.settings:flush()
+end
+
+function Pronunciation:getOverride(word)
+    local override = self.overrides[normalizeWord(word)]
+    if override then
+        return {{
+            ipa = override.ipa,
+            simple = override.simple,
+            source = "Personal override",
+            confidence = 100,
+            note = override.note,
+            simple_approx = false,
+        }}
+    end
+end
+
+function Pronunciation:getCache(word, generated_only)
+    local cached = self.cache[normalizeWord(word)]
+    if cached and type(cached) == "table" and #cached > 0 then
+        local filtered = {}
+        for _, result in ipairs(cached) do
+            if (result.generated == true) == (generated_only == true) then
+                filtered[#filtered + 1] = result
+            end
+        end
+        if #filtered > 0 then return ensureReadables(filtered) end
+    end
+end
+
+function Pronunciation:query(word)
+    local connection
+    local statement
+    local ok, results = pcall(function()
+        connection = SQ3.open(self.db_path)
+        statement = connection:prepare([[
+            SELECT ipa, arpabet, simple, source, confidence, note,
+                   region, simple_approx
+              FROM pronunciations
+             WHERE word = ?
+          ORDER BY confidence DESC, source, region, ipa
+        ]])
+        statement:bind(word)
+        local rows = {}
+        while true do
+            local row = statement:step()
+            if not row then break end
+            local language = languageDefinition(row[7], nil)
+            rows[#rows + 1] = {
+                ipa = row[1],
+                arpabet = row[2],
+                simple = row[3],
+                source = row[4],
+                confidence = tonumber(row[5]) or 0,
+                note = row[6],
+                region = language and nil or row[7],
+                language = language and language.name or nil,
+                simple_approx = tonumber(row[8]) == 1,
+            }
+        end
+        return rows
+    end)
+    if statement then pcall(function() statement:close() end) end
+    if connection then pcall(function() connection:close() end) end
+    if not ok then
+        logger.err("Pronunciation: database lookup failed:", results)
+        return nil
+    end
+    if #results > 0 then
+        ensureReadables(results)
+        -- Prefer an English/curated exact entry over a foreign homograph.
+        -- Foreign-only matches remain available for rare borrowed words.
+        local english = {}
+        for _, result in ipairs(results) do
+            if not result.language or result.language == "English" then
+                english[#english + 1] = result
+            end
+        end
+        return #english > 0 and english or results
+    end
+end
+
+function Pronunciation:queryLanguageHints(word)
+    local connection
+    local statement
+    local ok, results = pcall(function()
+        connection = SQ3.open(self.db_path)
+        statement = connection:prepare([[
+            SELECT language_code, language_name, source, note
+              FROM language_hints
+             WHERE word = ?
+          ORDER BY language_name
+        ]])
+        statement:bind(normalizeWord(word))
+        local rows = {}
+        while true do
+            local row = statement:step()
+            if not row then break end
+            rows[#rows + 1] = {
+                code = row[1],
+                name = row[2],
+                source = row[3],
+                note = row[4],
+            }
+        end
+        return rows
+    end)
+    if statement then pcall(function() statement:close() end) end
+    if connection then pcall(function() connection:close() end) end
+    -- Older v0.3 databases do not have language_hints; treat that as no hint.
+    if not ok then return {} end
+    return mergeLanguageHints(results)
+end
+
+local function lastArpabetPhone(arpabet)
+    if not arpabet then return nil end
+    local last
+    for phone in arpabet:gmatch("%S+") do
+        last = phone:gsub("[012]$", "")
+    end
+    return last
+end
+
+local function lastIpaPhone(ipa)
+    local phones = tokenizeIpa(ipa)
+    return phones[#phones] and phones[#phones].symbol or nil
+end
+
+local SIBILANTS = {
+    S = true, Z = true, SH = true, ZH = true, CH = true, JH = true,
+    ["s"] = true, ["z"] = true, ["ʃ"] = true, ["ʒ"] = true,
+    ["tʃ"] = true, ["dʒ"] = true,
+}
+local VOICELESS = {
+    P = true, T = true, K = true, F = true, TH = true,
+    ["p"] = true, ["t"] = true, ["k"] = true,
+    ["f"] = true, ["θ"] = true, ["x"] = true,
+}
+local PAST_VOICELESS = {
+    P = true, K = true, F = true, S = true, SH = true, CH = true, TH = true,
+    ["p"] = true, ["k"] = true, ["f"] = true, ["s"] = true,
+    ["ʃ"] = true, ["tʃ"] = true, ["θ"] = true, ["x"] = true,
+}
+
+local function finalPhone(result)
+    return lastArpabetPhone(result.arpabet) or lastIpaPhone(result.ipa)
+end
+
+local function pluralSuffix(phone)
+    if SIBILANTS[phone] then return "ɪz" end
+    if VOICELESS[phone] then return "s" end
+    return "z"
+end
+
+local function pastSuffix(phone)
+    if phone == "T" or phone == "D" or phone == "t" or phone == "d" then
+        return "ɪd"
+    end
+    if PAST_VOICELESS[phone] then return "t" end
+    return "d"
+end
+
+local function appendIpa(ipa, suffix)
+    local core = stripIpaWrappers(ipa)
+    if core == "" then return nil end
+    return "/" .. core .. suffix .. "/"
+end
+
+function Pronunciation:derive(base_results, kind, shown_base)
+    local results = {}
+    for _, base in ipairs(base_results) do
+        if not base.language or base.language == "English" then
+            local suffix
+            if kind == "plural" or kind == "possessive" then
+                suffix = pluralSuffix(finalPhone(base))
+            elseif kind == "past" then
+                suffix = pastSuffix(finalPhone(base))
+            elseif kind == "ing" then
+                suffix = "ɪŋ"
+            end
+            local ipa = suffix and appendIpa(base.ipa, suffix)
+            if ipa then
+                results[#results + 1] = {
+                    ipa = ipa,
+                    simple = readableFromIpa(ipa),
+                    simple_approx = true,
+                    region = base.region,
+                    language = base.language,
+                    source = (base.source or "Offline") .. " + derived inflection",
+                    confidence = math.max(50, (base.confidence or 70) - 10),
+                    note = "Derived from base form " .. shown_base
+                        .. " using English inflection rules.",
+                }
+            end
+        end
+    end
+    if #results > 0 then return results end
+end
+
+local function addCandidate(candidates, seen, word, kind)
+    if word and word ~= "" then
+        local key = word .. "\0" .. kind
+        if not seen[key] then
+            seen[key] = true
+            candidates[#candidates + 1] = { word = word, kind = kind }
+        end
+    end
+end
+
+function Pronunciation:candidates(word)
+    local candidates = {}
+    local seen = {}
+
+    if word:match("'s$") then
+        addCandidate(candidates, seen, word:sub(1, -3), "possessive")
+    end
+    if word:match("ies$") and #word > 4 then
+        addCandidate(candidates, seen, word:sub(1, -4) .. "y", "plural")
+    end
+    if word:match("ves$") and #word > 4 then
+        addCandidate(candidates, seen, word:sub(1, -4) .. "f", "plural")
+        addCandidate(candidates, seen, word:sub(1, -4) .. "fe", "plural")
+    end
+    if word:match("oes$") and #word > 4 then
+        addCandidate(candidates, seen, word:sub(1, -3), "plural")
+    end
+    if word:match("sses$") or word:match("shes$") or word:match("ches$")
+            or word:match("xes$") or word:match("zes$") then
+        addCandidate(candidates, seen, word:sub(1, -3), "plural")
+    end
+    if word:match("es$") and #word > 3 then
+        addCandidate(candidates, seen, word:sub(1, -3), "plural")
+    end
+    if word:match("s$") and not word:match("ss$") and #word > 2 then
+        addCandidate(candidates, seen, word:sub(1, -2), "plural")
+    end
+
+    if word:match("ied$") and #word > 4 then
+        addCandidate(candidates, seen, word:sub(1, -4) .. "y", "past")
+    end
+    if word:match("ed$") and #word > 3 then
+        local without_ed = word:sub(1, -3)
+        addCandidate(candidates, seen, without_ed, "past")
+        if without_ed:sub(-1) == without_ed:sub(-2, -2) then
+            addCandidate(candidates, seen, without_ed:sub(1, -2), "past")
+        end
+        addCandidate(candidates, seen, word:sub(1, -2), "past")
+    end
+
+    if word:match("ying$") and #word > 4 then
+        addCandidate(candidates, seen, word:sub(1, -5) .. "ie", "ing")
+    end
+    if word:match("ing$") and #word > 4 then
+        local without_ing = word:sub(1, -4)
+        addCandidate(candidates, seen, without_ing, "ing")
+        if without_ing:sub(-1) == without_ing:sub(-2, -2) then
+            addCandidate(candidates, seen, without_ing:sub(1, -2), "ing")
+        end
+        addCandidate(candidates, seen, without_ing .. "e", "ing")
+    end
+    return candidates
+end
+
+function Pronunciation:lookupOffline(word)
+    word = normalizeWord(word)
+    local results = self:getOverride(word)
+    if results then return results, word end
+    results = self:query(word)
+    if results then return results, word end
+    results = self:getCache(word)
+    if results then return results, word end
+
+    for _, candidate in ipairs(self:candidates(word)) do
+        local base = self:getOverride(candidate.word)
+            or self:query(candidate.word)
+            or self:getCache(candidate.word)
+        if base then
+            local derived = self:derive(base, candidate.kind, candidate.word)
+            if derived then return derived, candidate.word end
+        end
+    end
+end
+
+local function httpGet(request_url)
+    local sink = {}
+    socketutil:set_timeout()
+    local ok, code, headers, status = pcall(function()
+        return socket.skip(1, http.request{
+            url = request_url,
+            method = "GET",
+            sink = socketutil.table_sink and socketutil.table_sink(sink)
+                or ltn12.sink.table(sink),
+            headers = {
+                ["User-Agent"] = socketutil.USER_AGENT
+                    or "KOReader-Pronunciation/" .. PLUGIN_VERSION,
+            },
+        })
+    end)
+    socketutil:reset_timeout()
+    if not ok or code ~= 200 then
+        logger.warn("Pronunciation: HTTP request failed:", request_url, status or code)
+        return nil
+    end
+    return table.concat(sink), headers
+end
+
+local function decodeEntities(text)
+    return (text or "")
+        :gsub("&nbsp;", " ")
+        :gsub("&amp;", "&")
+        :gsub("&lt;", "<")
+        :gsub("&gt;", ">")
+        :gsub("&#39;", "'")
+        :gsub("&quot;", '"')
+end
+
+local function stripHtml(text)
+    return trim(decodeEntities((text or ""):gsub("<.->", " "))
+        :gsub("%s+", " "))
+end
+
+local function inferRegion(label)
+    local lower = stripHtml(label):lower()
+    if lower:find("general american", 1, true)
+            or lower:find("united states", 1, true)
+            or lower:find("(us)", 1, true)
+            or lower:find("california", 1, true) then
+        return "US"
+    elseif lower:find("received pronunciation", 1, true)
+            or lower:find("united kingdom", 1, true)
+            or lower:find("(uk)", 1, true)
+            or lower:find("british", 1, true) then
+        return "UK"
+    elseif lower:find("canada", 1, true) then
+        return "Canada"
+    elseif lower:find("australia", 1, true) then
+        return "Australia"
+    elseif lower:find("new zealand", 1, true) then
+        return "New Zealand"
+    elseif lower:find("ireland", 1, true) or lower:find("irish", 1, true) then
+        return "Ireland"
+    end
+end
+
+local function inferRegionFromAudio(audio)
+    local lower = (audio or ""):lower()
+    if lower:find("_us_", 1, true) or lower:find("-us-", 1, true)
+            or lower:find("american", 1, true) then
+        return "US"
+    elseif lower:find("_gb_", 1, true) or lower:find("_uk_", 1, true)
+            or lower:find("-uk-", 1, true) or lower:find("british", 1, true) then
+        return "UK"
+    end
+end
+
+normalizeOnlineIpa = function(ipa)
+    ipa = trim(ipa)
+    if ipa == "" then return nil end
+    local first = ipa:sub(1, 1)
+    if first ~= "/" and first ~= "[" then return wrapIpa(ipa) end
+    return ipa
+end
+
+local function resultKey(result)
+    return stripIpaWrappers(result.ipa) .. "\0"
+        .. (result.language or "") .. "\0" .. (result.region or "")
+end
+
+local function mergeResults(...)
+    local merged = {}
+    local by_key = {}
+    for i = 1, select("#", ...) do
+        for _, result in ipairs(select(i, ...) or {}) do
+            if result.ipa then
+                ensureReadable(result)
+                local key = resultKey(result)
+                local existing = by_key[key]
+                if not existing then
+                    by_key[key] = result
+                    merged[#merged + 1] = result
+                elseif result.source and existing.source
+                        and not existing.source:find(result.source, 1, true) then
+                    existing.source = existing.source .. " + " .. result.source
+                    existing.confidence = math.max(existing.confidence or 0,
+                        result.confidence or 0)
+                end
+            end
+        end
+    end
+    if #merged > 0 then return merged end
+end
+
+function Pronunciation:parseDictionaryApi(decoded)
+    if type(decoded) ~= "table" then return nil end
+    local results = {}
+    local seen = {}
+    local seen_ipa = {}
+    local function add(ipa, region)
+        ipa = normalizeOnlineIpa(ipa)
+        if not ipa then return end
+        local bare_ipa = stripIpaWrappers(ipa)
+        local key = bare_ipa .. "\0" .. (region or "")
+        if seen[key] then return end
+        seen[key] = true
+        seen_ipa[bare_ipa] = true
+        results[#results + 1] = {
+            ipa = ipa,
+            simple = readableFromIpa(ipa),
+            simple_approx = true,
+            region = region,
+            source = "Free Dictionary API",
+            confidence = 75,
+            note = "Learned online and cached locally.",
+        }
+    end
+
+    for _, entry in ipairs(decoded) do
+        for _, phonetic in ipairs(entry.phonetics or {}) do
+            add(phonetic.text, inferRegionFromAudio(phonetic.audio))
+        end
+        local bare_entry_ipa = entry.phonetic
+            and stripIpaWrappers(entry.phonetic) or nil
+        if not bare_entry_ipa or not seen_ipa[bare_entry_ipa] then
+            add(entry.phonetic)
+        end
+    end
+    if #results > 0 then return results end
+end
+
+function Pronunciation:dictApi(word)
+    local body = httpGet("https://api.dictionaryapi.dev/api/v2/entries/en/"
+        .. url.escape(word))
+    if not body then return nil end
+    local ok, decoded = pcall(JSON.decode, body, JSON.decode.simple)
+    if not ok then return nil end
+    return self:parseDictionaryApi(decoded)
+end
+
+local function englishWiktionarySection(html)
+    local english_id = html:find('id="English"', 1, true)
+    if not english_id then return nil end
+    local next_h2 = html:find('<h2[^>]-id="', english_id + #('id="English"'))
+    local next_heading = html:find(
+        '<div[^>]-class="[^"]-mw%-heading2[^"]-"',
+        english_id + #('id="English"'))
+    local finish
+    if next_h2 and next_heading then finish = math.min(next_h2, next_heading) - 1
+    elseif next_h2 then finish = next_h2 - 1
+    elseif next_heading then finish = next_heading - 1
+    else finish = #html end
+    return html:sub(english_id, finish)
+end
+
+local function extractIpaSpans(fragment, callback)
+    local found = false
+    for raw_ipa in fragment:gmatch(
+            '<span[^>]-class="[^"]*IPA[^"]*"[^>]*>(.-)</span>') do
+        local ipa = normalizeOnlineIpa(stripHtml(raw_ipa))
+        if ipa then
+            found = true
+            callback(ipa)
+        end
+    end
+    return found
+end
+
+local function extractEtymologyLanguageHints(english)
+    local hints = {}
+    for fragment in (english or ""):gmatch(
+            '<span[^>]-class="[^"]*etyl[^"]*"[^>]*>(.-)</span>') do
+        local name = stripHtml(fragment)
+        local definition = languageDefinition(name, nil)
+        if definition then
+            hints[#hints + 1] = {
+                code = definition.code,
+                name = definition.name,
+                source = "Wiktionary etymology",
+            }
+        end
+    end
+    return mergeLanguageHints(hints)
+end
+
+function Pronunciation:parseWiktionaryHtml(html)
+    local english = englishWiktionarySection(html or "")
+    if not english then return nil end
+    local language_hints = extractEtymologyLanguageHints(english)
+
+    local results = {}
+    local seen = {}
+    local function add(ipa, region)
+        local key = stripIpaWrappers(ipa) .. "\0" .. (region or "")
+        if seen[key] then return end
+        seen[key] = true
+        results[#results + 1] = {
+            ipa = ipa,
+            simple = readableFromIpa(ipa),
+            simple_approx = true,
+            region = region,
+            source = "Wiktionary",
+            confidence = 85,
+            note = "English-section pronunciation learned online and cached locally.",
+        }
+    end
+
+    local found_in_items = false
+    for item in english:gmatch("<li[^>]*>(.-)</li>") do
+        local region = inferRegion(item)
+        if extractIpaSpans(item, function(ipa) add(ipa, region) end) then
+            found_in_items = true
+        end
+    end
+    if not found_in_items then
+        extractIpaSpans(english, function(ipa) add(ipa, nil) end)
+    end
+    if #results > 0 then return results, language_hints end
+    return nil, language_hints
+end
+
+function Pronunciation:wiktionary(word)
+    local body = httpGet("https://en.wiktionary.org/w/api.php"
+        .. "?action=parse&format=json&formatversion=2&redirects=1&prop=text&page="
+        .. url.escape(word))
+    if not body then return nil end
+    local ok, decoded = pcall(JSON.decode, body, JSON.decode.simple)
+    if not ok or not decoded or not decoded.parse or not decoded.parse.text then
+        return nil
+    end
+    local html = decoded.parse.text
+    if type(html) == "table" then html = html["*"] end
+    if type(html) ~= "string" then return nil end
+    return self:parseWiktionaryHtml(html)
+end
+
+function Pronunciation:lookupOnline(word)
+    local dictionary = self:dictApi(word)
+    local wiktionary, language_hints = self:wiktionary(word)
+    return mergeResults(dictionary, wiktionary), language_hints
+end
+
+function Pronunciation:saveCache(word, results)
+    self.cache[normalizeWord(word)] = results
+    self.settings:saveSetting("cache", self.cache)
+    self.settings:saveSetting("cache_version", CACHE_VERSION)
+    self.settings:flush()
+end
+
+function Pronunciation:getGeneratedCache(key)
+    local cached = (self.generated_cache or {})[key]
+    if type(cached) == "table" and #cached > 0 then
+        return ensureReadables(cached)
+    end
+end
+
+function Pronunciation:saveGeneratedCache(key, results)
+    self.generated_cache = self.generated_cache or {}
+    self.generated_cache[key] = results
+    self.settings:saveSetting("generated_cache", self.generated_cache)
+    self.settings:saveSetting("cache_version", CACHE_VERSION)
+    self.settings:flush()
+end
+
+function Pronunciation:format(original, results, matched)
+    local lines = { original }
+    if matched and normalizeWord(original) ~= matched then
+        lines[#lines + 1] = "Matched/derived from: " .. matched
+    end
+    lines[#lines + 1] = ""
+    for index, result in ipairs(results) do
+        local location
+        if result.language == "English" and result.region then
+            location = result.region .. " English"
+        else
+            location = result.language or result.region
+        end
+        local qualifiers = {}
+        if result.generated then qualifiers[#qualifiers + 1] = "generated" end
+        if location then qualifiers[#qualifiers + 1] = location end
+        local qualifier = #qualifiers > 0
+            and " (" .. table.concat(qualifiers, "; ") .. ")" or ""
+        lines[#lines + 1] = "IPA" .. qualifier .. ": " .. (result.ipa or "—")
+        if result.simple and result.simple ~= "" then
+            local qualifier = result.simple_approx and " (approx.)" or ""
+            lines[#lines + 1] = "Readable" .. qualifier .. ": " .. result.simple
+        end
+        if result.source then lines[#lines + 1] = "Source: " .. result.source end
+        if result.confidence then
+            lines[#lines + 1] = "Confidence: " .. result.confidence .. "/100"
+        end
+        if result.note and result.note ~= "" then lines[#lines + 1] = result.note end
+        if index < #results then lines[#lines + 1] = "" end
+    end
+    return table.concat(lines, "\n")
+end
+
+function Pronunciation:generatedForWord(word, online_hints)
+    if not self.generated_fallback then return nil end
+    local hints = self:generationHints(word, online_hints)
+    local cache_key = self:generationCacheKey(word, hints)
+    local cached = self:getGeneratedCache(cache_key)
+    if cached then return cached end
+    local generated = self:generatePronunciations(word, hints)
+    if generated then self:saveGeneratedCache(cache_key, generated) end
+    return generated
+end
+
+function Pronunciation:lookupAndShow(word)
+    word = trim(word)
+    if word == "" then return end
+    local results, matched = self:lookupOffline(word)
+    if results then
+        UIManager:show(InfoMessage:new{ text = self:format(word, results, matched) })
+        return
+    end
+    if not self.online_fallback then
+        local generated = self:generatedForWord(normalizeWord(word))
+        if generated then
+            UIManager:show(InfoMessage:new{
+                text = self:format(word, generated, normalizeWord(word)),
+            })
+            return
+        end
+        UIManager:show(InfoMessage:new{
+            text = word .. "\n\nNo offline pronunciation found. "
+                .. "Long-press Pronunciation to add a personal override.",
+        })
+        return
+    end
+
+    NetworkMgr:runWhenOnline(function()
+        local normalized = normalizeWord(word)
+        local online, language_hints = self:lookupOnline(normalized)
+        local online_match = normalized
+        if not online then
+            for _, candidate in ipairs(self:candidates(normalized)) do
+                local base = self:lookupOnline(candidate.word)
+                if base then
+                    online = self:derive(base, candidate.kind, candidate.word)
+                    online_match = candidate.word
+                    if online then break end
+                end
+            end
+        end
+        if online then
+            self:saveCache(normalized, online)
+            UIManager:show(InfoMessage:new{
+                text = self:format(word, online, online_match),
+            })
+        else
+            local generated = self:generatedForWord(normalized, language_hints)
+            if generated then
+                UIManager:show(InfoMessage:new{
+                    text = self:format(word, generated, normalized),
+                })
+            else
+                UIManager:show(InfoMessage:new{
+                    text = word .. "\n\nNo pronunciation found offline or online. "
+                        .. "Long-press Pronunciation to save your own IPA/readable pronunciation.",
+                })
+            end
+        end
+    end)
+end
+
+function Pronunciation:editOverride(word)
+    word = normalizeWord(word)
+    if word == "" then return end
+    local existing = self.overrides[word] or {}
+    local dialog
+    dialog = InputDialog:new{
+        title = "Pronunciation override: " .. word,
+        input = (existing.ipa or "") .. "\n" .. (existing.simple or ""),
+        input_hint = "/IPA/ on line 1\nReadable pronunciation on line 2",
+        allow_newline = true,
+        buttons = {{
+            {
+                text = _("Cancel"),
+                id = "close",
+                callback = function() UIManager:close(dialog) end,
+            },
+            {
+                text = _("Delete"),
+                callback = function()
+                    self.overrides[word] = nil
+                    self.settings:saveSetting("overrides", self.overrides)
+                    self.settings:flush()
+                    UIManager:close(dialog)
+                end,
+            },
+            {
+                text = _("Save"),
+                callback = function()
+                    local text = dialog:getInputText() or ""
+                    local ipa, simple = text:match("([^\n]*)\n?(.*)")
+                    ipa, simple = trim(ipa), trim(simple)
+                    if ipa ~= "" or simple ~= "" then
+                        self.overrides[word] = { ipa = ipa, simple = simple }
+                    else
+                        self.overrides[word] = nil
+                    end
+                    self.settings:saveSetting("overrides", self.overrides)
+                    self.settings:flush()
+                    UIManager:close(dialog)
+                end,
+            },
+        }},
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+return Pronunciation
