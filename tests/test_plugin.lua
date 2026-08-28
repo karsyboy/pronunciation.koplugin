@@ -3,9 +3,25 @@ local function preload(name, value)
 end
 
 local shown_widget
+local shown_widgets = {}
+local closed_widgets = {}
+local repaint_count = 0
+local next_tick_count = 0
 local UIManager = {
-    show = function(_, widget) shown_widget = widget end,
-    close = function() end,
+    show = function(_, widget)
+        shown_widget = widget
+        shown_widgets[#shown_widgets + 1] = widget
+    end,
+    close = function(_, widget)
+        closed_widgets[#closed_widgets + 1] = widget
+    end,
+    forceRePaint = function()
+        repaint_count = repaint_count + 1
+    end,
+    nextTick = function(_, callback)
+        next_tick_count = next_tick_count + 1
+        callback()
+    end,
 }
 local NetworkMgr = {
     runWhenOnline = function(_, callback) callback() end,
@@ -420,12 +436,60 @@ Plugin.queryLanguageHints = function()
     return {{ code = "es", name = "Spanish" }}
 end
 Plugin.online_fallback = true
+shown_widget = nil
+shown_widgets = {}
+closed_widgets = {}
+repaint_count = 0
+next_tick_count = 0
 Plugin:lookupAndShow("zyrathion")
+equal(#shown_widgets, 2, "online lookup did not reuse its painted progress popup")
+equal(shown_widgets[1].text, "Looking up pronunciation…",
+    "lookup progress text changed")
+equal(shown_widgets[1].dismissable, false,
+    "lookup progress can be dismissed while work is running")
+equal(repaint_count, 1, "lookup progress was not painted before blocking work")
+equal(next_tick_count, 2, "lookup work did not yield to the UI event loop")
+equal(closed_widgets[1], shown_widgets[1], "offline progress was not closed")
 truthy(shown_widget and shown_widget.text, "missing-word result was not shown")
 truthy(shown_widget.text:find("MFA/Pynini", 1, true),
     "missing-word flow lost generated provenance")
 truthy(shown_widget.text:find("generated; US English", 1, true),
     "missing-word flow lost generated provenance")
+
+-- A canceled Wi-Fi prompt never runs its callback, so the first progress
+-- message must be closed before control passes to KOReader's network manager.
+local run_when_online = NetworkMgr.runWhenOnline
+NetworkMgr.runWhenOnline = function() end
+shown_widgets = {}
+closed_widgets = {}
+Plugin:lookupAndShow("cancelled")
+equal(#shown_widgets, 1, "network handoff showed an unexpected popup")
+equal(#closed_widgets, 1, "network handoff stranded its progress popup")
+equal(closed_widgets[1], shown_widgets[1],
+    "network handoff did not close the initial progress popup")
+
+-- If KOReader connects asynchronously, the plugin paints a new progress popup
+-- immediately before the deferred HTTP lookup.
+local pending_online_callback
+NetworkMgr.runWhenOnline = function(_, callback)
+    pending_online_callback = callback
+end
+shown_widgets = {}
+closed_widgets = {}
+repaint_count = 0
+next_tick_count = 0
+Plugin:lookupAndShow("delayed")
+equal(#shown_widgets, 1, "deferred lookup showed an early online popup")
+equal(#closed_widgets, 1, "deferred lookup stranded its initial popup")
+truthy(pending_online_callback, "deferred lookup callback was not retained")
+pending_online_callback()
+equal(#shown_widgets, 3, "deferred online progress or result was not shown")
+equal(shown_widgets[2].text, "Looking up pronunciation…",
+    "deferred online progress text changed")
+equal(closed_widgets[2], shown_widgets[2],
+    "deferred online progress was not closed")
+equal(repaint_count, 2, "deferred online progress was not painted")
+NetworkMgr.runWhenOnline = run_when_online
 
 Plugin.cache = {}
 Plugin.generated_cache = {}

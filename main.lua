@@ -25,6 +25,46 @@ local function newInfoMessage(options)
     return InfoMessage:new(options)
 end
 
+local function showLookupProgress()
+    local progress = newInfoMessage{
+        text = _("Looking up pronunciation…"),
+        dismissable = false,
+        show_icon = false,
+    }
+    UIManager:show(progress)
+    -- Make the message visible before database, G2P, or HTTP work blocks the
+    -- event loop. Guard both APIs for compatibility with older KOReader builds.
+    if type(UIManager.forceRePaint) == "function" then
+        UIManager:forceRePaint()
+    end
+    return progress
+end
+
+local function closeLookupProgress(progress)
+    if progress then UIManager:close(progress) end
+end
+
+local function showLookupMessage(progress, text)
+    closeLookupProgress(progress)
+    UIManager:show(newInfoMessage{ text = text })
+end
+
+local function afterLookupProgress(callback)
+    if type(UIManager.nextTick) == "function" then
+        UIManager:nextTick(callback)
+    else
+        callback()
+    end
+end
+
+local function runLookupSafely(word, progress, callback)
+    local ok, error_message = pcall(callback)
+    if ok then return end
+    logger.err("Pronunciation lookup failed:", error_message)
+    showLookupMessage(progress,
+        word .. "\n\n" .. _("Pronunciation lookup failed. Please try again."))
+end
+
 local function loadOnlineModules()
     if http then return end
     JSON = require("json")
@@ -1877,62 +1917,86 @@ function Pronunciation:generatedForWord(word, online_hints)
     return generated
 end
 
-function Pronunciation:lookupAndShow(word)
-    word = trim(word)
-    if word == "" then return end
+function Pronunciation:_lookupOnlineAndShow(word, progress)
+    local normalized = normalizeWord(word)
+    local online, language_hints = self:lookupOnline(normalized)
+    local online_match = normalized
+    if not online then
+        for _, candidate in ipairs(self:candidates(normalized)) do
+            local base = self:lookupOnline(candidate.word)
+            if base then
+                online = self:derive(base, candidate.kind, candidate.word)
+                online_match = candidate.word
+                if online then break end
+            end
+        end
+    end
+    if online then
+        self:saveCache(normalized, online)
+        showLookupMessage(progress, self:format(word, online, online_match))
+    else
+        local generated = self:generatedForWord(normalized, language_hints)
+        if generated then
+            showLookupMessage(progress, self:format(word, generated, normalized))
+        else
+            showLookupMessage(progress,
+                word .. "\n\nNo pronunciation found offline or online. "
+                    .. "Long-press Pronunciation to save your own IPA/readable pronunciation.")
+        end
+    end
+end
+
+function Pronunciation:_lookupAndShow(word, progress)
     local results, matched = self:lookupOffline(word)
     if results then
-        UIManager:show(newInfoMessage{ text = self:format(word, results, matched) })
+        showLookupMessage(progress, self:format(word, results, matched))
         return
     end
     if not self.online_fallback then
         local generated = self:generatedForWord(normalizeWord(word))
         if generated then
-            UIManager:show(newInfoMessage{
-                text = self:format(word, generated, normalizeWord(word)),
-            })
+            showLookupMessage(progress,
+                self:format(word, generated, normalizeWord(word)))
             return
         end
-        UIManager:show(newInfoMessage{
-            text = word .. "\n\nNo offline pronunciation found. "
-                .. "Long-press Pronunciation to add a personal override.",
-        })
+        showLookupMessage(progress,
+            word .. "\n\nNo offline pronunciation found. "
+                .. "Long-press Pronunciation to add a personal override.")
         return
     end
 
     if not NetworkMgr then NetworkMgr = require("ui/network/manager") end
+    local callback_ran = false
+    local progress_closed = false
     NetworkMgr:runWhenOnline(function()
-        local normalized = normalizeWord(word)
-        local online, language_hints = self:lookupOnline(normalized)
-        local online_match = normalized
-        if not online then
-            for _, candidate in ipairs(self:candidates(normalized)) do
-                local base = self:lookupOnline(candidate.word)
-                if base then
-                    online = self:derive(base, candidate.kind, candidate.word)
-                    online_match = candidate.word
-                    if online then break end
-                end
-            end
-        end
-        if online then
-            self:saveCache(normalized, online)
-            UIManager:show(newInfoMessage{
-                text = self:format(word, online, online_match),
-            })
-        else
-            local generated = self:generatedForWord(normalized, language_hints)
-            if generated then
-                UIManager:show(newInfoMessage{
-                    text = self:format(word, generated, normalized),
-                })
-            else
-                UIManager:show(newInfoMessage{
-                    text = word .. "\n\nNo pronunciation found offline or online. "
-                        .. "Long-press Pronunciation to save your own IPA/readable pronunciation.",
-                })
-            end
-        end
+        callback_ran = true
+        -- runWhenOnline calls back immediately when the device is already
+        -- online, so reuse the popup and avoid an extra e-ink refresh. If
+        -- KOReader had to connect first, repaint a fresh popup for HTTP work.
+        local online_progress = progress
+        if progress_closed then online_progress = showLookupProgress() end
+        afterLookupProgress(function()
+            runLookupSafely(word, online_progress, function()
+                self:_lookupOnlineAndShow(word, online_progress)
+            end)
+        end)
+    end)
+    -- KOReader owns any Wi-Fi prompt. Do not leave our non-dismissible popup
+    -- behind if the user cancels and the callback is never invoked.
+    if not callback_ran then
+        progress_closed = true
+        closeLookupProgress(progress)
+    end
+end
+
+function Pronunciation:lookupAndShow(word)
+    word = trim(word)
+    if word == "" then return end
+    local progress = showLookupProgress()
+    afterLookupProgress(function()
+        runLookupSafely(word, progress, function()
+            self:_lookupAndShow(word, progress)
+        end)
     end)
 end
 

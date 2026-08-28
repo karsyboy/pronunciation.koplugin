@@ -34,6 +34,9 @@ The bundled generator is US English. Auto mode is retained so additional ordinar
 
 ## Pronunciation display
 
+A compact loading popup is painted before each offline or online lookup, so
+database and generated-model work never looks like a frozen reader on slower devices.
+
 - Bundled entries contain stress-aware General American IPA converted from CMUdict ARPABET.
 - Bundled WikiPron entries contain exact broad IPA for US and UK English and retain their regional labels.
 - Bundled readable spellings are syllabified and place primary emphasis in uppercase, for example `ih-PIT-uh-mee`.
