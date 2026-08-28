@@ -17,7 +17,7 @@ The button looks up the text that originally opened the dictionary popup, not a 
 ## Lookup order
 
 1. Personal override
-2. Exact bundled CMUdict and multilingual WikiPron entries
+2. Exact bundled CMUdict and US/UK WikiPron entries
 3. Locally cached sourced results
 4. English morphological derivation from a known English base form
 5. Free Dictionary API and sourced IPA from the English section of Wiktionary
@@ -35,7 +35,7 @@ The bundled generator is US English. Auto mode is retained so additional ordinar
 ## Pronunciation display
 
 - Bundled entries contain stress-aware General American IPA converted from CMUdict ARPABET.
-- Bundled Basque entries contain exact broad IPA mined by WikiPron from Wiktionary and are labeled `Basque`.
+- Bundled WikiPron entries contain exact broad IPA for US and UK English and retain their regional labels.
 - Bundled readable spellings are syllabified and place primary emphasis in uppercase, for example `ih-PIT-uh-mee`.
 - Online readable spellings are generated from IPA and explicitly labeled `approx.`.
 - Automatically derived plurals, possessives, past forms, and gerunds are labeled as derived and receive a lower confidence score.
@@ -64,7 +64,7 @@ When upgrading, copy the complete plugin directory, including the rebuilt `data/
 
 ## Offline data
 
-The exact-pronunciation database is built from the CMU Pronouncing Dictionary, WikiPron's Basque broad-IPA TSV, the curated supplement in `data/supplemental.tsv`, and origin-only hints in `data/language_hints.tsv`. Exact revisions and the WikiPron input SHA-256 are recorded in the database `metadata` table.
+The exact-pronunciation database is built from the CMU Pronouncing Dictionary, the curated WikiPron broad-IPA sources listed in `data/wikipron_sources.tsv`, the supplement in `data/supplemental.tsv`, and optional origin-only hints in `data/language_hints.tsv`. The current manifest contains US and UK English. Exact revisions and input SHA-256 hashes are recorded in both the manifest and database metadata.
 
 Rebuild it with:
 
@@ -72,11 +72,11 @@ Rebuild it with:
 python3 tools/build_database.py \
   --cmudict /path/to/cmudict.dict \
   --cmudict-revision 74790861f652b15e4ac49015a90074ad62a27690 \
-  --wikipron /path/to/wikipron/data/scrape/tsv/eus_latn_broad.tsv eus Basque \
+  --wikipron-root /path/to/wikipron/data/scrape/tsv \
   --wikipron-revision d282e848a211ea31cfd730f0ced8bc8cdab9e83d
 ```
 
-WikiPron inputs are repeatable: add another `--wikipron TSV CODE NAME` argument for each language. These records remain sourced pronunciations and always outrank generated estimates.
+To add a source, add one row to `data/wikipron_sources.tsv` with its broad-IPA filename, stable source ID, language, optional region, and SHA-256. The builder rejects narrow TSVs, missing files, duplicate IDs, and hash mismatches. Manifest records remain sourced pronunciations and always outrank generated estimates.
 
 ## Portable generated-pronunciation data
 
@@ -113,4 +113,4 @@ Plugin code is MIT licensed. CMUdict retains its BSD-3-Clause terms. WikiPron-de
 
 ## Limitations
 
-CMUdict and the portable G2P model are General American resources, and the currently bundled WikiPron addition is not a complete multilingual dictionary. Language selection uses a user preference, explicit bundled hints, Wiktionary etymology markup, or book metadata; none can determine an author's intended pronunciation for an invented name. Unsupported book languages fall back to a clearly labeled US-English adaptation. Generated IPA and readable spellings are aids, not authoritative transcriptions; leave **Generated fallback** disabled if only sourced results are desired.
+CMUdict and the portable G2P model are General American resources, while the curated WikiPron manifest currently adds US and UK English broad IPA rather than a complete multilingual dictionary. Language selection uses a user preference, explicit bundled hints, Wiktionary etymology markup, or book metadata; none can determine an author's intended pronunciation for an invented name. Unsupported book languages fall back to a clearly labeled US-English adaptation. Generated IPA and readable spellings are aids, not authoritative transcriptions; leave **Generated fallback** disabled if only sourced results are desired.

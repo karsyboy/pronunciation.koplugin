@@ -21,11 +21,12 @@ RELEASE_FILES = (
     "data/pronunciations.sqlite3",
     "data/mfa_english_g2p.bin",
     "data/mfa_english_g2p.SOURCE.txt",
+    "data/wikipron_sources.tsv",
 )
 ZIP_TIMESTAMP = (2026, 1, 1, 0, 0, 0)
 PLUGIN_VERSION = "0.5.0"
 DATABASE_SHA256 = (
-    "337c196fbf8411fc9fb8c096b980f8a3dadf88c7f129931e138119044761ffb1"
+    "62494a9b4b612eeaf04caedde85b123d1b5365fc87ed597ca6ec9815d0281fcc"
 )
 G2P_SHA256 = (
     "9b4d3730a451c530da2a81f2c378a9e4635ec706e14f43d22fee945effd17f84"
@@ -52,7 +53,7 @@ def validate_inputs() -> None:
     try:
         if database.execute("PRAGMA quick_check").fetchone()[0] != "ok":
             raise RuntimeError("pronunciation database failed quick_check")
-        if database.execute("PRAGMA user_version").fetchone()[0] != 5:
+        if database.execute("PRAGMA user_version").fetchone()[0] != 6:
             raise RuntimeError("pronunciation database schema is not release-ready")
         metadata = dict(database.execute("SELECT key, value FROM metadata"))
         if metadata.get("version") != PLUGIN_VERSION:

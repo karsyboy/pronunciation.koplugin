@@ -19,6 +19,7 @@ from build_database import (  # noqa: E402
     arpabet_to_ipa,
     arpabet_to_readable,
     build_database,
+    load_wikipron_manifest,
 )
 from build_release import (  # noqa: E402
     DATABASE_SHA256,
@@ -46,7 +47,7 @@ def check_database() -> None:
     connection = sqlite3.connect(database)
     try:
         assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         columns = {
             row[1] for row in connection.execute("PRAGMA table_info(pronunciations)")
         }
@@ -61,12 +62,12 @@ def check_database() -> None:
         ).fetchone()[0] == 3
         assert connection.execute(
             "SELECT COUNT(*) FROM pronunciation_profiles"
-        ).fetchone()[0] == 7
+        ).fetchone()[0] == 8
         headwords, records = connection.execute(
             "SELECT COUNT(DISTINCT word), COUNT(*) FROM pronunciations"
         ).fetchone()
-        assert headwords >= 137_500
-        assert records >= 155_000
+        assert headwords >= 176_000
+        assert records >= 345_000
 
         for ipa, arpabet, simple in connection.execute(
             "SELECT ipa, arpabet, simple FROM pronunciations "
@@ -87,12 +88,13 @@ def check_database() -> None:
         assert ("/ɪˈpɪtəmi/", "ih-PIT-uh-mee") in pronunciations("epitome")
         assert any(ipa == "/ˈklʊərɪkɔːnz/"
                    for ipa, _ in pronunciations("clurichauns"))
-        assert ("/eu̯s̺kaɾa/", None) in pronunciations("euskara")
-        basque = connection.execute(
-            "SELECT source, region, simple_approx FROM pronunciations "
-            "WHERE word = 'euskara' AND ipa = '/eu̯s̺kaɾa/'"
-        ).fetchone()
-        assert basque == ("WikiPron/Wiktionary", "Basque", 1)
+        regional_tomato = connection.execute(
+            "SELECT ipa, region, simple_approx FROM pronunciations "
+            "WHERE word = 'tomato' AND source = 'WikiPron/Wiktionary'"
+        ).fetchall()
+        assert {region for _, region, _ in regional_tomato} == {"US", "UK"}
+        assert ("/təmɑːtəʊ/", "UK", 1) in regional_tomato
+        assert ("/təmeɪtoʊ/", "US", 1) in regional_tomato
         assert connection.execute(
             "SELECT COUNT(*) FROM pronunciations "
             "WHERE source = 'WikiPron/Wiktionary' "
@@ -108,14 +110,18 @@ def check_database() -> None:
         assert len(metadata["supplement_sha256"]) == 64
         assert len(metadata["language_hints_sha256"]) == 64
         assert len(metadata["wikipron_revision"]) == 40
-        assert metadata["wikipron_eus_sha256"] == (
-            "9e4301ed2f86e060a43fa8fb06f9b2590df284c9a54ed373bbae2d002a0bfac0"
+        assert metadata["wikipron_eng_us_sha256"] == (
+            "f304b8f0565466e8abfe4c04a30d99421e1590d2aa17c4a08ebfa5942c587e75"
         )
-        assert metadata["wikipron_eus_records"] == "20058"
+        assert metadata["wikipron_eng_uk_sha256"] == (
+            "f8ca476aa2e96cb22cafbf9099d689b5902a9d321579055081909b2eeafa1b8d"
+        )
+        assert metadata["wikipron_eng_us_records"] == "105458"
+        assert metadata["wikipron_eng_uk_records"] == "105157"
         assert metadata["converter"] == (
-            "tools/build_database.py compact profile schema v3"
+            "tools/build_database.py manifest profile schema v4"
         )
-        assert database.stat().st_size < 9_000_000
+        assert database.stat().st_size < 15_000_000
     finally:
         connection.close()
 
@@ -125,14 +131,29 @@ def check_compact_database_build() -> None:
         directory = Path(directory)
         cmudict = directory / "cmudict.dict"
         cmudict.write_text("cat K AE1 T\n", encoding="utf-8")
-        wikipron = directory / "eus.tsv"
-        wikipron.write_text("euskara\te u̯ s̺ k a ɾ a\n", encoding="utf-8")
+        us_wikipron = directory / "eng_latn_us_broad.tsv"
+        uk_wikipron = directory / "eng_latn_uk_broad.tsv"
+        us_wikipron.write_text("test\tt ɛ s t\n", encoding="utf-8")
+        uk_wikipron.write_text("test\tt ɛ s t\n", encoding="utf-8")
+        manifest = directory / "wikipron_sources.tsv"
+        manifest.write_text(
+            "filename\tsource_id\tlanguage_code\tlanguage_name\tregion\tsha256\n"
+            f"{us_wikipron.name}\teng_us\ten\tEnglish\tUS\t"
+            f"{hashlib.sha256(us_wikipron.read_bytes()).hexdigest()}\n"
+            f"{uk_wikipron.name}\teng_uk\ten\tEnglish\tUK\t"
+            f"{hashlib.sha256(uk_wikipron.read_bytes()).hexdigest()}\n",
+            encoding="utf-8",
+        )
+        wikipron_sources = load_wikipron_manifest(manifest, directory)
+        assert [source.source_id for source in wikipron_sources] == [
+            "eng_us", "eng_uk",
+        ]
         output = directory / "pronunciations.sqlite3"
         headwords, records = build_database(
             cmudict,
             ROOT / "data" / "supplemental.tsv",
             ROOT / "data" / "language_hints.tsv",
-            [(wikipron, "eus", "Basque")],
+            wikipron_sources,
             output,
             "test-cmudict-revision",
             "test-wikipron-revision",
@@ -141,7 +162,7 @@ def check_compact_database_build() -> None:
         connection = sqlite3.connect(output)
         try:
             assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
             assert connection.execute(
                 "SELECT ipa, arpabet, simple FROM pronunciations WHERE word='cat'"
             ).fetchone() == ("/ˈkæt/", "K AE1 T", "KAT")
@@ -150,7 +171,12 @@ def check_compact_database_build() -> None:
             ).fetchone()[0] == 3
             assert connection.execute(
                 "SELECT COUNT(*) FROM pronunciation_profiles"
-            ).fetchone()[0] == 7
+            ).fetchone()[0] == 8
+            assert connection.execute(
+                "SELECT region FROM pronunciations "
+                "WHERE word='test' AND source='WikiPron/Wiktionary' "
+                "ORDER BY region"
+            ).fetchall() == [("UK",), ("US",)]
         finally:
             connection.close()
 
@@ -182,7 +208,7 @@ def check_release_build() -> None:
         installed_size, archive_size = build_release(output)
         build_release(second_output)
         assert output.read_bytes() == second_output.read_bytes()
-        assert installed_size < 20_000_000
+        assert installed_size < 26_000_000
         assert archive_size < installed_size
         with zipfile.ZipFile(output) as archive:
             assert archive.namelist() == [

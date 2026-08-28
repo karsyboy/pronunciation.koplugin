@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the bundled KOReader pronunciation database from CMUdict."""
+"""Build the bundled database from CMUdict and selected WikiPron broad TSVs."""
 
 from __future__ import annotations
 
@@ -10,10 +10,20 @@ import hashlib
 import os
 import re
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
 
 
 PLUGIN_VERSION = "0.5.0"
+
+
+@dataclass(frozen=True)
+class WikiPronSource:
+    path: Path
+    source_id: str
+    language_code: str
+    language_name: str
+    region: str | None = None
 VOWELS = {
     "AA", "AE", "AH", "AO", "AW", "AY", "EH", "ER",
     "EY", "IH", "IY", "OW", "OY", "UH", "UW",
@@ -199,10 +209,14 @@ def parse_supplement(path: Path):
             )
 
 
-def parse_wikipron(path: Path, language_code: str, language_name: str):
+def parse_wikipron(source: WikiPronSource):
     """Load a WikiPron broad TSV, removing its phoneme-segmentation spaces."""
-    with path.open(encoding="utf-8") as source:
-        for line_number, raw_line in enumerate(source, 1):
+    location = (
+        f"{source.region} {source.language_name}"
+        if source.region else source.language_name
+    )
+    with source.path.open(encoding="utf-8") as tsv:
+        for line_number, raw_line in enumerate(tsv, 1):
             line = raw_line.rstrip("\r\n")
             if not line:
                 continue
@@ -223,10 +237,73 @@ def parse_wikipron(path: Path, language_code: str, language_name: str):
                 None,
                 "WikiPron/Wiktionary",
                 78,
-                f"Exact {language_name} IPA mined from Wiktionary by WikiPron.",
-                language_name,
+                f"Exact {location} IPA mined from Wiktionary by WikiPron.",
+                source.region or source.language_name,
                 1,
             )
+
+
+def load_wikipron_manifest(path: Path, tsv_root: Path) -> list[WikiPronSource]:
+    """Resolve and verify the curated set of distributable broad-IPA inputs."""
+    required = {
+        "filename", "source_id", "language_code", "language_name",
+        "region", "sha256",
+    }
+    sources = []
+    seen_ids = set()
+    with path.open(encoding="utf-8", newline="") as manifest:
+        reader = csv.DictReader(manifest, delimiter="\t")
+        missing = required - set(reader.fieldnames or ())
+        if missing:
+            raise ValueError(f"WikiPron manifest is missing columns: {sorted(missing)}")
+        for line_number, row in enumerate(reader, 2):
+            filename = row["filename"].strip()
+            relative = Path(filename)
+            if (not filename or relative.is_absolute() or ".." in relative.parts
+                    or not filename.endswith("_broad.tsv")):
+                raise ValueError(
+                    f"invalid WikiPron broad TSV on manifest line {line_number}: "
+                    f"{filename!r}"
+                )
+            source_id = row["source_id"].strip().lower()
+            if not re.fullmatch(r"[a-z0-9_]+", source_id):
+                raise ValueError(
+                    f"invalid WikiPron source_id on line {line_number}: "
+                    f"{source_id!r}"
+                )
+            if source_id in seen_ids:
+                raise ValueError(f"duplicate WikiPron source_id: {source_id}")
+            seen_ids.add(source_id)
+            expected_hash = row["sha256"].strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+                raise ValueError(
+                    f"invalid WikiPron SHA-256 on line {line_number}"
+                )
+            tsv_path = tsv_root / relative
+            if not tsv_path.is_file():
+                raise FileNotFoundError(f"WikiPron TSV is missing: {tsv_path}")
+            actual_hash = sha256(tsv_path)
+            if actual_hash != expected_hash:
+                raise ValueError(
+                    f"WikiPron SHA-256 mismatch for {filename}: expected "
+                    f"{expected_hash}, found {actual_hash}"
+                )
+            language_code = row["language_code"].strip().lower()
+            language_name = row["language_name"].strip()
+            if not language_code or not language_name:
+                raise ValueError(
+                    f"missing WikiPron language on manifest line {line_number}"
+                )
+            sources.append(WikiPronSource(
+                path=tsv_path,
+                source_id=source_id,
+                language_code=language_code,
+                language_name=language_name,
+                region=row["region"].strip() or None,
+            ))
+    if not sources:
+        raise ValueError("WikiPron manifest contains no broad-IPA sources")
+    return sources
 
 
 def parse_language_hints(path: Path):
@@ -265,19 +342,17 @@ CREATE TABLE pronunciation_profiles (
 CREATE TABLE pronunciation_entries (
     word TEXT NOT NULL,
     ipa TEXT NOT NULL,
-    source_id INTEGER NOT NULL,
     arpabet TEXT,
     simple TEXT,
     profile_id INTEGER NOT NULL,
-    PRIMARY KEY (word, ipa, source_id)
+    PRIMARY KEY (word, ipa, profile_id)
 ) WITHOUT ROWID;
 CREATE VIEW pronunciations AS
 SELECT e.word, e.ipa, e.arpabet, e.simple, s.name AS source,
        p.confidence, p.note, p.region, p.simple_approx
   FROM pronunciation_entries AS e
-  JOIN pronunciation_sources AS s ON s.id = e.source_id
-  JOIN pronunciation_profiles AS p
-    ON p.id = e.profile_id AND p.source_id = e.source_id;
+  JOIN pronunciation_profiles AS p ON p.id = e.profile_id
+  JOIN pronunciation_sources AS s ON s.id = p.source_id;
 CREATE TABLE language_hints (
     word TEXT NOT NULL,
     language_code TEXT NOT NULL,
@@ -290,7 +365,7 @@ CREATE TABLE metadata (
     key TEXT NOT NULL PRIMARY KEY,
     value TEXT NOT NULL
 ) WITHOUT ROWID;
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;
 """
 
 
@@ -303,8 +378,8 @@ def insert_pronunciations(
     """Normalize repeated source metadata while streaming pronunciation rows."""
     insert = """
         INSERT OR IGNORE INTO pronunciation_entries
-            (word, ipa, source_id, arpabet, simple, profile_id)
-        VALUES (?, ?, ?, ?, ?, ?)
+            (word, ipa, arpabet, simple, profile_id)
+        VALUES (?, ?, ?, ?, ?)
     """
     batch = []
     inserted = 0
@@ -338,7 +413,7 @@ def insert_pronunciations(
                 (profile_id, *profile),
             )
 
-        batch.append((word, ipa, source_id, arpabet, simple, profile_id))
+        batch.append((word, ipa, arpabet, simple, profile_id))
         if len(batch) >= 5000:
             flush()
     flush()
@@ -349,7 +424,7 @@ def build_database(
     cmudict: Path,
     supplement: Path,
     language_hints: Path,
-    wikipron_sources: list[tuple[Path, str, str]],
+    wikipron_sources: list[WikiPronSource],
     output: Path,
     revision: str,
     wikipron_revision: str,
@@ -373,10 +448,10 @@ def build_database(
             connection, parse_supplement(supplement), source_ids, profile_ids
         )
         wikipron_counts = {}
-        for path, language_code, language_name in wikipron_sources:
-            wikipron_counts[language_code] = insert_pronunciations(
+        for source in wikipron_sources:
+            wikipron_counts[source.source_id] = insert_pronunciations(
                 connection,
-                parse_wikipron(path, language_code, language_name),
+                parse_wikipron(source),
                 source_ids,
                 profile_ids,
             )
@@ -403,7 +478,7 @@ def build_database(
             "language_hints_sha256": sha256(language_hints),
             "headwords": str(headwords),
             "records": str(records),
-            "converter": "tools/build_database.py compact profile schema v3",
+            "converter": "tools/build_database.py manifest profile schema v4",
         }
         if wikipron_sources:
             metadata.update({
@@ -411,10 +486,11 @@ def build_database(
                 "wikipron_url": "https://github.com/CUNY-CL/wikipron",
                 "wikipron_license": "CC BY-SA 4.0 (Wiktionary data)",
             })
-            for path, language_code, _ in wikipron_sources:
-                metadata[f"wikipron_{language_code}_sha256"] = sha256(path)
-                metadata[f"wikipron_{language_code}_records"] = str(
-                    wikipron_counts[language_code]
+            for source in wikipron_sources:
+                key = f"wikipron_{source.source_id}"
+                metadata[f"{key}_sha256"] = sha256(source.path)
+                metadata[f"{key}_records"] = str(
+                    wikipron_counts[source.source_id]
                 )
         connection.executemany(
             "INSERT INTO metadata(key, value) VALUES (?, ?)", metadata.items()
@@ -440,19 +516,22 @@ def main() -> None:
     parser.add_argument("--language-hints", type=Path,
                         default=Path("data/language_hints.tsv"))
     parser.add_argument(
-        "--wikipron", nargs=3, action="append", default=[],
-        metavar=("TSV", "LANGUAGE_CODE", "LANGUAGE_NAME"),
-        help="add an exact WikiPron TSV; may be repeated",
+        "--wikipron-manifest", type=Path,
+        default=Path("data/wikipron_sources.tsv"),
+        help="curated WikiPron broad-IPA source manifest",
+    )
+    parser.add_argument(
+        "--wikipron-root", required=True, type=Path,
+        help="directory containing the manifest's WikiPron TSV files",
     )
     parser.add_argument("--wikipron-revision", default="")
     parser.add_argument("--output", type=Path,
                         default=Path("data/pronunciations.sqlite3"))
     parser.add_argument("--cmudict-revision", required=True)
     args = parser.parse_args()
-    wikipron_sources = [
-        (Path(path), language_code, language_name)
-        for path, language_code, language_name in args.wikipron
-    ]
+    wikipron_sources = load_wikipron_manifest(
+        args.wikipron_manifest, args.wikipron_root
+    )
     if wikipron_sources and not args.wikipron_revision:
         parser.error("--wikipron-revision is required with --wikipron")
     headwords, records = build_database(

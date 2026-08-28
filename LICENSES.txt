@@ -56,16 +56,20 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 
-WikiPron-derived Wiktionary data (CC BY-SA 4.0)
-================================================
+WikiPron-derived US/UK English data (CC BY-SA 4.0)
+===================================================
 
-The Basque pronunciation records in data/pronunciations.sqlite3 were extracted
-from the English Wiktionary by WikiPron:
+The US and UK English broad-IPA records in data/pronunciations.sqlite3 were
+extracted from the English Wiktionary by WikiPron:
 
   WikiPron: https://github.com/CUNY-CL/wikipron
   Pinned revision: d282e848a211ea31cfd730f0ced8bc8cdab9e83d
-  Input: data/scrape/tsv/eus_latn_broad.tsv
-  Input SHA-256: 9e4301ed2f86e060a43fa8fb06f9b2590df284c9a54ed373bbae2d002a0bfac0
+  Inputs:
+    data/scrape/tsv/eng_latn_us_broad.tsv
+    SHA-256: f304b8f0565466e8abfe4c04a30d99421e1590d2aa17c4a08ebfa5942c587e75
+    data/scrape/tsv/eng_latn_uk_broad.tsv
+    SHA-256: f8ca476aa2e96cb22cafbf9099d689b5902a9d321579055081909b2eeafa1b8d
+  Curated source manifest: data/wikipron_sources.tsv
   Wiktionary: https://en.wiktionary.org/
   Wiktionary attribution and license information:
   https://en.wiktionary.org/wiki/Wiktionary:Copyrights

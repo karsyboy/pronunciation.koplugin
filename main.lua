@@ -335,7 +335,6 @@ end
 local normalizeOnlineIpa
 
 local LANGUAGE_DEFINITIONS = {
-    basque = { code = "eu", name = "Basque" },
     catalan = { code = "ca", name = "Catalan" },
     dutch = { code = "nl", name = "Dutch" },
     english = { code = "en", name = "English", region = "US" },
@@ -355,7 +354,7 @@ end
 
 local LANGUAGE_CODE_ALIASES = {
     cat = "ca", cym = "cy", dut = "nl", nld = "nl", eng = "en",
-    eus = "eu", baq = "eu", fra = "fr", fre = "fr", deu = "de",
+    fra = "fr", fre = "fr", deu = "de",
     ger = "de", ita = "it", lat = "la", por = "pt", spa = "es",
 }
 
@@ -1187,7 +1186,7 @@ function Pronunciation:addToMainMenu(menu_items)
                 text = _("About pronunciation dictionary"),
                 callback = function()
                     UIManager:show(newInfoMessage{
-                        text = _("Offline CMUdict and multilingual WikiPron IPA data, a portable weighted US English G2P model for unfamiliar and invented words, language-aware generated fallbacks, local learning, and personal overrides. Long-press Pronunciation to save an override.")
+                        text = _("Offline CMUdict and US/UK WikiPron IPA data, a portable weighted US English G2P model for unfamiliar and invented words, language-aware generated fallbacks, local learning, and personal overrides. Long-press Pronunciation to save an override.")
                             .. "\n\n" .. _("Version") .. ": " .. PLUGIN_VERSION,
                     })
                 end,
