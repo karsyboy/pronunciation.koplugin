@@ -73,6 +73,8 @@ assert(package.loaded["lua-ljsqlite3/init"] == nil,
     "SQLite was loaded during plugin startup")
 assert(package.loaded["socket.http"] == nil,
     "HTTP was loaded during plugin startup")
+assert(package.loaded["ui/widget/dictquicklookup"] == nil,
+    "legacy dictionary widget was loaded during modern plugin startup")
 
 local function equal(actual, expected, message)
     if actual ~= expected then
@@ -275,6 +277,27 @@ truthy(generated_cache_count <= 128, "generated cache limit was not enforced")
 truthy(Plugin.generated_cache["generator:2|test:current"],
     "new generated cache entry was pruned")
 
+-- Online results are recoverable, so their settings cache is bounded and
+-- unused descriptions are stripped before serialization.
+Plugin.cache = {}
+for index = 1, 270 do
+    Plugin.cache["cached-" .. index] = {{
+        ipa = "/tɛst/",
+        note = "unused description",
+    }}
+end
+Plugin:saveCache("cached-current", {{
+    ipa = "/kɝənt/",
+    note = "unused description",
+}})
+local sourced_cache_count = 0
+for _, results in pairs(Plugin.cache) do
+    sourced_cache_count = sourced_cache_count + 1
+    equal(results[1].note, nil, "sourced cache retained an unused description")
+end
+truthy(sourced_cache_count <= 256, "sourced cache limit was not enforced")
+truthy(Plugin.cache["cached-current"], "new sourced cache entry was pruned")
+
 truthy(hasCandidate("running", "run", "ing"), "running -> run missing")
 truthy(hasCandidate("stopped", "stop", "past"), "stopped -> stop missing")
 truthy(hasCandidate("heroes", "hero", "plural"), "heroes -> hero missing")
@@ -335,7 +358,7 @@ local fake_statement = {
         if active_word == "cat" and not self.returned then
             self.returned = true
             return { "/ˈkæt/", "K AE1 T", "KAT", "CMUdict", 80,
-                "test", "US", 0 }
+                "US", 0 }
         end
     end,
     close = function() statement_close_count = statement_close_count + 1 end,
@@ -355,6 +378,9 @@ local found, found_error, reused = Plugin:_queryConnection(
 truthy(found and found[1], "reused query lost a pronunciation")
 equal(found_error, nil, "reused query returned an error")
 equal(reused, reusable, "query did not return the reusable statement")
+equal(found[1].region, "US", "compact query shifted the region column")
+equal(found[1].simple_approx, false,
+    "compact query shifted the readable-approximation column")
 equal(prepare_count, 1, "candidate queries prepared more than once")
 equal(reset_count, 1, "reused candidate statement was not reset")
 reused:close()
@@ -366,6 +392,8 @@ local wiktionary_fixture = [[
 <ul>
 <li>(General American) IPA: <span class="IPA">/ɹɪˈzum/</span></li>
 <li>(Received Pronunciation) IPA: <span class="IPA">/ɹɪˈzjuːm/</span></li>
+<li>Rhymes: <span class="IPA">-uːm</span></li>
+<li>Suffix: <span class="IPA">/-ʃʊ-/</span></li>
 </ul>
 <div class="mw-heading mw-heading2"><h2 id="Indonesian">Indonesian</h2></div>
 <ul><li>IPA: <span class="IPA">/reˈsume/</span></li></ul>
@@ -388,6 +416,23 @@ equal(#dictionary_api, 2, "Dictionary API duplicate was not removed")
 equal(dictionary_api[1].region, "US", "Dictionary API US label missing")
 equal(dictionary_api[2].region, "UK", "Dictionary API UK label missing")
 truthy(dictionary_api[1].simple, "Dictionary API readable missing")
+local normalized_api = Plugin:parseDictionaryApi({{ phonetic = "/tɛst" }})
+equal(normalized_api[1].ipa, "/tɛst/",
+    "online IPA with one wrapper was not normalized")
+
+local dict_api_method = Plugin.dictApi
+local wiktionary_method = Plugin.wiktionary
+Plugin.dictApi = function()
+    return {{ ipa = "/dɪkt/", source = "Dictionary", confidence = 75 }}
+end
+Plugin.wiktionary = function()
+    return {{ ipa = "/wɪki/", source = "Wiktionary", confidence = 85 }}
+end
+local ordered_online = Plugin:lookupOnline("test")
+equal(ordered_online[1].source, "Wiktionary",
+    "online results were not ordered by confidence")
+Plugin.dictApi = dict_api_method
+Plugin.wiktionary = wiktionary_method
 
 local etymology_fixture = [[
 <div class="mw-heading mw-heading2"><h2 id="English">English</h2></div>
@@ -408,6 +453,8 @@ truthy(formatted:find("Readable (approx.):", 1, true),
     "approximate readable label missing")
 truthy(formatted:find("Source: Wiktionary", 1, true),
     "compact formatting lost source attribution")
+truthy(not formatted:find("Confidence:", 1, true),
+    "confidence score was not removed from the UI")
 truthy(not formatted:find("learned online and cached locally", 1, true),
     "source description was not removed")
 local ptf_header = TextBoxWidget.PTF_HEADER
@@ -419,6 +466,40 @@ TextBoxWidget.PTF_HEADER = ptf_header
 local generated_formatted = Plugin:format("zyrathion", fantasy, "zyrathion")
 truthy(generated_formatted:find("IPA (generated; US English):", 1, true),
     "generated IPA label missing")
+
+local original_overrides = Plugin.overrides
+Plugin.overrides = { cat = { ipa = "[kæt]", simple = "KAT" } }
+equal(Plugin:getOverride("cat")[1].ipa, "/kæt/",
+    "stored override IPA was not normalized")
+Plugin.overrides = original_overrides
+
+-- Older KOReader builds without the repaint scheduling helpers still perform
+-- an exact offline lookup and close the progress popup synchronously.
+local lookup_offline = Plugin.lookupOffline
+local next_tick = UIManager.nextTick
+local force_repaint = UIManager.forceRePaint
+Plugin.lookupOffline = function()
+    return {{
+        ipa = "/ˈkæt/",
+        source = "CMUdict",
+        confidence = 95,
+    }}, "cat"
+end
+UIManager.nextTick = nil
+UIManager.forceRePaint = nil
+shown_widgets = {}
+closed_widgets = {}
+Plugin:lookupAndShow("cat")
+equal(#shown_widgets, 2, "legacy offline lookup did not show progress and result")
+equal(shown_widgets[1].text, "Looking up pronunciation…",
+    "legacy offline progress text changed")
+equal(closed_widgets[1], shown_widgets[1],
+    "legacy offline progress was not closed")
+truthy(shown_widget.text:find("Source: CMUdict", 1, true),
+    "legacy offline result was not shown")
+Plugin.lookupOffline = lookup_offline
+UIManager.nextTick = next_tick
+UIManager.forceRePaint = force_repaint
 
 -- End-to-end missing-word flow: sourced online lookup is attempted first,
 -- then an unsupported language hint safely uses the general English fallback.

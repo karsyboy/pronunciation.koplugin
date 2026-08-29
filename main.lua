@@ -2,13 +2,13 @@ local DataStorage = require("datastorage")
 local LuaSettings = require("luasettings")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
-local DictQuickLookup = require("ui/widget/dictquicklookup")
 local logger = require("logger")
 local _ = require("gettext")
 
 -- Keep database, network, JSON, and dialog modules out of the plugin's startup
 -- footprint. They are loaded only when the corresponding feature is used.
-local InfoMessage, InputDialog, JSON, NetworkMgr, SQ3
+local DictQuickLookup, InfoMessage, InputDialog, JSON, NetworkMgr, SQ3
+local TextBoxWidget
 local ltn12, socket, http, socketutil, url
 
 local function sqliteModule()
@@ -78,6 +78,7 @@ end
 local PLUGIN_VERSION = "0.5.0"
 local CACHE_VERSION = 5
 local GENERATOR_VERSION = 2
+local SOURCED_CACHE_LIMIT = 256
 local GENERATED_CACHE_LIMIT = 128
 local GENERATED_CACHE_PREFIX = "generator:" .. GENERATOR_VERSION .. "|"
 
@@ -436,7 +437,6 @@ local function mergeLanguageHints(...)
                     name = definition.name,
                     region = definition.region,
                     source = hint.source,
-                    note = hint.note,
                 }
             end
         end
@@ -904,9 +904,8 @@ local PORTABLE_GENERATORS = {
         return {
             ipa = arpabetPhonesToIpa(phones),
             arpabet = table.concat(phones, " "),
-            source = "Bundled MFA/Pynini English G2P model (generated)",
+            source = "MFA/Pynini English G2P",
             confidence = 45,
-            note = "Portable weighted US English spelling-to-pronunciation estimate; invented names may have another intended pronunciation.",
         }
     end,
 }
@@ -933,7 +932,6 @@ function Pronunciation:generatePronunciations(word, hints)
             source = generated.source,
             confidence = generated.confidence,
             generated = true,
-            note = generated.note,
         }
     end
 
@@ -1001,23 +999,40 @@ function Pronunciation:generationCacheKey(word, hints)
         .. "|word:" .. normalizeWord(word)
 end
 
-local function pruneGeneratedCache(cache, protected_key)
+local function pruneResultCache(cache, limit, protected_key, required_prefix)
     if type(cache) ~= "table" then return false end
     local count = 0
     local changed = false
-    for key in pairs(cache or {}) do
-        if type(key) ~= "string"
-                or key:sub(1, #GENERATED_CACHE_PREFIX)
-                    ~= GENERATED_CACHE_PREFIX then
+    for key, results in pairs(cache) do
+        local valid = type(key) == "string"
+            and type(results) == "table" and #results > 0
+            and (not required_prefix
+                or key:sub(1, #required_prefix) == required_prefix)
+        if valid then
+            for _, result in ipairs(results) do
+                if type(result) ~= "table" then
+                    valid = false
+                    break
+                end
+                -- Descriptive notes are retained in the bundled database for
+                -- provenance, but are not displayed and should not bloat the
+                -- settings file or resident cache.
+                if result.note ~= nil then
+                    result.note = nil
+                    changed = true
+                end
+            end
+        end
+        if not valid then
             cache[key] = nil
             changed = true
         else
             count = count + 1
         end
     end
-    if count <= GENERATED_CACHE_LIMIT then return changed end
+    if count <= limit then return changed end
     for key in pairs(cache) do
-        if count <= GENERATED_CACHE_LIMIT then break end
+        if count <= limit then break end
         if key ~= protected_key then
             cache[key] = nil
             count = count - 1
@@ -1025,6 +1040,15 @@ local function pruneGeneratedCache(cache, protected_key)
         end
     end
     return changed
+end
+
+local function pruneSourcedCache(cache, protected_key)
+    return pruneResultCache(cache, SOURCED_CACHE_LIMIT, protected_key)
+end
+
+local function pruneGeneratedCache(cache, protected_key)
+    return pruneResultCache(cache, GENERATED_CACHE_LIMIT, protected_key,
+        GENERATED_CACHE_PREFIX)
 end
 
 function Pronunciation:init()
@@ -1055,11 +1079,19 @@ function Pronunciation:init()
         self.settings:saveSetting("generated_cache", self.generated_cache)
         self.settings:saveSetting("cache_version", CACHE_VERSION)
         self.settings:flush()
-    elseif pruneGeneratedCache(self.generated_cache) then
+    else
         -- Old generator formats are never reused, and generated entries can
-        -- always be recreated offline. Keep their startup footprint bounded.
-        self.settings:saveSetting("generated_cache", self.generated_cache)
-        self.settings:flush()
+        -- always be recreated offline. Both recoverable caches remain bounded
+        -- so pronunciation.lua cannot grow indefinitely on long-lived devices.
+        local cache_changed = pruneSourcedCache(self.cache)
+        local generated_changed = pruneGeneratedCache(self.generated_cache)
+        if cache_changed then
+            self.settings:saveSetting("cache", self.cache)
+        end
+        if generated_changed then
+            self.settings:saveSetting("generated_cache", self.generated_cache)
+        end
+        if cache_changed or generated_changed then self.settings:flush() end
     end
 
     self.ui.menu:registerToMainMenu(self)
@@ -1091,9 +1123,12 @@ function Pronunciation:registerDictionaryButton()
         self.uses_modern_dictionary_buttons = true
         dictionary:addToDictButtons(self:_dictionaryButtonSpec())
     else
-        -- KOReader v2022.06-v2024.04 called a tweak_buttons_func method on
+        -- KOReader v2022.06-v2024.02 called a tweak_buttons_func method on
         -- each popup. Patch init once so we can chain whichever plugin owns
         -- that old single-callback slot when a popup is actually created.
+        if not DictQuickLookup then
+            DictQuickLookup = require("ui/widget/dictquicklookup")
+        end
         DictQuickLookup._pronunciation_plugin_instance = self
         if not DictQuickLookup._pronunciation_original_init then
             DictQuickLookup._pronunciation_original_init = DictQuickLookup.init
@@ -1134,7 +1169,7 @@ function Pronunciation:_insertLegacyButton(dict_popup, buttons)
     }})
 end
 
--- KOReader v2024.05-v2026.03 use this event instead of addToDictButtons().
+-- KOReader v2024.03-v2026.03 use this event instead of addToDictButtons().
 function Pronunciation:onDictButtonsReady(dict_popup, buttons)
     if self.uses_modern_dictionary_buttons
             or (self.ui and self.ui.dictionary
@@ -1226,7 +1261,7 @@ function Pronunciation:addToMainMenu(menu_items)
                 text = _("About pronunciation dictionary"),
                 callback = function()
                     UIManager:show(newInfoMessage{
-                        text = _("Offline CMUdict and US/UK WikiPron IPA data, a portable weighted US English G2P model for unfamiliar and invented words, language-aware generated fallbacks, local learning, and personal overrides. Long-press Pronunciation to save an override.")
+                        text = _("Offline US/UK IPA, sourced online lookup, and a bundled US English fallback for unfamiliar words. Long-press Pronunciation to save an override.")
                             .. "\n\n" .. _("Version") .. ": " .. PLUGIN_VERSION,
                     })
                 end,
@@ -1246,13 +1281,12 @@ end
 
 function Pronunciation:getOverride(word)
     local override = self.overrides[normalizeWord(word)]
-    if override then
+    if type(override) == "table" then
         return {{
-            ipa = override.ipa,
+            ipa = wrapIpa(override.ipa),
             simple = override.simple,
             source = "Personal override",
             confidence = 100,
-            note = override.note,
             simple_approx = false,
         }}
     end
@@ -1273,8 +1307,11 @@ local function boldHeading(text)
     -- TextBoxWidget's inline-bold markers were added after the oldest KOReader
     -- versions supported by this plugin. Use them when available and degrade
     -- to an unchanged plain heading on older builds.
-    local ok, TextBoxWidget = pcall(require, "ui/widget/textboxwidget")
-    if not ok or not TextBoxWidget.PTF_HEADER
+    if TextBoxWidget == nil then
+        local ok, module = pcall(require, "ui/widget/textboxwidget")
+        TextBoxWidget = ok and module or false
+    end
+    if not TextBoxWidget or not TextBoxWidget.PTF_HEADER
             or not TextBoxWidget.PTF_BOLD_START
             or not TextBoxWidget.PTF_BOLD_END then
         return text
@@ -1284,8 +1321,7 @@ local function boldHeading(text)
 end
 
 local PRONUNCIATION_QUERY = [[
-    SELECT ipa, arpabet, simple, source, confidence, note,
-           region, simple_approx
+    SELECT ipa, arpabet, simple, source, confidence, region, simple_approx
       FROM pronunciations
      WHERE word = ?
   ORDER BY confidence DESC, source, region, ipa
@@ -1303,17 +1339,16 @@ function Pronunciation:_queryConnection(connection, word, statement)
         while true do
             local row = statement:step()
             if not row then break end
-            local language = languageDefinition(row[7], nil)
+            local language = languageDefinition(row[6], nil)
             rows[#rows + 1] = {
                 ipa = row[1],
                 arpabet = row[2],
                 simple = row[3],
                 source = row[4],
                 confidence = tonumber(row[5]) or 0,
-                note = row[6],
-                region = language and nil or row[7],
+                region = language and nil or row[6],
                 language = language and language.name or nil,
-                simple_approx = tonumber(row[8]) == 1,
+                simple_approx = tonumber(row[7]) == 1,
             }
         end
         return rows
@@ -1359,7 +1394,7 @@ function Pronunciation:queryLanguageHints(word)
     local ok, results = pcall(function()
         connection = openDatabase(self.db_path)
         statement = connection:prepare([[
-            SELECT language_code, language_name, source, note
+            SELECT language_code, language_name, source
               FROM language_hints
              WHERE word = ?
           ORDER BY language_name
@@ -1373,7 +1408,6 @@ function Pronunciation:queryLanguageHints(word)
                 code = row[1],
                 name = row[2],
                 source = row[3],
-                note = row[4],
             }
         end
         return rows
@@ -1461,8 +1495,6 @@ function Pronunciation:derive(base_results, kind, shown_base)
                     language = base.language,
                     source = (base.source or "Offline") .. " + derived inflection",
                     confidence = math.max(50, (base.confidence or 70) - 10),
-                    note = "Derived from base form " .. shown_base
-                        .. " using English inflection rules.",
                 }
             end
         end
@@ -1543,7 +1575,7 @@ function Pronunciation:lookupOffline(word)
     -- possible inflection bases. Opening the bundled database repeatedly is
     -- noticeably expensive on low-memory e-ink devices.
     local opened, connection = pcall(openDatabase, self.db_path)
-    if not opened then
+    if not opened or not connection then
         logger.err("Pronunciation: database open failed:", connection)
         connection = nil
     end
@@ -1602,6 +1634,8 @@ local function httpGet(request_url)
             sink = socketutil.table_sink and socketutil.table_sink(sink)
                 or ltn12.sink.table(sink),
             headers = {
+                ["Accept"] = "application/json",
+                ["Accept-Encoding"] = "identity",
                 ["User-Agent"] = socketutil.USER_AGENT
                     or "KOReader-Pronunciation/" .. PLUGIN_VERSION,
             },
@@ -1665,11 +1699,7 @@ local function inferRegionFromAudio(audio)
 end
 
 normalizeOnlineIpa = function(ipa)
-    ipa = trim(ipa)
-    if ipa == "" then return nil end
-    local first = ipa:sub(1, 1)
-    if first ~= "/" and first ~= "[" then return wrapIpa(ipa) end
-    return ipa
+    return wrapIpa(ipa)
 end
 
 local function resultKey(result)
@@ -1698,7 +1728,21 @@ local function mergeResults(...)
             end
         end
     end
-    if #merged > 0 then return merged end
+    if #merged > 0 then
+        table.sort(merged, function(left, right)
+            local left_confidence = left.confidence or 0
+            local right_confidence = right.confidence or 0
+            if left_confidence ~= right_confidence then
+                return left_confidence > right_confidence
+            end
+            local left_key = (left.source or "") .. "\0"
+                .. (left.region or "") .. "\0" .. (left.ipa or "")
+            local right_key = (right.source or "") .. "\0"
+                .. (right.region or "") .. "\0" .. (right.ipa or "")
+            return left_key < right_key
+        end)
+        return merged
+    end
 end
 
 function Pronunciation:parseDictionaryApi(decoded)
@@ -1721,7 +1765,6 @@ function Pronunciation:parseDictionaryApi(decoded)
             region = region,
             source = "Free Dictionary API",
             confidence = 75,
-            note = "Learned online and cached locally.",
         }
     end
 
@@ -1767,7 +1810,19 @@ local function extractIpaSpans(fragment, callback)
     local found = false
     for raw_ipa in fragment:gmatch(
             '<span[^>]-class="[^"]*IPA[^"]*"[^>]*>(.-)</span>') do
-        local ipa = normalizeOnlineIpa(stripHtml(raw_ipa))
+        local text = stripHtml(raw_ipa)
+        local first = text:sub(1, 1)
+        local last = text:sub(-1)
+        local paired = (first == "/" and last == "/")
+            or (first == "[" and last == "]")
+        local core = paired and stripIpaWrappers(text) or ""
+        -- Wiktionary also marks rhyme endings and hyphenation fragments with
+        -- class=IPA. They are not complete word pronunciations.
+        local ipa
+        if core ~= "" and core:sub(1, 1) ~= "-"
+                and core:sub(-1) ~= "-" then
+            ipa = wrapIpa(core)
+        end
         if ipa then
             found = true
             callback(ipa)
@@ -1811,7 +1866,6 @@ function Pronunciation:parseWiktionaryHtml(html)
             region = region,
             source = "Wiktionary",
             confidence = 85,
-            note = "English-section pronunciation learned online and cached locally.",
         }
     end
 
@@ -1852,7 +1906,9 @@ function Pronunciation:lookupOnline(word)
 end
 
 function Pronunciation:saveCache(word, results)
-    self.cache[normalizeWord(word)] = results
+    local key = normalizeWord(word)
+    self.cache[key] = results
+    pruneSourcedCache(self.cache, key)
     self.settings:saveSetting("cache", self.cache)
     self.settings:saveSetting("cache_version", CACHE_VERSION)
     self.settings:flush()
@@ -1877,7 +1933,7 @@ end
 function Pronunciation:format(original, results, matched)
     local lines = { boldHeading(original) }
     if matched and normalizeWord(original) ~= matched then
-        lines[#lines + 1] = "Matched/derived from: " .. matched
+        lines[#lines + 1] = _("Matched/derived from") .. ": " .. matched
     end
     lines[#lines + 1] = ""
     for index, result in ipairs(results) do
@@ -1888,18 +1944,18 @@ function Pronunciation:format(original, results, matched)
             location = result.language or result.region
         end
         local qualifiers = {}
-        if result.generated then qualifiers[#qualifiers + 1] = "generated" end
+        if result.generated then qualifiers[#qualifiers + 1] = _("generated") end
         if location then qualifiers[#qualifiers + 1] = location end
         local qualifier = #qualifiers > 0
             and " (" .. table.concat(qualifiers, "; ") .. ")" or ""
-        lines[#lines + 1] = "IPA" .. qualifier .. ": " .. (result.ipa or "—")
+        lines[#lines + 1] = _("IPA") .. qualifier .. ": " .. (result.ipa or "—")
         if result.simple and result.simple ~= "" then
-            local qualifier = result.simple_approx and " (approx.)" or ""
-            lines[#lines + 1] = "Readable" .. qualifier .. ": " .. result.simple
+            local qualifier = result.simple_approx
+                and " (" .. _("approx.") .. ")" or ""
+            lines[#lines + 1] = _("Readable") .. qualifier .. ": " .. result.simple
         end
-        if result.source then lines[#lines + 1] = "Source: " .. result.source end
-        if result.confidence then
-            lines[#lines + 1] = "Confidence: " .. result.confidence .. "/100"
+        if result.source then
+            lines[#lines + 1] = _("Source") .. ": " .. result.source
         end
         if index < #results then lines[#lines + 1] = "" end
     end
@@ -1940,8 +1996,8 @@ function Pronunciation:_lookupOnlineAndShow(word, progress)
             showLookupMessage(progress, self:format(word, generated, normalized))
         else
             showLookupMessage(progress,
-                word .. "\n\nNo pronunciation found offline or online. "
-                    .. "Long-press Pronunciation to save your own IPA/readable pronunciation.")
+                word .. "\n\n"
+                    .. _("No pronunciation found offline or online. Long-press Pronunciation to save your own IPA/readable pronunciation."))
         end
     end
 end
@@ -1960,8 +2016,8 @@ function Pronunciation:_lookupAndShow(word, progress)
             return
         end
         showLookupMessage(progress,
-            word .. "\n\nNo offline pronunciation found. "
-                .. "Long-press Pronunciation to add a personal override.")
+            word .. "\n\n"
+                .. _("No offline pronunciation found. Long-press Pronunciation to add a personal override."))
         return
     end
 
@@ -2003,13 +2059,14 @@ end
 function Pronunciation:editOverride(word)
     word = normalizeWord(word)
     if word == "" then return end
-    local existing = self.overrides[word] or {}
+    local existing = type(self.overrides[word]) == "table"
+        and self.overrides[word] or {}
     local dialog
     if not InputDialog then InputDialog = require("ui/widget/inputdialog") end
     dialog = InputDialog:new{
-        title = "Pronunciation override: " .. word,
+        title = _("Pronunciation override") .. ": " .. word,
         input = (existing.ipa or "") .. "\n" .. (existing.simple or ""),
-        input_hint = "/IPA/ on line 1\nReadable pronunciation on line 2",
+        input_hint = _("/IPA/ on line 1\nReadable pronunciation on line 2"),
         allow_newline = true,
         buttons = {{
             {
@@ -2033,7 +2090,10 @@ function Pronunciation:editOverride(word)
                     local ipa, simple = text:match("([^\n]*)\n?(.*)")
                     ipa, simple = trim(ipa), trim(simple)
                     if ipa ~= "" or simple ~= "" then
-                        self.overrides[word] = { ipa = ipa, simple = simple }
+                        self.overrides[word] = {
+                            ipa = ipa ~= "" and wrapIpa(ipa) or nil,
+                            simple = simple ~= "" and simple or nil,
+                        }
                     else
                         self.overrides[word] = nil
                     end

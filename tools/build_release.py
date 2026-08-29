@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import os
 import sqlite3
@@ -17,6 +18,7 @@ RELEASE_FILES = (
     "_meta.lua",
     "main.lua",
     "README.md",
+    "LICENSE",
     "LICENSES.txt",
     "data/pronunciations.sqlite3",
     "data/mfa_english_g2p.bin",
@@ -58,10 +60,44 @@ def validate_inputs() -> None:
         metadata = dict(database.execute("SELECT key, value FROM metadata"))
         if metadata.get("version") != PLUGIN_VERSION:
             raise RuntimeError("pronunciation database version does not match release")
+        headwords, records = database.execute(
+            "SELECT COUNT(DISTINCT word), COUNT(*) FROM pronunciations"
+        ).fetchone()
+        if metadata.get("headwords") != str(headwords):
+            raise RuntimeError("pronunciation database headword metadata is stale")
+        if metadata.get("records") != str(records):
+            raise RuntimeError("pronunciation database record metadata is stale")
     finally:
         database.close()
     if sha256(database_path) != DATABASE_SHA256:
         raise RuntimeError("pronunciation database failed the release integrity check")
+
+    with (ROOT / "data/wikipron_sources.tsv").open(
+        encoding="utf-8", newline=""
+    ) as manifest:
+        reader = csv.DictReader(manifest, delimiter="\t")
+        required = {"source_id", "sha256"}
+        missing_columns = required - set(reader.fieldnames or ())
+        if missing_columns:
+            raise RuntimeError(
+                f"WikiPron manifest is missing columns: {sorted(missing_columns)}"
+            )
+        source_count = 0
+        for row in reader:
+            source_count += 1
+            source_id = row["source_id"].strip()
+            expected = row["sha256"].strip().lower()
+            if metadata.get(f"wikipron_{source_id}_sha256") != expected:
+                raise RuntimeError(
+                    f"database metadata does not match WikiPron source {source_id}"
+                )
+        if source_count == 0:
+            raise RuntimeError("WikiPron release manifest contains no sources")
+
+    if not (ROOT / "LICENSE").read_text(encoding="utf-8").startswith(
+        "MIT License\n"
+    ):
+        raise RuntimeError("plugin code license is missing or invalid")
 
     metadata_source = (ROOT / "_meta.lua").read_text(encoding="utf-8")
     runtime_source = (ROOT / "main.lua").read_text(encoding="utf-8")

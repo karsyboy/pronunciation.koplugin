@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_VERSION = "0.5.0"
 
 
@@ -24,6 +25,8 @@ class WikiPronSource:
     language_code: str
     language_name: str
     region: str | None = None
+
+
 VOWELS = {
     "AA", "AE", "AH", "AO", "AW", "AY", "EH", "ER",
     "EY", "IH", "IY", "OW", "OY", "UH", "UW",
@@ -326,6 +329,18 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def iso_date(value: str) -> str:
+    try:
+        parsed = dt.date.fromisoformat(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "date must use YYYY-MM-DD format"
+        ) from error
+    if parsed.isoformat() != value:
+        raise argparse.ArgumentTypeError("date must use YYYY-MM-DD format")
+    return value
+
+
 SCHEMA = """
 CREATE TABLE pronunciation_sources (
     id INTEGER NOT NULL PRIMARY KEY,
@@ -428,6 +443,7 @@ def build_database(
     output: Path,
     revision: str,
     wikipron_revision: str,
+    generated_date: str | None = None,
 ) -> tuple[int, int]:
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(output.name + ".tmp")
@@ -469,7 +485,10 @@ def build_database(
         metadata = {
             "name": "KOReader Pronunciation",
             "version": PLUGIN_VERSION,
-            "generated": dt.datetime.now(dt.timezone.utc).date().isoformat(),
+            "generated": (
+                generated_date
+                or dt.datetime.now(dt.timezone.utc).date().isoformat()
+            ),
             "base": "CMU Pronouncing Dictionary"
                     + (" + WikiPron" if wikipron_sources else ""),
             "cmudict_revision": revision,
@@ -512,12 +531,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cmudict", required=True, type=Path)
     parser.add_argument("--supplement", type=Path,
-                        default=Path("data/supplemental.tsv"))
+                        default=ROOT / "data" / "supplemental.tsv")
     parser.add_argument("--language-hints", type=Path,
-                        default=Path("data/language_hints.tsv"))
+                        default=ROOT / "data" / "language_hints.tsv")
     parser.add_argument(
         "--wikipron-manifest", type=Path,
-        default=Path("data/wikipron_sources.tsv"),
+        default=ROOT / "data" / "wikipron_sources.tsv",
         help="curated WikiPron broad-IPA source manifest",
     )
     parser.add_argument(
@@ -525,15 +544,20 @@ def main() -> None:
         help="directory containing the manifest's WikiPron TSV files",
     )
     parser.add_argument("--wikipron-revision", default="")
+    parser.add_argument(
+        "--generated-date",
+        type=iso_date,
+        help="UTC build date to record (YYYY-MM-DD; set for reproducible builds)",
+    )
     parser.add_argument("--output", type=Path,
-                        default=Path("data/pronunciations.sqlite3"))
+                        default=ROOT / "data" / "pronunciations.sqlite3")
     parser.add_argument("--cmudict-revision", required=True)
     args = parser.parse_args()
     wikipron_sources = load_wikipron_manifest(
         args.wikipron_manifest, args.wikipron_root
     )
     if wikipron_sources and not args.wikipron_revision:
-        parser.error("--wikipron-revision is required with --wikipron")
+        parser.error("--wikipron-revision is required with WikiPron sources")
     headwords, records = build_database(
         args.cmudict,
         args.supplement,
@@ -542,6 +566,7 @@ def main() -> None:
         args.output,
         args.cmudict_revision,
         args.wikipron_revision,
+        args.generated_date,
     )
     print(f"built {args.output}: {headwords} headwords, {records} records")
 

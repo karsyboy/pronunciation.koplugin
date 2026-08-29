@@ -2,6 +2,6 @@ local _ = require("gettext")
 
 return {
     fullname = _("Pronunciation Dictionary"),
-    description = _([[Offline-first US/UK English IPA lookup with a portable unfamiliar-word fallback, sourced online results, caching, and personal overrides.]]),
+    description = _([[Offline-first US/UK IPA with readable pronunciations, online lookup, a bundled unfamiliar-word fallback, and personal overrides.]]),
     version = "0.5.0",
 }

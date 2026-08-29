@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Lua runtimes
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes lua5.1 luajit
+      - name: Validate Lua runtime
+        run: |
+          luac5.1 -p main.lua
+          luajit tests/test_plugin.lua
+          lua5.1 tests/test_plugin.lua
+      - name: Validate data and release build
+        run: python3 tests/test_database.py
+      - name: Check Python syntax and whitespace
+        run: |
+          python3 -m py_compile tools/*.py tests/*.py
+          git diff --check

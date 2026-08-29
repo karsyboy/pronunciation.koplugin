@@ -157,6 +157,7 @@ def check_compact_database_build() -> None:
             output,
             "test-cmudict-revision",
             "test-wikipron-revision",
+            "2026-01-01",
         )
         assert headwords > 2 and records > 2
         connection = sqlite3.connect(output)
@@ -177,6 +178,9 @@ def check_compact_database_build() -> None:
                 "WHERE word='test' AND source='WikiPron/Wiktionary' "
                 "ORDER BY region"
             ).fetchall() == [("UK",), ("US",)]
+            assert connection.execute(
+                "SELECT value FROM metadata WHERE key='generated'"
+            ).fetchone()[0] == "2026-01-01"
         finally:
             connection.close()
 
@@ -215,6 +219,10 @@ def check_release_build() -> None:
                 f"{PLUGIN_DIRECTORY}/{relative}" for relative in RELEASE_FILES
             ]
             assert all("flite" not in name.lower() for name in archive.namelist())
+            assert (
+                archive.read(f"{PLUGIN_DIRECTORY}/LICENSE")
+                .startswith(b"MIT License\n")
+            )
 
 
 if __name__ == "__main__":

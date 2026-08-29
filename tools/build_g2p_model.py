@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import BinaryIO
 
 
+ROOT = Path(__file__).resolve().parents[1]
 OPENFST_MAGIC = 0x7EB2FDD6
 OUTPUT_MAGIC = b"KPG2P3\0\0"
 WEIGHT_SCALE = 1024
@@ -305,7 +306,7 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("data/mfa_english_g2p.bin"),
+        default=ROOT / "data" / "mfa_english_g2p.bin",
     )
     parser.add_argument(
         "--expected-sha256",
