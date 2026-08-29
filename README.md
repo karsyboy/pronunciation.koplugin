@@ -54,18 +54,6 @@ The plugin uses the word that opened KOReader's dictionary popup. It falls back
 to the displayed dictionary headword only on older/custom builds that do not
 provide the original query.
 
-## KOReader compatibility
-
-The plugin supports KOReader's three dictionary-button extension systems:
-
-- v2022.06–v2024.02: original popup callback
-- v2024.03–v2026.03: `DictButtonsReady` event
-- v2026.07 and newer: `ReaderDictionary:addToDictButtons()`
-
-Newer KOReader versions register Pronunciation as a conditional button, so a
-previously saved custom button layout does not hide it. Older APIs and optional
-UI repaint helpers are detected at runtime.
-
 ## Build and test
 
 Runtime files are plain Lua plus the bundled SQLite database and G2P model.
