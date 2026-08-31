@@ -7,7 +7,9 @@ import argparse
 import csv
 import hashlib
 import os
+import re
 import sqlite3
+import subprocess
 import zipfile
 from pathlib import Path
 
@@ -26,6 +28,7 @@ RELEASE_FILES = (
     "data/wikipron_sources.tsv",
 )
 ZIP_TIMESTAMP = (2026, 1, 1, 0, 0, 0)
+RELEASE_ID_LENGTH = 12
 PLUGIN_VERSION = "0.5.0"
 DATABASE_SHA256 = (
     "62494a9b4b612eeaf04caedde85b123d1b5365fc87ed597ca6ec9815d0281fcc"
@@ -41,6 +44,38 @@ def sha256(path: Path) -> str:
         for block in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def git_release_id() -> str:
+    """Return an abbreviated Git commit SHA suitable for an artifact name."""
+    try:
+        result = subprocess.run(
+            (
+                "git",
+                "rev-parse",
+                "--verify",
+                f"--short={RELEASE_ID_LENGTH}",
+                "HEAD",
+            ),
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as error:
+        raise RuntimeError(
+            "cannot determine the Git SHA for the default release name; "
+            "build from a Git checkout or pass --output"
+        ) from error
+
+    release_id = result.stdout.strip().lower()
+    if not re.fullmatch(rf"[0-9a-f]{{{RELEASE_ID_LENGTH},64}}", release_id):
+        raise RuntimeError(f"Git returned an invalid release SHA: {release_id!r}")
+    return release_id
+
+
+def default_release_output() -> Path:
+    return ROOT / "dist" / f"{PLUGIN_DIRECTORY}-{git_release_id()}.zip"
 
 
 def validate_inputs() -> None:
@@ -150,13 +185,17 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=ROOT / "dist" / f"{PLUGIN_DIRECTORY}.zip",
+        help=(
+            "archive path (default: "
+            f"dist/{PLUGIN_DIRECTORY}-<12-character-git-sha>.zip)"
+        ),
     )
     args = parser.parse_args()
-    uncompressed, compressed = build_release(args.output)
+    output = args.output or default_release_output()
+    uncompressed, compressed = build_release(output)
     print(
-        f"built {args.output}: {compressed} bytes compressed, "
-        f"{uncompressed} bytes installed, sha256 {sha256(args.output)}"
+        f"built {output}: {compressed} bytes compressed, "
+        f"{uncompressed} bytes installed, sha256 {sha256(output)}"
     )
 
 

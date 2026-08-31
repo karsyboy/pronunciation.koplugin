@@ -14,7 +14,8 @@ jailbroken Kindles.
 
 ## Install
 
-1. Download `pronunciation.koplugin.zip` from the repository's Releases page.
+1. Download `pronunciation.koplugin-<git-sha>.zip` from the repository's
+   Releases page.
 2. Extract it into `koreader/plugins/`.
 3. Confirm this path exists:
 
@@ -69,7 +70,9 @@ python3 tools/build_release.py
 
 The release builder validates versions, database integrity and metadata, source
 manifests, model hashes, required licenses, and archive contents. Output is
-`dist/pronunciation.koplugin.zip`; repeated builds are byte-identical.
+`dist/pronunciation.koplugin-<12-character-git-sha>.zip`, so artifacts from
+different commits do not overwrite one another. Repeated builds of the same
+commit are byte-identical. Pass `--output PATH` to select an explicit name.
 
 ### Rebuild the pronunciation database
 

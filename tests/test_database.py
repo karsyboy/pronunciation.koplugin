@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import sqlite3
 import sys
 import tempfile
@@ -25,8 +26,11 @@ from build_release import (  # noqa: E402
     DATABASE_SHA256,
     G2P_SHA256,
     PLUGIN_DIRECTORY,
+    RELEASE_ID_LENGTH,
     RELEASE_FILES,
     build_release,
+    default_release_output,
+    git_release_id,
 )
 
 
@@ -206,6 +210,14 @@ def check_g2p_model() -> None:
 
 
 def check_release_build() -> None:
+    release_id = git_release_id()
+    assert re.fullmatch(
+        rf"[0-9a-f]{{{RELEASE_ID_LENGTH},64}}", release_id
+    )
+    assert default_release_output() == (
+        ROOT / "dist" / f"{PLUGIN_DIRECTORY}-{release_id}.zip"
+    )
+
     with tempfile.TemporaryDirectory(prefix="pronunciation-release-test-") as directory:
         output = Path(directory) / "release.zip"
         second_output = Path(directory) / "release-again.zip"
