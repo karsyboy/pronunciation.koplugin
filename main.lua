@@ -1203,6 +1203,7 @@ function Pronunciation:addToMainMenu(menu_items)
     end
 
     menu_items.pronunciation = {
+        sorting_hint = "tools",
         text = _("Pronunciation dictionary"),
         sub_item_table = {
             {

@@ -252,6 +252,8 @@ Plugin.settings = {
 }
 local menu = {}
 Plugin:addToMainMenu(menu)
+equal(menu.pronunciation.sorting_hint, "tools",
+    "pronunciation settings were not assigned to the Tools menu")
 local language_menu = menu.pronunciation.sub_item_table[3].sub_item_table
 equal(#language_menu, 2,
     "generated-language menu should contain only Auto and US English")
