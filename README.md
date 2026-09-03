@@ -1,12 +1,11 @@
 # Pronunciation for KOReader
 
-Offline IPA and readable pronunciation lookup for KOReader, including
-jailbroken Kindles.
+Offline IPA and readable pronunciation lookup for KOReader.
 
 ## Features
 
 - Bundled US and UK English pronunciations from CMUdict and WikiPron
-- Readable spellings, IPA, stress, regional labels, and source attribution
+- Readable spellings, IPA, regional labels, and source attribution
 - Offline estimates for unfamiliar names and invented words
 - Optional online fallback through Dictionary API and English Wiktionary
 - Personal pronunciation overrides
