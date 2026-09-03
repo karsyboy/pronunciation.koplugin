@@ -78,7 +78,7 @@ end
 local PLUGIN_VERSION = "0.6.0"
 local DICTIONARY_BUTTON_ID = "pronunciation_lookup"
 local CACHE_VERSION = 5
-local GENERATOR_VERSION = 2
+local GENERATOR_VERSION = 3
 local SOURCED_CACHE_LIMIT = 256
 local GENERATED_CACHE_LIMIT = 128
 local GENERATED_CACHE_PREFIX = "generator:" .. GENERATOR_VERSION .. "|"
@@ -90,7 +90,7 @@ local Pronunciation = WidgetContainer:extend{
 
 local function trim(value)
     if type(value) ~= "string" then return "" end
-    return value:gsub("^%s+", ""):gsub("%s+$", "")
+    return (value:gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
 local LATIN_LOWERCASE = {
@@ -114,7 +114,7 @@ local function normalizeWord(word)
     word = word:gsub("‘", "'"):gsub("’", "'")
         :gsub("^“", ""):gsub("^”", ""):gsub("^«", ""):gsub("^»", "")
         :gsub("“$", ""):gsub("”$", ""):gsub("«$", ""):gsub("»$", "")
-    return word:gsub("^[%p%s]+", ""):gsub("[%p%s]+$", "")
+    return (word:gsub("^[%p%s]+", ""):gsub("[%p%s]+$", ""))
 end
 
 -- KOReader keeps the originally queried text in `word` and the currently
@@ -466,7 +466,7 @@ local ARPABET_VOWELS = {
 }
 
 local function arpabetBase(phone)
-    return phone:gsub("[012]$", "")
+    return (phone:gsub("[012]$", ""))
 end
 
 local function arpabetPhonesToIpa(arpabet)
@@ -991,11 +991,20 @@ end
 
 function Pronunciation:generationCacheKey(word, hints)
     local languages = {}
-    for _, hint in ipairs(hints or {}) do
-        languages[#languages + 1] = hint.code
+    local seen = {}
+    for _, hint in ipairs(mergeLanguageHints(hints)) do
+        if PORTABLE_GENERATORS[hint.code] and not seen[hint.code] then
+            seen[hint.code] = true
+            languages[#languages + 1] = hint.code
+        end
+    end
+    -- Unsupported or absent hints use the English fallback, so key the cache
+    -- by the generator that actually produced the result instead of by hints
+    -- that cannot affect it.
+    if #languages == 0 then
+        languages[1] = LANGUAGE_DEFINITIONS.english.code
     end
     return "generator:" .. GENERATOR_VERSION
-        .. "|preference:" .. (self.generated_language or "auto")
         .. "|languages:" .. table.concat(languages, ",")
         .. "|word:" .. normalizeWord(word)
 end
@@ -1071,8 +1080,8 @@ function Pronunciation:init()
             and selected.code or "auto"
     end
 
-    -- v0.5 separates sourced and generated caches and keys generated entries
-    -- by language choice so results cannot leak between books.
+    -- v0.5 separates sourced and generated caches. Generated entries are
+    -- versioned and keyed by the generator languages that produced them.
     if self.settings:readSetting("cache_version") ~= CACHE_VERSION then
         self.cache = {}
         self.generated_cache = {}
@@ -1382,7 +1391,7 @@ function Pronunciation:setGeneratedLanguage(code)
 end
 
 function Pronunciation:getOverride(word)
-    local override = self.overrides[normalizeWord(word)]
+    local override = (self.overrides or {})[normalizeWord(word)]
     if type(override) == "table" then
         return {{
             ipa = wrapIpa(override.ipa),
@@ -1395,7 +1404,7 @@ function Pronunciation:getOverride(word)
 end
 
 function Pronunciation:getCache(word)
-    local cached = self.cache[normalizeWord(word)]
+    local cached = (self.cache or {})[normalizeWord(word)]
     if type(cached) == "table" and #cached > 0 then
         return ensureReadables(cached)
     end
@@ -1480,8 +1489,9 @@ function Pronunciation:query(word)
         logger.err("Pronunciation: database open failed:", connection)
         return nil
     end
+    local normalized = normalizeWord(word)
     local results, query_error, statement = self:_queryConnection(connection,
-        normalizeWord(word))
+        normalized)
     closeSqlResource(statement)
     closeSqlResource(connection)
     if query_error then
@@ -1493,6 +1503,7 @@ end
 function Pronunciation:queryLanguageHints(word)
     local connection
     local statement
+    local normalized = normalizeWord(word)
     local ok, results = pcall(function()
         connection = openDatabase(self.db_path)
         statement = connection:prepare([[
@@ -1501,7 +1512,7 @@ function Pronunciation:queryLanguageHints(word)
              WHERE word = ?
           ORDER BY language_name
         ]])
-        statement:bind(normalizeWord(word))
+        statement:bind(normalized)
         local rows = {}
         while true do
             local row = statement:step()
@@ -1672,6 +1683,8 @@ function Pronunciation:lookupOffline(word)
     word = normalizeWord(word)
     local results = self:getOverride(word)
     if results then return results, word end
+    results = self:getCache(word)
+    if results then return results, word end
 
     -- Reuse one SQLite connection while checking the exact word and all
     -- possible inflection bases. Opening the bundled database repeatedly is
@@ -1710,13 +1723,11 @@ function Pronunciation:lookupOffline(word)
 
     results = queryDatabase(word)
     if results then return finish(results, word) end
-    results = self:getCache(word)
-    if results then return finish(results, word) end
 
     for _, candidate in ipairs(self:candidates(word)) do
         local base = self:getOverride(candidate.word)
-            or queryDatabase(candidate.word)
             or self:getCache(candidate.word)
+            or queryDatabase(candidate.word)
         if base then
             local derived = self:derive(base, candidate.kind, candidate.word)
             if derived then return finish(derived, candidate.word) end
@@ -2064,6 +2075,30 @@ function Pronunciation:format(original, results, matched)
     return table.concat(lines, "\n")
 end
 
+function Pronunciation:getCachedGeneratedForWord(word)
+    if not self.generated_fallback then return nil end
+    local hints
+    if self.generated_language and self.generated_language ~= "auto" then
+        hints = self:generationHints(word)
+    else
+        -- Book metadata is already resident. Avoid opening the database or
+        -- touching the network merely to decide whether a cache entry exists.
+        hints = self:documentLanguageHints()
+    end
+    local cache_key = self:generationCacheKey(word, hints)
+    return self:getGeneratedCache(cache_key)
+end
+
+function Pronunciation:lookupCached(word)
+    local normalized = normalizeWord(word)
+    local results = self:getOverride(normalized)
+    if results then return results, normalized end
+    results = self:getCache(normalized)
+    if results then return results, normalized end
+    results = self:getCachedGeneratedForWord(normalized)
+    if results then return results, normalized end
+end
+
 function Pronunciation:generatedForWord(word, online_hints)
     if not self.generated_fallback then return nil end
     local hints = self:generationHints(word, online_hints)
@@ -2105,16 +2140,22 @@ function Pronunciation:_lookupOnlineAndShow(word, progress)
 end
 
 function Pronunciation:_lookupAndShow(word, progress)
-    local results, matched = self:lookupOffline(word)
+    local normalized = normalizeWord(word)
+    local results, matched = self:lookupCached(normalized)
+    if results then
+        showLookupMessage(progress, self:format(word, results, matched))
+        return
+    end
+    results, matched = self:lookupOffline(normalized)
     if results then
         showLookupMessage(progress, self:format(word, results, matched))
         return
     end
     if not self.online_fallback then
-        local generated = self:generatedForWord(normalizeWord(word))
+        local generated = self:generatedForWord(normalized)
         if generated then
             showLookupMessage(progress,
-                self:format(word, generated, normalizeWord(word)))
+                self:format(word, generated, normalized))
             return
         end
         showLookupMessage(progress,
@@ -2150,6 +2191,11 @@ end
 function Pronunciation:lookupAndShow(word)
     word = trim(word)
     if word == "" then return end
+    local cached, matched = self:lookupCached(word)
+    if cached then
+        showLookupMessage(nil, self:format(word, cached, matched))
+        return
+    end
     local progress = showLookupProgress()
     afterLookupProgress(function()
         runLookupSafely(word, progress, function()

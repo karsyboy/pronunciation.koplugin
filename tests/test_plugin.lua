@@ -396,6 +396,7 @@ equal(Plugin:generatePronunciations("“Faërun”", {})[1].arpabet,
     "typographic query wrappers were not normalized")
 
 -- Auto mode uses safe, optional book metadata on old and new KOReader builds.
+local query_language_hints_method = Plugin.queryLanguageHints
 Plugin.queryLanguageHints = function() return {} end
 Plugin.generated_language = "auto"
 Plugin.ui.document = {
@@ -408,8 +409,8 @@ local foreign_cache_key = Plugin:generationCacheKey("fantasia", book_hints)
 Plugin.ui.document.getProps = function() return { language = "en-US" } end
 local english_cache_key = Plugin:generationCacheKey(
     "fantasia", Plugin:generationHints("fantasia"))
-truthy(foreign_cache_key ~= english_cache_key,
-    "generated cache key ignored the book language")
+equal(foreign_cache_key, english_cache_key,
+    "unsupported language fragmented the English generator cache")
 
 Plugin.generated_language = "en"
 Plugin.ui.document.getProps = function() return { language = "es" } end
@@ -423,6 +424,35 @@ Plugin.settings = {
     saveSetting = function() end,
     flush = function() end,
 }
+
+-- Both public generated-fallback paths must go through the generated cache.
+-- Normalized spelling variants share an entry and never decode the model twice.
+local cached_g2p_method = Plugin._englishG2pPhones
+local cached_lookup_offline = Plugin.lookupOffline
+local cached_online_fallback = Plugin.online_fallback
+local cached_g2p_calls = 0
+Plugin._englishG2pPhones = function(plugin, word)
+    cached_g2p_calls = cached_g2p_calls + 1
+    return cached_g2p_method(plugin, word)
+end
+Plugin.lookupOffline = function() return nil end
+Plugin.online_fallback = false
+Plugin.generated_cache = {}
+Plugin:_lookupAndShow("Zyrathion")
+Plugin.lookupOffline = function()
+    error("cached generated result reached the offline database lookup")
+end
+Plugin:_lookupAndShow("“ZYRATHION”")
+equal(cached_g2p_calls, 1,
+    "offline generated fallback did not reuse its cached result")
+local normalized_generated_key = Plugin:generationCacheKey(
+    "zyrathion", Plugin:generationHints("zyrathion"))
+truthy(Plugin.generated_cache[normalized_generated_key],
+    "offline generated fallback did not save its result")
+Plugin._englishG2pPhones = cached_g2p_method
+Plugin.lookupOffline = cached_lookup_offline
+Plugin.online_fallback = cached_online_fallback
+
 local menu = {}
 Plugin:addToMainMenu(menu)
 equal(menu.pronunciation_lookup.sorting_hint, "search",
@@ -476,19 +506,19 @@ Plugin.lookupAndShow = menu_lookup
 
 -- Generated entries are reproducible offline, so stale formats and excessive
 -- history must not grow the startup settings table without bound.
-Plugin.generated_cache = { ["generator:1|old"] = {{ ipa = "/oʊld/" }} }
+Plugin.generated_cache = { ["generator:2|old"] = {{ ipa = "/oʊld/" }} }
 for index = 1, 140 do
-    Plugin.generated_cache["generator:2|test:" .. index] = {{ ipa = "/tɛst/" }}
+    Plugin.generated_cache["generator:3|test:" .. index] = {{ ipa = "/tɛst/" }}
 end
-Plugin:saveGeneratedCache("generator:2|test:current", {{ ipa = "/kɝənt/" }})
+Plugin:saveGeneratedCache("generator:3|test:current", {{ ipa = "/kɝənt/" }})
 local generated_cache_count = 0
 for key in pairs(Plugin.generated_cache) do
     generated_cache_count = generated_cache_count + 1
-    truthy(key:find("generator:2|", 1, true) == 1,
+    truthy(key:find("generator:3|", 1, true) == 1,
         "stale generator cache version survived pruning")
 end
 truthy(generated_cache_count <= 128, "generated cache limit was not enforced")
-truthy(Plugin.generated_cache["generator:2|test:current"],
+truthy(Plugin.generated_cache["generator:3|test:current"],
     "new generated cache entry was pruned")
 
 -- Online results are recoverable, so their settings cache is bounded and
@@ -511,6 +541,24 @@ for _, results in pairs(Plugin.cache) do
 end
 truthy(sourced_cache_count <= 256, "sourced cache limit was not enforced")
 truthy(Plugin.cache["cached-current"], "new sourced cache entry was pruned")
+local cached_overrides = Plugin.overrides
+local cached_database_open = SQ3.open
+local cached_database_open_count = 0
+Plugin.overrides = {}
+SQ3.open = function()
+    cached_database_open_count = cached_database_open_count + 1
+    error("sourced cache lookup opened the database")
+end
+local cached_sourced, cached_sourced_match =
+    Plugin:lookupOffline("“CACHED-CURRENT”")
+truthy(cached_sourced and cached_sourced[1],
+    "offline lookup did not reuse the normalized sourced cache entry")
+equal(cached_sourced_match, "cached-current",
+    "sourced cache returned the wrong normalized match")
+equal(cached_database_open_count, 0,
+    "sourced cache was checked after opening the database")
+Plugin.overrides = cached_overrides
+SQ3.open = cached_database_open
 
 truthy(hasCandidate("running", "run", "ing"), "running -> run missing")
 truthy(hasCandidate("stopped", "stop", "past"), "stopped -> stop missing")
@@ -564,7 +612,10 @@ local fake_statement = {
         reset_count = reset_count + 1
         return self
     end,
-    bind = function(self, word)
+    bind = function(self, ...)
+        equal(select("#", ...), 1,
+            "pronunciation query received an extra bound value")
+        local word = ...
         active_word = word
         self.returned = false
     end,
@@ -599,6 +650,55 @@ equal(prepare_count, 1, "candidate queries prepared more than once")
 equal(reset_count, 1, "reused candidate statement was not reset")
 reused:close()
 equal(statement_close_count, 1, "reused statement did not close")
+
+-- Normalization helpers must return exactly one value when passed directly to
+-- prepared-query methods; string.gsub otherwise leaks its replacement count.
+local query_connection_close_count = 0
+fake_connection.close = function()
+    query_connection_close_count = query_connection_close_count + 1
+end
+local query_open = SQ3.open
+local query_mode
+SQ3.open = function(_, mode)
+    query_mode = mode
+    return fake_connection
+end
+local queried = Plugin:query("“CAT”")
+truthy(queried and queried[1], "normalized direct query lost its result")
+equal(queried[1].ipa, "/ˈkæt/", "normalized direct query returned wrong IPA")
+equal(query_mode, "ro", "direct query did not open the database read-only")
+equal(prepare_count, 2, "direct query did not prepare exactly one statement")
+equal(statement_close_count, 2, "direct query did not close its statement")
+equal(query_connection_close_count, 1,
+    "direct query did not close its database connection")
+
+local hint_bind_count = 0
+local hint_word
+local hint_returned = false
+local hint_statement = {
+    bind = function(_, ...)
+        hint_bind_count = select("#", ...)
+        hint_word = ...
+    end,
+    step = function()
+        if hint_returned then return nil end
+        hint_returned = true
+        return { "es", "Spanish", "test language hint" }
+    end,
+    close = function() end,
+}
+SQ3.open = function()
+    return {
+        prepare = function() return hint_statement end,
+        close = function() end,
+    }
+end
+local normalized_hints = query_language_hints_method(Plugin, "“FANTASIA”")
+equal(hint_bind_count, 1,
+    "language-hint query received an extra bound value")
+equal(hint_word, "fantasia", "language-hint query did not normalize its word")
+equal(normalized_hints[1].code, "es", "language-hint query lost its result")
+SQ3.open = query_open
 
 local wiktionary_fixture = [[
 <div class="mw-heading mw-heading2"><h2 id="English">English</h2></div>
@@ -724,13 +824,21 @@ Plugin.settings = {
     flush = function() end,
 }
 Plugin.lookupOffline = function() return nil end
+local online_lookup_calls = 0
 Plugin.lookupOnline = function()
+    online_lookup_calls = online_lookup_calls + 1
     return nil, {{ code = "es", name = "Spanish" }}
 end
 Plugin.queryLanguageHints = function()
     return {{ code = "es", name = "Spanish" }}
 end
 Plugin.online_fallback = true
+local online_g2p_method = Plugin._englishG2pPhones
+local online_g2p_calls = 0
+Plugin._englishG2pPhones = function(plugin, word)
+    online_g2p_calls = online_g2p_calls + 1
+    return online_g2p_method(plugin, word)
+end
 shown_widget = nil
 shown_widgets = {}
 closed_widgets = {}
@@ -744,12 +852,28 @@ equal(shown_widgets[1].dismissable, false,
     "lookup progress can be dismissed while work is running")
 equal(repaint_count, 1, "lookup progress was not painted before blocking work")
 equal(next_tick_count, 2, "lookup work did not yield to the UI event loop")
+equal(online_lookup_calls, 1, "missing-word flow repeated its online lookup")
 equal(closed_widgets[1], shown_widgets[1], "offline progress was not closed")
 truthy(shown_widget and shown_widget.text, "missing-word result was not shown")
 truthy(shown_widget.text:find("MFA/Pynini", 1, true),
     "missing-word flow lost generated provenance")
 truthy(shown_widget.text:find("generated; US English", 1, true),
     "missing-word flow lost generated provenance")
+local shown_before_cached_lookup = #shown_widgets
+local repaint_before_cached_lookup = repaint_count
+local ticks_before_cached_lookup = next_tick_count
+Plugin:lookupAndShow("“ZYRATHION”")
+equal(online_g2p_calls, 1,
+    "online missing-word flow regenerated an existing cached pronunciation")
+equal(online_lookup_calls, 1,
+    "cached generated result repeated the online source lookup")
+equal(#shown_widgets, shown_before_cached_lookup + 1,
+    "cached generated result showed a progress popup")
+equal(repaint_count, repaint_before_cached_lookup,
+    "cached generated result triggered an extra repaint")
+equal(next_tick_count, ticks_before_cached_lookup,
+    "cached generated result deferred work to the event loop")
+Plugin._englishG2pPhones = online_g2p_method
 
 -- A canceled Wi-Fi prompt never runs its callback, so the first progress
 -- message must be closed before control passes to KOReader's network manager.

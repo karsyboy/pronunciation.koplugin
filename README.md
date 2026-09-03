@@ -59,15 +59,15 @@ settings and personal overrides separately.
 ## Lookup order
 
 1. Personal override
-2. Bundled CMUdict and US/UK WikiPron data
-3. Cached sourced result
+2. Cached sourced or generated result
+3. Bundled CMUdict and US/UK WikiPron data
 4. English inflection derived from a known base
 5. Dictionary API and the English section of Wiktionary
 6. Bundled US-English G2P estimate
 
-Sourced results always take priority over generated estimates. Generated
-entries are labeled `generated`, and readable text derived from IPA is labeled
-`approx.`
+Personal overrides and cached results return immediately. On a cache miss,
+sourced results take priority over generated estimates. Generated entries are
+labeled `generated`, and readable text derived from IPA is labeled `approx.`
 
 ## Data and licenses
 
