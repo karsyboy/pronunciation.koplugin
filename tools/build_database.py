@@ -14,9 +14,11 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from build_release import read_plugin_version
+
 
 ROOT = Path(__file__).resolve().parents[1]
-PLUGIN_VERSION = "0.5.1"
+PLUGIN_VERSION = read_plugin_version()
 DEFAULT_SOURCES_DIR = ROOT / "pronunciation-sources"
 CMUDICT_REPOSITORY = "https://github.com/cmusphinx/cmudict.git"
 WIKIPRON_REPOSITORY = "https://github.com/CUNY-CL/wikipron.git"

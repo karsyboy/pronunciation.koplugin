@@ -52,6 +52,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes lua5.1 luajit
 
+      - name: Synchronize version and rebuild pronunciation database
+        if: steps.release.outputs.publish == 'true'
+        run: python3 tools/prepare_release.py
+
       - name: Run release checks
         if: steps.release.outputs.publish == 'true'
         run: |
@@ -66,6 +70,29 @@ jobs:
           ASSET: ${{ steps.release.outputs.asset }}
         run: python3 tools/build_release.py --output "$ASSET"
 
+      - name: Commit generated release inputs
+        if: steps.release.outputs.publish == 'true'
+        id: commit
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            main.lua \
+            tools/build_release.py \
+            data/pronunciations.sqlite3 \
+            data/wikipron_sources.tsv
+
+          if git diff --cached --quiet; then
+            echo "Release inputs are already synchronized."
+          else
+            git commit -m "Prepare release ${VERSION}"
+            git push origin HEAD:main
+          fi
+
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Publish GitHub release
         if: steps.release.outputs.publish == 'true'
         env:
@@ -73,6 +100,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.release.outputs.tag }}
           VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_SHA: ${{ steps.commit.outputs.sha }}
         run: |
           prerelease=()
           if [[ "$VERSION" == *-* ]]; then
@@ -81,5 +109,5 @@ jobs:
           gh release create "$TAG" "$ASSET" \
             --generate-notes \
             "${prerelease[@]}" \
-            --target "$GITHUB_SHA" \
+            --target "$RELEASE_SHA" \
             --title "Pronunciation ${VERSION}"

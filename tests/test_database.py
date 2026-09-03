@@ -18,6 +18,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(ROOT / "tools"))
 
 from build_database import (  # noqa: E402
+    PLUGIN_VERSION as DATABASE_PLUGIN_VERSION,
     arpabet_to_ipa,
     arpabet_to_readable,
     build_database,
@@ -35,9 +36,14 @@ from build_release import (  # noqa: E402
     default_release_output,
     read_plugin_version,
 )
+from prepare_release import (  # noqa: E402
+    synchronize_database_hash,
+    synchronize_runtime_version,
+)
 
 
 def check_conversion() -> None:
+    assert DATABASE_PLUGIN_VERSION == PLUGIN_VERSION
     assert arpabet_to_ipa("K AE1 T".split()) == "/ˈkæt/"
     assert arpabet_to_readable("K AE1 T".split()) == "KAT"
     epitome = "IH0 P IH1 T AH0 M IY0".split()
@@ -235,6 +241,33 @@ def check_source_checkout_update() -> None:
         assert (checkout / "source.txt").read_text(encoding="utf-8") == "second\n"
 
 
+def check_release_preparation() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="pronunciation-release-preparation-test-"
+    ) as directory:
+        directory = Path(directory)
+        runtime = directory / "main.lua"
+        runtime.write_text(
+            'local PLUGIN_VERSION = "0.1.0"\nlocal untouched = true\n',
+            encoding="utf-8",
+        )
+        synchronize_runtime_version("2.3.4", runtime)
+        assert runtime.read_text(encoding="utf-8") == (
+            'local PLUGIN_VERSION = "2.3.4"\nlocal untouched = true\n'
+        )
+
+        database = directory / "pronunciations.sqlite3"
+        database.write_bytes(b"database test contents")
+        release_builder = directory / "build_release.py"
+        release_builder.write_text(
+            'DATABASE_SHA256 = (\n    "' + "0" * 64 + '"\n)\n',
+            encoding="utf-8",
+        )
+        database_hash = synchronize_database_hash(database, release_builder)
+        assert database_hash == hashlib.sha256(database.read_bytes()).hexdigest()
+        assert database_hash in release_builder.read_text(encoding="utf-8")
+
+
 def check_g2p_model() -> None:
     assert not (ROOT / "data" / "cmu_flite_lts.bin").exists()
     assert not (ROOT / "data" / "cmu_flite_lts.SOURCE.txt").exists()
@@ -316,6 +349,7 @@ if __name__ == "__main__":
     check_database()
     check_compact_database_build()
     check_source_checkout_update()
+    check_release_preparation()
     check_g2p_model()
     check_release_build()
     print("database regression tests: OK")

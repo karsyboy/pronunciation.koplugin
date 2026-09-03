@@ -21,32 +21,26 @@ manifests, model hashes, required licenses, and archive contents. Output is
 `--output PATH` to select an explicit name, or `--print-version` to print the
 validated version without building an archive.
 
-## Prepare a version bump
+## Prepare a release locally
 
-The plugin version is intentionally recorded in the metadata, runtime, database
-builder, and bundled database. All four must agree before a release can be
-built.
+`_meta.lua` is the source of truth for the plugin version. To reproduce the
+automated release process locally:
 
-1. Set the same semantic version in these three source files:
+1. Change only `version` in `_meta.lua`.
 
-   - `version` in `_meta.lua`
-   - `PLUGIN_VERSION` in `main.lua`
-   - `PLUGIN_VERSION` in `tools/build_database.py`
-
-2. Rebuild `data/pronunciations.sqlite3` using the command in
-   [Rebuild the pronunciation database](#rebuild-the-pronunciation-database).
-   By default, this fetches the latest pronunciation sources and writes their
-   exact revisions and the new plugin version into the database metadata.
-
-3. Calculate the rebuilt database's SHA-256 hash:
+2. Prepare all generated release inputs:
 
    ```sh
-   sha256sum data/pronunciations.sqlite3
+   python3 tools/prepare_release.py
    ```
 
-4. Replace `DATABASE_SHA256` in `tools/build_release.py` with that hash.
+   This fetches the latest CMUdict and WikiPron revisions, rebuilds
+   `data/pronunciations.sqlite3`, synchronizes `PLUGIN_VERSION` in `main.lua`,
+   refreshes the WikiPron manifest hashes, and updates `DATABASE_SHA256` in
+   `tools/build_release.py`. The database builder reads its version directly
+   from `_meta.lua`.
 
-5. Run the complete validation and release build:
+3. Run the complete validation and release build:
 
    ```sh
    luac5.1 -p main.lua
@@ -63,10 +57,20 @@ schema version, not the plugin version.
 
 ## Publish a release
 
-Pushing a change to `_meta.lua` on `main` starts the release workflow. If no
-GitHub Release exists for `v<version>`, the workflow runs the Lua and Python
-checks, builds the versioned archive, creates that tag, and publishes the
-archive. It can also be run manually on `main` to retry an unpublished version.
+Change only the version in `_meta.lua` and push it to `main`. If no GitHub
+Release exists for `v<version>`, the release workflow automatically:
+
+1. Fetches the latest CMUdict and WikiPron revisions.
+2. Synchronizes the runtime version and rebuilds the pronunciation database.
+3. Refreshes source and database integrity hashes.
+4. Runs the Lua and Python regression checks.
+5. Builds the versioned plugin archive.
+6. Commits the generated release inputs back to `main`.
+7. Tags that generated commit and publishes the GitHub Release.
+
+The workflow can also be started manually on `main` to retry an unpublished
+version. The repository must permit GitHub Actions to write contents so the
+generated release commit can be pushed.
 
 ## Rebuild the pronunciation database
 
