@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - _meta.lua
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pronunciation-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect an unpublished plugin version
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(python3 tools/build_release.py --print-version)"
+          tag="v${version}"
+          asset="dist/pronunciation.koplugin-${version}.zip"
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "Release ${tag} already exists; nothing to publish."
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "Release ${tag} is new and will be published."
+          fi
+
+      - name: Install Lua runtimes
+        if: steps.release.outputs.publish == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes lua5.1 luajit
+
+      - name: Run release checks
+        if: steps.release.outputs.publish == 'true'
+        run: |
+          luac5.1 -p main.lua
+          luajit tests/test_plugin.lua
+          lua5.1 tests/test_plugin.lua
+          python3 tests/test_database.py
+
+      - name: Build versioned release archive
+        if: steps.release.outputs.publish == 'true'
+        env:
+          ASSET: ${{ steps.release.outputs.asset }}
+        run: python3 tools/build_release.py --output "$ASSET"
+
+      - name: Publish GitHub release
+        if: steps.release.outputs.publish == 'true'
+        env:
+          ASSET: ${{ steps.release.outputs.asset }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          prerelease=()
+          if [[ "$VERSION" == *-* ]]; then
+            prerelease+=(--prerelease)
+          fi
+          gh release create "$TAG" "$ASSET" \
+            --generate-notes \
+            "${prerelease[@]}" \
+            --target "$GITHUB_SHA" \
+            --title "Pronunciation ${VERSION}"

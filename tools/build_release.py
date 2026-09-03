@@ -9,7 +9,6 @@ import hashlib
 import os
 import re
 import sqlite3
-import subprocess
 import zipfile
 from pathlib import Path
 
@@ -28,14 +27,40 @@ RELEASE_FILES = (
     "data/wikipron_sources.tsv",
 )
 ZIP_TIMESTAMP = (2026, 1, 1, 0, 0, 0)
-RELEASE_ID_LENGTH = 12
-PLUGIN_VERSION = "0.5.0"
+VERSION_PATTERN = re.compile(
+    r"(?:0|[1-9][0-9]*)\."
+    r"(?:0|[1-9][0-9]*)\."
+    r"(?:0|[1-9][0-9]*)"
+    r"(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?"
+    r"(?:\+[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?"
+)
 DATABASE_SHA256 = (
     "62494a9b4b612eeaf04caedde85b123d1b5365fc87ed597ca6ec9815d0281fcc"
 )
 G2P_SHA256 = (
     "9b4d3730a451c530da2a81f2c378a9e4635ec706e14f43d22fee945effd17f84"
 )
+
+
+def read_plugin_version(metadata_path: Path = ROOT / "_meta.lua") -> str:
+    """Read and validate the release version declared in KOReader metadata."""
+    metadata = metadata_path.read_text(encoding="utf-8")
+    matches = re.findall(
+        r'^\s*version\s*=\s*"([^"]+)"\s*,?\s*(?:--.*)?$',
+        metadata,
+        flags=re.MULTILINE,
+    )
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"expected exactly one version in plugin metadata: {metadata_path}"
+        )
+    version = matches[0]
+    if VERSION_PATTERN.fullmatch(version) is None:
+        raise RuntimeError(f"plugin metadata has an invalid version: {version!r}")
+    return version
+
+
+PLUGIN_VERSION = read_plugin_version()
 
 
 def sha256(path: Path) -> str:
@@ -46,36 +71,8 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def git_release_id() -> str:
-    """Return an abbreviated Git commit SHA suitable for an artifact name."""
-    try:
-        result = subprocess.run(
-            (
-                "git",
-                "rev-parse",
-                "--verify",
-                f"--short={RELEASE_ID_LENGTH}",
-                "HEAD",
-            ),
-            cwd=ROOT,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError) as error:
-        raise RuntimeError(
-            "cannot determine the Git SHA for the default release name; "
-            "build from a Git checkout or pass --output"
-        ) from error
-
-    release_id = result.stdout.strip().lower()
-    if not re.fullmatch(rf"[0-9a-f]{{{RELEASE_ID_LENGTH},64}}", release_id):
-        raise RuntimeError(f"Git returned an invalid release SHA: {release_id!r}")
-    return release_id
-
-
 def default_release_output() -> Path:
-    return ROOT / "dist" / f"{PLUGIN_DIRECTORY}-{git_release_id()}.zip"
+    return ROOT / "dist" / f"{PLUGIN_DIRECTORY}-{PLUGIN_VERSION}.zip"
 
 
 def validate_inputs() -> None:
@@ -134,10 +131,7 @@ def validate_inputs() -> None:
     ):
         raise RuntimeError("plugin code license is missing or invalid")
 
-    metadata_source = (ROOT / "_meta.lua").read_text(encoding="utf-8")
     runtime_source = (ROOT / "main.lua").read_text(encoding="utf-8")
-    if f'version = "{PLUGIN_VERSION}"' not in metadata_source:
-        raise RuntimeError("plugin metadata version does not match release")
     if f'local PLUGIN_VERSION = "{PLUGIN_VERSION}"' not in runtime_source:
         raise RuntimeError("runtime version does not match release")
 
@@ -182,15 +176,24 @@ def build_release(output: Path) -> tuple[int, int]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
+    output_group = parser.add_mutually_exclusive_group()
+    output_group.add_argument(
         "--output",
         type=Path,
         help=(
             "archive path (default: "
-            f"dist/{PLUGIN_DIRECTORY}-<12-character-git-sha>.zip)"
+            f"dist/{PLUGIN_DIRECTORY}-<version>.zip)"
         ),
     )
+    output_group.add_argument(
+        "--print-version",
+        action="store_true",
+        help="print the validated plugin version and exit",
+    )
     args = parser.parse_args()
+    if args.print_version:
+        print(PLUGIN_VERSION)
+        return
     output = args.output or default_release_output()
     uncompressed, compressed = build_release(output)
     print(

@@ -76,6 +76,7 @@ local function loadOnlineModules()
 end
 
 local PLUGIN_VERSION = "0.5.0"
+local DICTIONARY_BUTTON_ID = "pronunciation_lookup"
 local CACHE_VERSION = 5
 local GENERATOR_VERSION = 2
 local SOURCED_CACHE_LIMIT = 256
@@ -1100,13 +1101,17 @@ end
 
 function Pronunciation:_dictionaryButtonSpec()
     return {
-        id = "pronunciation_lookup",
+        id = DICTIONARY_BUTTON_ID,
         text = _("Pronunciation"),
         -- Conditional buttons are appended even when a user has an older saved layout.
         conditional = true,
         row_group = "pronunciation",
         show_func = function(dict_popup)
-            return not dict_popup.is_wiki_fullpage
+            local dictionary = dict_popup and dict_popup.ui
+                and dict_popup.ui.dictionary
+                or (self.ui and self.ui.dictionary)
+            self:_removeStaleDictionaryButtonLayout(dictionary)
+            return not dict_popup or not dict_popup.is_wiki_fullpage
         end,
         callback = function(dict_popup)
             self:lookupAndShow(popupQueryWord(dict_popup))
@@ -1117,10 +1122,70 @@ function Pronunciation:_dictionaryButtonSpec()
     }
 end
 
+local function removeValue(values, target)
+    if type(values) ~= "table" then return false end
+    local changed = false
+    for index = #values, 1, -1 do
+        if values[index] == target then
+            table.remove(values, index)
+            changed = true
+        end
+    end
+    return changed
+end
+
+local function removeButtonFromLayout(layout, button_id, row_count)
+    if type(layout) ~= "table" then return false end
+    local changed = false
+    for row_index = #layout, 1, -1 do
+        local row = layout[row_index]
+        local row_changed = removeValue(row, button_id)
+        if row_changed then
+            changed = true
+            if #row == 0 then
+                table.remove(layout, row_index)
+                if type(row_count) == "table" then
+                    table.remove(row_count, row_index)
+                end
+            end
+        end
+    end
+    return changed
+end
+
+function Pronunciation:_removeStaleDictionaryButtonLayout(dictionary)
+    -- Early builds of KOReader's modern button API could append conditional
+    -- rows directly to default_layout. If that contaminated layout was then
+    -- customized, the transient button ID was also saved in dict_button_config.
+    -- Modern KOReader appends the conditional row again at runtime, displaying
+    -- both copies, so remove only the stale persistent occurrences.
+    removeButtonFromLayout(dictionary and dictionary.default_layout,
+        DICTIONARY_BUTTON_ID)
+
+    local reader_settings = rawget(_G, "G_reader_settings")
+    if not reader_settings
+            or type(reader_settings.readSetting) ~= "function"
+            or type(reader_settings.saveSetting) ~= "function" then
+        return
+    end
+    local config = reader_settings:readSetting("dict_button_config")
+    if type(config) ~= "table" then return end
+
+    local changed = removeButtonFromLayout(config.layout,
+        DICTIONARY_BUTTON_ID, config.row_count)
+    if removeValue(config.order, DICTIONARY_BUTTON_ID) then
+        changed = true
+    end
+    if changed then
+        reader_settings:saveSetting("dict_button_config", config)
+    end
+end
+
 function Pronunciation:registerDictionaryButton()
     local dictionary = self.ui and self.ui.dictionary
     if dictionary and type(dictionary.addToDictButtons) == "function" then
         self.uses_modern_dictionary_buttons = true
+        self:_removeStaleDictionaryButtonLayout(dictionary)
         dictionary:addToDictButtons(self:_dictionaryButtonSpec())
     else
         -- KOReader v2022.06-v2024.02 called a tweak_buttons_func method on
@@ -1156,9 +1221,9 @@ end
 
 function Pronunciation:_insertLegacyButton(dict_popup, buttons)
     if not dict_popup or dict_popup.is_wiki_fullpage
-            or containsButton(buttons, "pronunciation_lookup") then return end
+            or containsButton(buttons, DICTIONARY_BUTTON_ID) then return end
     table.insert(buttons, 1, {{
-        id = "pronunciation_lookup",
+        id = DICTIONARY_BUTTON_ID,
         text = _("Pronunciation"),
         callback = function()
             self:lookupAndShow(popupQueryWord(dict_popup))
@@ -1177,6 +1242,36 @@ function Pronunciation:onDictButtonsReady(dict_popup, buttons)
         return
     end
     self:_insertLegacyButton(dict_popup, buttons)
+end
+
+function Pronunciation:onShowPronunciationLookup(selection)
+    if not InputDialog then InputDialog = require("ui/widget/inputdialog") end
+    local dialog
+    dialog = InputDialog:new{
+        title = _("Enter a word or phrase to look up"),
+        input = selection or "",
+        input_type = "text",
+        buttons = {{
+            {
+                text = _("Cancel"),
+                id = "close",
+                callback = function() UIManager:close(dialog) end,
+            },
+            {
+                text = _("Look up pronunciation"),
+                is_enter_default = true,
+                callback = function()
+                    local word = dialog:getInputText() or ""
+                    if trim(word) == "" then return end
+                    UIManager:close(dialog)
+                    self:lookupAndShow(word)
+                end,
+            },
+        }},
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+    return true
 end
 
 function Pronunciation:addToMainMenu(menu_items)
@@ -1201,6 +1296,12 @@ function Pronunciation:addToMainMenu(menu_items)
             end,
         }
     end
+
+    menu_items.pronunciation_lookup = {
+        sorting_hint = "search",
+        text = _("Pronunciation lookup"),
+        callback = function() self:onShowPronunciationLookup() end,
+    }
 
     menu_items.pronunciation = {
         sorting_hint = "tools",

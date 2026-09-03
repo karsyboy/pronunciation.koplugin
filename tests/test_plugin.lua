@@ -7,6 +7,7 @@ local shown_widgets = {}
 local closed_widgets = {}
 local repaint_count = 0
 local next_tick_count = 0
+local keyboard_show_count = 0
 local UIManager = {
     show = function(_, widget)
         shown_widget = widget
@@ -29,7 +30,15 @@ local NetworkMgr = {
 
 preload("datastorage", {})
 preload("ui/widget/infomessage", { new = function(_, value) return value end })
-preload("ui/widget/inputdialog", { new = function(_, value) return value end })
+preload("ui/widget/inputdialog", {
+    new = function(_, value)
+        value.getInputText = function(self) return self.input end
+        value.onShowKeyboard = function()
+            keyboard_show_count = keyboard_show_count + 1
+        end
+        return value
+    end,
+})
 local TextBoxWidget = {
     PTF_HEADER = "<formatted>",
     PTF_BOLD_START = "<bold>",
@@ -87,6 +96,17 @@ local function truthy(value, message)
     if not value then error(message or "expected a truthy value", 2) end
 end
 
+local function countValue(rows, expected)
+    local count = 0
+    for _, row in ipairs(rows or {}) do
+        for _, value in ipairs(row) do
+            local actual = type(value) == "table" and value.id or value
+            if actual == expected then count = count + 1 end
+        end
+    end
+    return count
+end
+
 local function hasCandidate(word, expected_word, expected_kind)
     for _, candidate in ipairs(Plugin:candidates(word)) do
         if candidate.word == expected_word and candidate.kind == expected_kind then
@@ -138,10 +158,163 @@ equal(tapped_word, "cat", "legacy lookupword compatibility fallback failed")
 
 -- Modern registration is conditional, so saved layouts cannot hide the button.
 local modern_spec
+local original_reader_settings = rawget(_G, "G_reader_settings")
+
+-- Missing global settings are valid in stripped-down/custom KOReader builds.
+_G.G_reader_settings = nil
+local no_settings_dictionary = {
+    default_layout = {
+        { "prev_dict", "pronunciation_lookup" },
+        { "pronunciation_lookup" },
+        { "search", "close" },
+    },
+    addToDictButtons = function(_, spec) modern_spec = spec end,
+}
+Plugin.ui = { dictionary = no_settings_dictionary }
+local no_settings_ok = pcall(function() Plugin:registerDictionaryButton() end)
+truthy(no_settings_ok, "modern registration required global reader settings")
+equal(countValue(no_settings_dictionary.default_layout,
+    "pronunciation_lookup"), 0,
+    "stale default-layout buttons survived without reader settings")
+
+-- A clean saved layout must not be rewritten just because the plugin starts.
+local clean_config = {
+    layout = {{ "prev_dict", "search", "close" }},
+    order = { "prev_dict", "search", "close" },
+    row_count = { 3 },
+}
+local clean_save_count = 0
+_G.G_reader_settings = {
+    readSetting = function(_, key)
+        if key == "dict_button_config" then return clean_config end
+    end,
+    saveSetting = function() clean_save_count = clean_save_count + 1 end,
+}
 Plugin.ui = { dictionary = {
+    default_layout = {{ "prev_dict", "search", "close" }},
     addToDictButtons = function(_, spec) modern_spec = spec end,
 } }
 Plugin:registerDictionaryButton()
+equal(clean_save_count, 0, "clean dictionary layout was needlessly rewritten")
+
+-- KOReader's first modern button implementation could persist conditional
+-- rows in both default_layout and dict_button_config. Current KOReader then
+-- appends the conditional row once more, so migrate every stale occurrence.
+local contaminated_config = {
+    layout = {
+        { "prev_dict", "pronunciation_lookup" },
+        { "pronunciation_lookup" },
+        { "search", "close" },
+        { "pronunciation_lookup" },
+    },
+    order = {
+        "prev_dict", "pronunciation_lookup", "search",
+        "pronunciation_lookup", "close",
+    },
+    row_count = { 2, 1, 2, 1 },
+}
+local saved_config
+_G.G_reader_settings = {
+    readSetting = function(_, key)
+        if key == "dict_button_config" then return contaminated_config end
+    end,
+    saveSetting = function(_, key, value)
+        equal(key, "dict_button_config", "unexpected reader setting changed")
+        saved_config = value
+    end,
+}
+local contaminated_dictionary = {
+    default_layout = {
+        { "prev_dict", "pronunciation_lookup" },
+        { "pronunciation_lookup" },
+        { "search", "close" },
+    },
+    addToDictButtons = function(_, spec) modern_spec = spec end,
+}
+Plugin.ui = { dictionary = contaminated_dictionary }
+Plugin:registerDictionaryButton()
+equal(countValue(contaminated_dictionary.default_layout,
+    "pronunciation_lookup"), 0,
+    "contaminated default layout retained the conditional button")
+equal(countValue(contaminated_config.layout, "pronunciation_lookup"), 0,
+    "saved layout retained the conditional button")
+equal(countValue({ contaminated_config.order }, "pronunciation_lookup"), 0,
+    "saved button order retained the conditional button")
+equal(#contaminated_config.layout, 2,
+    "empty contaminated layout rows were not removed")
+equal(#contaminated_config.row_count, 2,
+    "row counts were not kept aligned with the migrated layout")
+equal(contaminated_config.row_count[1], 2,
+    "first surviving row count changed during migration")
+equal(contaminated_config.row_count[2], 2,
+    "second surviving row count changed during migration")
+equal(saved_config, contaminated_config,
+    "migrated dictionary layout was not saved")
+
+-- The same repair runs while each popup is assembled, so it also handles a
+-- layout contaminated after registration (for example, by an old core build).
+table.insert(contaminated_config.layout, { "pronunciation_lookup" })
+table.insert(contaminated_config.order, "pronunciation_lookup")
+table.insert(contaminated_config.row_count, 1)
+saved_config = nil
+truthy(modern_spec.show_func({
+    ui = { dictionary = contaminated_dictionary },
+    is_wiki_fullpage = false,
+}), "modern button was hidden while migrating a saved layout")
+equal(countValue(contaminated_config.layout, "pronunciation_lookup"), 0,
+    "per-popup migration retained a saved conditional button")
+equal(saved_config, contaminated_config,
+    "per-popup saved-layout migration was not persisted")
+
+-- v2026.07 builds the saved rows, then appends each conditional row. After
+-- migration that assembly must contain exactly one pronunciation button.
+local modern_rendered_count = countValue(contaminated_config.layout,
+    "pronunciation_lookup")
+if modern_spec and modern_spec.conditional then
+    modern_rendered_count = modern_rendered_count + 1
+end
+equal(modern_rendered_count, 1,
+    "modern dictionary layout still renders duplicate pronunciation buttons")
+
+-- KOReader ed695fe3 before 17b9a64 appended the transient row directly to
+-- default_layout. The per-popup show hook must repair that mutation before
+-- every build, not only once when the plugin registers.
+local buggy_dictionary = {
+    default_layout = {{ "prev_dict", "search", "close" }},
+    addToDictButtons = function(_, spec) modern_spec = spec end,
+}
+local missing_config_save_count = 0
+_G.G_reader_settings = {
+    readSetting = function() return nil end,
+    saveSetting = function() missing_config_save_count =
+        missing_config_save_count + 1 end,
+}
+Plugin.ui = { dictionary = buggy_dictionary }
+Plugin:registerDictionaryButton()
+local buggy_popup = {
+    ui = { dictionary = buggy_dictionary },
+    is_wiki_fullpage = false,
+}
+local function simulateBuggyModernPopupBuild()
+    truthy(modern_spec.show_func(buggy_popup),
+        "modern button was hidden in a dictionary popup")
+    -- This intentionally reproduces KOReader's old aliasing bug: its runtime
+    -- layout and default_layout were the same table when no config existed.
+    table.insert(buggy_dictionary.default_layout, { modern_spec.id })
+    return countValue(buggy_dictionary.default_layout, modern_spec.id)
+end
+equal(simulateBuggyModernPopupBuild(), 1,
+    "first buggy-core popup rendered an unexpected button count")
+equal(simulateBuggyModernPopupBuild(), 1,
+    "second buggy-core popup duplicated the pronunciation button")
+equal(missing_config_save_count, 0,
+    "missing dictionary config triggered a settings write")
+equal(modern_spec.show_func({
+    ui = { dictionary = buggy_dictionary },
+    is_wiki_fullpage = true,
+}), false, "modern button appeared in full-page Wikipedia")
+_G.G_reader_settings = original_reader_settings
+
 truthy(modern_spec, "modern button was not registered")
 equal(modern_spec.id, "pronunciation_lookup", "modern button id")
 equal(modern_spec.conditional, true, "modern button must bypass saved layouts")
@@ -252,6 +425,10 @@ Plugin.settings = {
 }
 local menu = {}
 Plugin:addToMainMenu(menu)
+equal(menu.pronunciation_lookup.sorting_hint, "search",
+    "manual pronunciation lookup was not assigned to the Search menu")
+equal(menu.pronunciation_lookup.text, "Pronunciation lookup",
+    "manual pronunciation lookup menu label")
 equal(menu.pronunciation.sorting_hint, "tools",
     "pronunciation settings were not assigned to the Tools menu")
 local language_menu = menu.pronunciation.sub_item_table[3].sub_item_table
@@ -261,6 +438,41 @@ language_menu[2].callback()
 equal(Plugin.generated_language, "en",
     "generated-language menu did not select US English")
 Plugin.generated_language = "auto"
+
+-- Manual pronunciation lookup mirrors KOReader's dictionary lookup dialog.
+local menu_lookup_word
+local menu_lookup = Plugin.lookupAndShow
+Plugin.lookupAndShow = function(_, word) menu_lookup_word = word end
+shown_widgets = {}
+closed_widgets = {}
+keyboard_show_count = 0
+menu.pronunciation_lookup.callback()
+local lookup_dialog = shown_widgets[#shown_widgets]
+truthy(lookup_dialog, "manual pronunciation lookup dialog was not shown")
+equal(lookup_dialog.title, "Enter a word or phrase to look up",
+    "manual pronunciation lookup dialog title")
+equal(lookup_dialog.input_type, "text",
+    "manual pronunciation lookup input type")
+equal(keyboard_show_count, 1,
+    "manual pronunciation lookup did not show the keyboard")
+equal(lookup_dialog.buttons[1][2].is_enter_default, true,
+    "manual pronunciation lookup is not the enter-key default")
+lookup_dialog.input = "   "
+lookup_dialog.buttons[1][2].callback()
+equal(menu_lookup_word, nil, "blank manual pronunciation lookup was submitted")
+equal(#closed_widgets, 0, "blank manual pronunciation lookup closed its dialog")
+lookup_dialog.input = "Faërun"
+lookup_dialog.buttons[1][2].callback()
+equal(menu_lookup_word, "Faërun", "manual pronunciation lookup changed its query")
+equal(closed_widgets[1], lookup_dialog,
+    "manual pronunciation lookup did not close before searching")
+
+menu.pronunciation_lookup.callback()
+local cancelled_lookup_dialog = shown_widgets[#shown_widgets]
+cancelled_lookup_dialog.buttons[1][1].callback()
+equal(closed_widgets[#closed_widgets], cancelled_lookup_dialog,
+    "manual pronunciation lookup cancel did not close its dialog")
+Plugin.lookupAndShow = menu_lookup
 
 -- Generated entries are reproducible offline, so stale formats and excessive
 -- history must not grow the startup settings table without bound.

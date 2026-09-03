@@ -4,8 +4,8 @@
 from __future__ import annotations
 
 import hashlib
-import re
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import zipfile
@@ -26,11 +26,11 @@ from build_release import (  # noqa: E402
     DATABASE_SHA256,
     G2P_SHA256,
     PLUGIN_DIRECTORY,
-    RELEASE_ID_LENGTH,
+    PLUGIN_VERSION,
     RELEASE_FILES,
     build_release,
     default_release_output,
-    git_release_id,
+    read_plugin_version,
 )
 
 
@@ -109,7 +109,7 @@ def check_database() -> None:
             "SELECT COUNT(*) FROM language_hints"
         ).fetchone()[0] == 0
         metadata = dict(connection.execute("SELECT key, value FROM metadata"))
-        assert metadata["version"] == "0.5.0"
+        assert metadata["version"] == PLUGIN_VERSION
         assert len(metadata["cmudict_revision"]) == 40
         assert len(metadata["supplement_sha256"]) == 64
         assert len(metadata["language_hints_sha256"]) == 64
@@ -210,17 +210,45 @@ def check_g2p_model() -> None:
 
 
 def check_release_build() -> None:
-    release_id = git_release_id()
-    assert re.fullmatch(
-        rf"[0-9a-f]{{{RELEASE_ID_LENGTH},64}}", release_id
-    )
+    assert read_plugin_version() == PLUGIN_VERSION
     assert default_release_output() == (
-        ROOT / "dist" / f"{PLUGIN_DIRECTORY}-{release_id}.zip"
+        ROOT / "dist" / f"{PLUGIN_DIRECTORY}-{PLUGIN_VERSION}.zip"
     )
 
     with tempfile.TemporaryDirectory(prefix="pronunciation-release-test-") as directory:
-        output = Path(directory) / "release.zip"
-        second_output = Path(directory) / "release-again.zip"
+        directory = Path(directory)
+        metadata = directory / "_meta.lua"
+        metadata.write_text(
+            'return {\n    version = "1.2.3-rc.1+build.4",\n}\n',
+            encoding="utf-8",
+        )
+        assert read_plugin_version(metadata) == "1.2.3-rc.1+build.4"
+        metadata.write_text(
+            'return {\n    version = "not/a/version",\n}\n',
+            encoding="utf-8",
+        )
+        try:
+            read_plugin_version(metadata)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("invalid plugin metadata version was accepted")
+
+        version_result = subprocess.run(
+            [
+                sys.executable,
+                ROOT / "tools" / "build_release.py",
+                "--print-version",
+            ],
+            cwd=directory,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert version_result.stdout.strip() == PLUGIN_VERSION
+
+        output = directory / "release.zip"
+        second_output = directory / "release-again.zip"
         installed_size, archive_size = build_release(output)
         build_release(second_output)
         assert output.read_bytes() == second_output.read_bytes()

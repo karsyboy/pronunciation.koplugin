@@ -14,7 +14,7 @@ jailbroken Kindles.
 
 ## Install
 
-1. Download `pronunciation.koplugin-<git-sha>.zip` from the repository's
+1. Download `pronunciation.koplugin-<version>.zip` from the repository's
    Releases page.
 2. Extract it into `koreader/plugins/`.
 3. Confirm this path exists:
@@ -26,7 +26,8 @@ jailbroken Kindles.
 4. Restart KOReader.
 
 Open a dictionary result and tap **Pronunciation**. Long-press the button to add
-or edit an override. Settings are under **Tools → Pronunciation dictionary**:
+or edit an override. To enter a word manually, use **Search → Pronunciation
+lookup**. Settings are under **Tools → Pronunciation dictionary**:
 
 - **Online fallback** enables Dictionary API and Wiktionary lookup.
 - **Generated fallback** enables the bundled unfamiliar-word model.
@@ -70,9 +71,22 @@ python3 tools/build_release.py
 
 The release builder validates versions, database integrity and metadata, source
 manifests, model hashes, required licenses, and archive contents. Output is
-`dist/pronunciation.koplugin-<12-character-git-sha>.zip`, so artifacts from
-different commits do not overwrite one another. Repeated builds of the same
-commit are byte-identical. Pass `--output PATH` to select an explicit name.
+`dist/pronunciation.koplugin-<version>.zip`, using the semantic version in
+`_meta.lua`. Repeated builds from the same inputs are byte-identical. Pass
+`--output PATH` to select an explicit name, or `--print-version` to print the
+validated version without building an archive.
+
+### Publish a release
+
+Pushing a change to `_meta.lua` on `main` starts the release workflow. If no
+GitHub Release exists for `v<version>`, the workflow runs the Lua and Python
+checks, builds the versioned archive, creates that tag, and publishes the
+archive. It can also be run manually on `main` to retry an unpublished version.
+
+Before merging a version bump, update `_meta.lua`, `main.lua`, and
+`tools/build_database.py`, rebuild the bundled database, and update its expected
+hash in `tools/build_release.py`. The release builder rejects version or hash
+mismatches.
 
 ### Rebuild the pronunciation database
 
