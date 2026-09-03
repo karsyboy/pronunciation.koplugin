@@ -12,8 +12,22 @@ Offline IPA and readable pronunciation lookup for KOReader.
 
 ## Screenshots
 <img src="./.resources/img1.png" width="45%" /> <img src="./.resources/img2.png" width="45%" />
+
 ## Install
 
+### Method 1: Install via Storefront (Recommended)
+If you use the Storefront plugin manager for KOReader, you can install and update Pronunciation directly on your device without connecting to a computer:
+
+1. Open KOReader on your device.
+2. Open the Tools menu (wrench icon / menu) and launch Storefront.
+3. Search for or browse to Pronunciation in the plugin list. (You may have to set the filter to show zero stars)
+4. Tap Install.
+4. Restart KOReader when prompted.
+
+> [!TIP]
+> Storefront will automatically check for new Pronunciation releases and allow seamless, one-tap updates directly on your e-reader.
+
+### Method 2: Manual Installation
 1. Download `pronunciation.koplugin-<version>.zip` from the repository's
    Releases page.
 2. Extract it into `koreader/plugins/`.
