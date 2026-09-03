@@ -1,4 +1,4 @@
-# Pronunciation for KOReader
+# Pronunciation Dictionary for KOReader
 
 Offline IPA and readable pronunciation lookup for KOReader.
 
