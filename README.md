@@ -39,6 +39,9 @@ If you use the Storefront plugin manager for KOReader, you can install and updat
 
 4. Restart KOReader.
 
+> [!Note]
+> You can replace the complete plugin directory when upgrading. KOReader stores settings and personal overrides separately.
+
 ## Use
 
 - Open a dictionary result and tap **Pronunciation**.
@@ -50,11 +53,9 @@ Settings are under **Search → Settings → Pronunciation settings**:
 - **Online fallback** enables Dictionary API and Wiktionary lookup.
 - **Generated fallback** enables the bundled unfamiliar-word model.
 - **Generated language** offers **Auto** or **US English**.
-- **Clear cached pronunciations** removes sourced and generated caches without
-  deleting personal overrides.
-
-You can replace the complete plugin directory when upgrading. KOReader stores
-settings and personal overrides separately.
+- **Clear cached pronunciations** removes sourced and generated caches without deleting personal overrides.
+>[!Note]
+> Turning off online fallback can greatly increase the time it takes to generate a pronunciation.
 
 ## Lookup order
 
