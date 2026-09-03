@@ -45,8 +45,7 @@ If you use the Storefront plugin manager for KOReader, you can install and updat
 - Long-press **Pronunciation** to add or edit a personal override.
 - Use **Search → Pronunciation lookup** to enter a word manually.
 
-Settings are under **Search → Settings → Pronunciation dictionary**, beside
-KOReader's **Dictionary settings**:
+Settings are under **Search → Settings → Pronunciation settings**:
 
 - **Online fallback** enables Dictionary API and Wiktionary lookup.
 - **Generated fallback** enables the bundled unfamiliar-word model.
