@@ -12,7 +12,7 @@ jailbroken Kindles.
 - Personal pronunciation overrides
 
 ## Screenshots
-
+<img src="./.resources/img1.png" width="45%" /> <img src="./.resources/img2.png" width="45%" />
 ## Install
 
 1. Download `pronunciation.koplugin-<version>.zip` from the repository's
