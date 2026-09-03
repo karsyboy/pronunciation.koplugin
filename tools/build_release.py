@@ -35,7 +35,7 @@ VERSION_PATTERN = re.compile(
     r"(?:\+[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?"
 )
 DATABASE_SHA256 = (
-    "6aa1baf33d93add8596fff06cd78aeedbda7b1657a7f718f6f1c58d1bc6f73d7"
+    "85028786aac72b2cc43fa369e6bf42148af052453a84d9793dbf58f324d804ae"
 )
 G2P_SHA256 = (
     "9b4d3730a451c530da2a81f2c378a9e4635ec706e14f43d22fee945effd17f84"

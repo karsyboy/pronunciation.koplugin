@@ -75,7 +75,7 @@ local function loadOnlineModules()
     url = require("socket.url")
 end
 
-local PLUGIN_VERSION = "0.6.1"
+local PLUGIN_VERSION = "0.6.2"
 local DICTIONARY_BUTTON_ID = "pronunciation_lookup"
 local CACHE_VERSION = 5
 local GENERATOR_VERSION = 3
