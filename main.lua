@@ -1305,7 +1305,7 @@ function Pronunciation:addToMainMenu(menu_items)
 
     menu_items.pronunciation = {
         sorting_hint = "search_settings",
-        text = _("Pronunciation dictionary"),
+        text = _("Pronunciation settings"),
         sub_item_table = {
             {
                 text_func = function()
