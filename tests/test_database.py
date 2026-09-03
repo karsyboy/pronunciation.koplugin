@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import sqlite3
 import subprocess
@@ -21,6 +22,8 @@ from build_database import (  # noqa: E402
     arpabet_to_readable,
     build_database,
     load_wikipron_manifest,
+    refresh_wikipron_manifest,
+    sync_git_checkout,
 )
 from build_release import (  # noqa: E402
     DATABASE_SHA256,
@@ -114,14 +117,13 @@ def check_database() -> None:
         assert len(metadata["supplement_sha256"]) == 64
         assert len(metadata["language_hints_sha256"]) == 64
         assert len(metadata["wikipron_revision"]) == 40
-        assert metadata["wikipron_eng_us_sha256"] == (
-            "f304b8f0565466e8abfe4c04a30d99421e1590d2aa17c4a08ebfa5942c587e75"
-        )
-        assert metadata["wikipron_eng_uk_sha256"] == (
-            "f8ca476aa2e96cb22cafbf9099d689b5902a9d321579055081909b2eeafa1b8d"
-        )
-        assert metadata["wikipron_eng_us_records"] == "105458"
-        assert metadata["wikipron_eng_uk_records"] == "105157"
+        with (ROOT / "data" / "wikipron_sources.tsv").open(
+            encoding="utf-8", newline=""
+        ) as manifest:
+            for row in csv.DictReader(manifest, delimiter="\t"):
+                source_id = row["source_id"]
+                assert metadata[f"wikipron_{source_id}_sha256"] == row["sha256"]
+                assert int(metadata[f"wikipron_{source_id}_records"]) > 0
         assert metadata["converter"] == (
             "tools/build_database.py manifest profile schema v4"
         )
@@ -143,11 +145,13 @@ def check_compact_database_build() -> None:
         manifest.write_text(
             "filename\tsource_id\tlanguage_code\tlanguage_name\tregion\tsha256\n"
             f"{us_wikipron.name}\teng_us\ten\tEnglish\tUS\t"
-            f"{hashlib.sha256(us_wikipron.read_bytes()).hexdigest()}\n"
+            f"{'0' * 64}\n"
             f"{uk_wikipron.name}\teng_uk\ten\tEnglish\tUK\t"
-            f"{hashlib.sha256(uk_wikipron.read_bytes()).hexdigest()}\n",
+            f"{'0' * 64}\n",
             encoding="utf-8",
         )
+        assert refresh_wikipron_manifest(manifest, directory)
+        assert not refresh_wikipron_manifest(manifest, directory)
         wikipron_sources = load_wikipron_manifest(manifest, directory)
         assert [source.source_id for source in wikipron_sources] == [
             "eng_us", "eng_uk",
@@ -187,6 +191,48 @@ def check_compact_database_build() -> None:
             ).fetchone()[0] == "2026-01-01"
         finally:
             connection.close()
+
+
+def check_source_checkout_update() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="pronunciation-source-test-"
+    ) as directory:
+        directory = Path(directory)
+        upstream = directory / "upstream"
+        checkout = directory / "checkout"
+        subprocess.run(
+            ["git", "init", upstream], check=True, capture_output=True, text=True
+        )
+        subprocess.run(
+            ["git", "-C", upstream, "config", "user.name", "Test Builder"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", upstream, "config", "user.email", "test@example.com"],
+            check=True,
+        )
+        source = upstream / "source.txt"
+        source.write_text("first\n", encoding="utf-8")
+        subprocess.run(["git", "-C", upstream, "add", "source.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", upstream, "commit", "-m", "first"],
+            check=True,
+            capture_output=True,
+        )
+
+        first_revision = sync_git_checkout(str(upstream.resolve()), checkout)
+        assert (checkout / "source.txt").read_text(encoding="utf-8") == "first\n"
+
+        source.write_text("second\n", encoding="utf-8")
+        subprocess.run(["git", "-C", upstream, "add", "source.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", upstream, "commit", "-m", "second"],
+            check=True,
+            capture_output=True,
+        )
+        second_revision = sync_git_checkout(str(upstream.resolve()), checkout)
+        assert second_revision != first_revision
+        assert (checkout / "source.txt").read_text(encoding="utf-8") == "second\n"
 
 
 def check_g2p_model() -> None:
@@ -269,6 +315,7 @@ if __name__ == "__main__":
     check_conversion()
     check_database()
     check_compact_database_build()
+    check_source_checkout_update()
     check_g2p_model()
     check_release_build()
     print("database regression tests: OK")

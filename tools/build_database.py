@@ -10,12 +10,16 @@ import hashlib
 import os
 import re
 import sqlite3
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PLUGIN_VERSION = "0.5.0"
+PLUGIN_VERSION = "0.5.1"
+DEFAULT_SOURCES_DIR = ROOT / "pronunciation-sources"
+CMUDICT_REPOSITORY = "https://github.com/cmusphinx/cmudict.git"
+WIKIPRON_REPOSITORY = "https://github.com/CUNY-CL/wikipron.git"
 
 
 @dataclass(frozen=True)
@@ -329,6 +333,108 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def run_git(*arguments: str | Path) -> str:
+    command = ["git", *(str(argument) for argument in arguments)]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as error:
+        raise RuntimeError(
+            "Git is required to download the pronunciation sources"
+        ) from error
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(f"Git command failed: {detail}")
+    return result.stdout.strip()
+
+
+def sync_git_checkout(repository: str, checkout: Path) -> str:
+    """Clone or update a clean, tool-managed checkout to upstream HEAD."""
+    checkout = checkout.resolve()
+    checkout.parent.mkdir(parents=True, exist_ok=True)
+    if checkout.exists():
+        if not (checkout / ".git").exists():
+            raise RuntimeError(
+                f"source directory exists but is not a Git checkout: {checkout}"
+            )
+        remote = run_git("-C", checkout, "remote", "get-url", "origin")
+        if remote != repository:
+            raise RuntimeError(
+                f"source checkout has an unexpected origin: {checkout}"
+            )
+        if run_git("-C", checkout, "status", "--porcelain"):
+            raise RuntimeError(
+                f"source checkout has local changes; clean it before updating: "
+                f"{checkout}"
+            )
+        print(f"Updating {checkout.name} from {repository}")
+        run_git("-C", checkout, "fetch", "--depth", "1", "origin", "HEAD")
+        run_git("-C", checkout, "checkout", "--detach", "FETCH_HEAD")
+    else:
+        print(f"Downloading {checkout.name} from {repository}")
+        run_git("clone", "--depth", "1", repository, checkout)
+
+    revision = run_git("-C", checkout, "rev-parse", "HEAD")
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise RuntimeError(f"could not determine source revision for {checkout}")
+    return revision
+
+
+def refresh_wikipron_manifest(path: Path, tsv_root: Path) -> bool:
+    """Update hashes for the allowlisted TSVs after fetching WikiPron."""
+    with path.open(encoding="utf-8", newline="") as manifest:
+        reader = csv.DictReader(manifest, delimiter="\t")
+        fieldnames = reader.fieldnames
+        required = {"filename", "sha256"}
+        missing = required - set(fieldnames or ())
+        if missing:
+            raise ValueError(
+                f"WikiPron manifest is missing columns: {sorted(missing)}"
+            )
+        rows = list(reader)
+
+    changed = False
+    for line_number, row in enumerate(rows, 2):
+        filename = row["filename"].strip()
+        relative = Path(filename)
+        if (not filename or relative.is_absolute() or ".." in relative.parts
+                or not filename.endswith("_broad.tsv")):
+            raise ValueError(
+                f"invalid WikiPron broad TSV on manifest line {line_number}: "
+                f"{filename!r}"
+            )
+        source = tsv_root / relative
+        if not source.is_file():
+            raise FileNotFoundError(f"WikiPron TSV is missing: {source}")
+        actual_hash = sha256(source)
+        if row["sha256"].strip().lower() != actual_hash:
+            row["sha256"] = actual_hash
+            changed = True
+
+    if changed:
+        temporary = path.with_name(path.name + ".tmp")
+        try:
+            with temporary.open("w", encoding="utf-8", newline="") as manifest:
+                writer = csv.DictWriter(
+                    manifest,
+                    fieldnames=fieldnames,
+                    delimiter="\t",
+                    lineterminator="\n",
+                )
+                writer.writeheader()
+                writer.writerows(rows)
+            os.replace(temporary, path)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+        print(f"Updated WikiPron hashes in {path}")
+    return changed
+
+
 def iso_date(value: str) -> str:
     try:
         parsed = dt.date.fromisoformat(value)
@@ -529,7 +635,20 @@ def build_database(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cmudict", required=True, type=Path)
+    parser.add_argument(
+        "--sources-dir",
+        type=Path,
+        default=DEFAULT_SOURCES_DIR,
+        help=(
+            "automatic CMUdict and WikiPron checkout directory "
+            "(default: pronunciation-sources)"
+        ),
+    )
+    parser.add_argument(
+        "--cmudict",
+        type=Path,
+        help="use a local cmudict.dict instead of downloading latest CMUdict",
+    )
     parser.add_argument("--supplement", type=Path,
                         default=ROOT / "data" / "supplemental.tsv")
     parser.add_argument("--language-hints", type=Path,
@@ -540,8 +659,12 @@ def main() -> None:
         help="curated WikiPron broad-IPA source manifest",
     )
     parser.add_argument(
-        "--wikipron-root", required=True, type=Path,
-        help="directory containing the manifest's WikiPron TSV files",
+        "--wikipron-root",
+        type=Path,
+        help=(
+            "use a local directory containing the manifest's WikiPron TSV "
+            "files instead of downloading latest WikiPron"
+        ),
     )
     parser.add_argument("--wikipron-revision", default="")
     parser.add_argument(
@@ -551,21 +674,55 @@ def main() -> None:
     )
     parser.add_argument("--output", type=Path,
                         default=ROOT / "data" / "pronunciations.sqlite3")
-    parser.add_argument("--cmudict-revision", required=True)
+    parser.add_argument("--cmudict-revision", default="")
     args = parser.parse_args()
+
+    local_sources = args.cmudict is not None or args.wikipron_root is not None
+    if local_sources:
+        if args.cmudict is None or args.wikipron_root is None:
+            parser.error(
+                "--cmudict and --wikipron-root must be provided together"
+            )
+        if not args.cmudict_revision:
+            parser.error("--cmudict-revision is required with local sources")
+        if not args.wikipron_revision:
+            parser.error("--wikipron-revision is required with local sources")
+        cmudict = args.cmudict
+        wikipron_root = args.wikipron_root
+        cmudict_revision = args.cmudict_revision
+        wikipron_revision = args.wikipron_revision
+    else:
+        if args.cmudict_revision or args.wikipron_revision:
+            parser.error(
+                "source revisions can only be used with explicit local sources"
+            )
+        cmudict_checkout = args.sources_dir / "cmudict"
+        wikipron_checkout = args.sources_dir / "wikipron"
+        cmudict_revision = sync_git_checkout(
+            CMUDICT_REPOSITORY, cmudict_checkout
+        )
+        wikipron_revision = sync_git_checkout(
+            WIKIPRON_REPOSITORY, wikipron_checkout
+        )
+        cmudict = cmudict_checkout / "cmudict.dict"
+        wikipron_root = wikipron_checkout / "data" / "scrape" / "tsv"
+        refresh_wikipron_manifest(args.wikipron_manifest, wikipron_root)
+        print(
+            f"Using CMUdict {cmudict_revision} and "
+            f"WikiPron {wikipron_revision}"
+        )
+
     wikipron_sources = load_wikipron_manifest(
-        args.wikipron_manifest, args.wikipron_root
+        args.wikipron_manifest, wikipron_root
     )
-    if wikipron_sources and not args.wikipron_revision:
-        parser.error("--wikipron-revision is required with WikiPron sources")
     headwords, records = build_database(
-        args.cmudict,
+        cmudict,
         args.supplement,
         args.language_hints,
         wikipron_sources,
         args.output,
-        args.cmudict_revision,
-        args.wikipron_revision,
+        cmudict_revision,
+        wikipron_revision,
         args.generated_date,
     )
     print(f"built {args.output}: {headwords} headwords, {records} records")
