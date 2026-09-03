@@ -1322,10 +1322,14 @@ function Pronunciation:addToMainMenu(menu_items)
                         and _("Online fallback: on") or _("Online fallback: off")
                 end,
                 keep_menu_open = true,
-                callback = function()
+                callback = function(touchmenu_instance)
                     self.online_fallback = not self.online_fallback
                     self.settings:saveSetting("online_fallback", self.online_fallback)
                     self.settings:flush()
+                    if touchmenu_instance
+                            and type(touchmenu_instance.updateItems) == "function" then
+                        touchmenu_instance:updateItems()
+                    end
                 end,
             },
             {
@@ -1334,11 +1338,15 @@ function Pronunciation:addToMainMenu(menu_items)
                         and _("Generated fallback: on") or _("Generated fallback: off")
                 end,
                 keep_menu_open = true,
-                callback = function()
+                callback = function(touchmenu_instance)
                     self.generated_fallback = not self.generated_fallback
                     self.settings:saveSetting("generated_fallback",
                         self.generated_fallback)
                     self.settings:flush()
+                    if touchmenu_instance
+                            and type(touchmenu_instance.updateItems) == "function" then
+                        touchmenu_instance:updateItems()
+                    end
                 end,
             },
             {

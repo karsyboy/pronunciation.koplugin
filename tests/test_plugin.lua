@@ -461,6 +461,34 @@ equal(menu.pronunciation_lookup.text, "Pronunciation lookup",
     "manual pronunciation lookup menu label")
 equal(menu.pronunciation.sorting_hint, "search_settings",
     "pronunciation settings were not assigned beside Dictionary settings")
+local online_fallback_item = menu.pronunciation.sub_item_table[1]
+local generated_fallback_item = menu.pronunciation.sub_item_table[2]
+local menu_update_count = 0
+local touchmenu_instance = {
+    updateItems = function()
+        menu_update_count = menu_update_count + 1
+    end,
+}
+Plugin.online_fallback = true
+equal(online_fallback_item.text_func(), "Online fallback: on",
+    "online fallback initial menu label")
+online_fallback_item.callback(touchmenu_instance)
+equal(online_fallback_item.text_func(), "Online fallback: off",
+    "online fallback label did not update after disabling")
+online_fallback_item.callback(touchmenu_instance)
+equal(online_fallback_item.text_func(), "Online fallback: on",
+    "online fallback label did not update after enabling")
+Plugin.generated_fallback = true
+equal(generated_fallback_item.text_func(), "Generated fallback: on",
+    "generated fallback initial menu label")
+generated_fallback_item.callback(touchmenu_instance)
+equal(generated_fallback_item.text_func(), "Generated fallback: off",
+    "generated fallback label did not update after disabling")
+generated_fallback_item.callback(touchmenu_instance)
+equal(generated_fallback_item.text_func(), "Generated fallback: on",
+    "generated fallback label did not update after enabling")
+equal(menu_update_count, 4,
+    "fallback toggles did not refresh the open settings menu")
 local language_menu = menu.pronunciation.sub_item_table[3].sub_item_table
 equal(#language_menu, 2,
     "generated-language menu should contain only Auto and US English")
