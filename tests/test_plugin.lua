@@ -429,8 +429,8 @@ equal(menu.pronunciation_lookup.sorting_hint, "search",
     "manual pronunciation lookup was not assigned to the Search menu")
 equal(menu.pronunciation_lookup.text, "Pronunciation lookup",
     "manual pronunciation lookup menu label")
-equal(menu.pronunciation.sorting_hint, "tools",
-    "pronunciation settings were not assigned to the Tools menu")
+equal(menu.pronunciation.sorting_hint, "search_settings",
+    "pronunciation settings were not assigned beside Dictionary settings")
 local language_menu = menu.pronunciation.sub_item_table[3].sub_item_table
 equal(#language_menu, 2,
     "generated-language menu should contain only Auto and US English")

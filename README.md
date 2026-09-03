@@ -31,7 +31,8 @@ Offline IPA and readable pronunciation lookup for KOReader.
 - Long-press **Pronunciation** to add or edit a personal override.
 - Use **Search → Pronunciation lookup** to enter a word manually.
 
-Settings are under **Tools → Pronunciation dictionary**:
+Settings are under **Search → Settings → Pronunciation dictionary**, beside
+KOReader's **Dictionary settings**:
 
 - **Online fallback** enables Dictionary API and Wiktionary lookup.
 - **Generated fallback** enables the bundled unfamiliar-word model.
