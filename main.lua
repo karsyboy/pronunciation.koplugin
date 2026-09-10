@@ -491,7 +491,12 @@ function Pronunciation:discoverLanguagePacks(force)
     local packs = {}
     local data_path = self.data_path or (self.path .. "/data")
     if not LFS then
-        local ok, module = pcall(require, "lfs")
+        local ok, module = pcall(require, "libs/libkoreader-lfs")
+        if not ok then
+            -- Keep plain Lua development environments compatible with the
+            -- conventional LuaFileSystem module name.
+            ok, module = pcall(require, "lfs")
+        end
         LFS = ok and module or false
     end
     local function add(code)
@@ -548,6 +553,28 @@ function Pronunciation:discoverLanguagePacks(force)
     self.language_packs = packs
     self.language_pack_aliases = aliases
     return packs
+end
+
+function Pronunciation:pronunciationLanguageMenuItems()
+    local items = {
+        {
+            text = _("Auto (book language)"),
+            checked_func = function()
+                return self.pronunciation_language == "auto"
+            end,
+            callback = function() self:setPronunciationLanguage("auto") end,
+        },
+    }
+    for _, pack in ipairs(self:installedLanguagePacks()) do
+        items[#items + 1] = {
+            text = pack.name,
+            checked_func = function()
+                return self.pronunciation_language == pack.code
+            end,
+            callback = function() self:setPronunciationLanguage(pack.code) end,
+        }
+    end
+    return items
 end
 
 function Pronunciation:normalizePronunciationLanguage(value)
@@ -1737,24 +1764,6 @@ function Pronunciation:fetchAIModels(provider_id, provider_name, menu_items,
 end
 
 function Pronunciation:addToMainMenu(menu_items)
-    local pronunciation_language_items = {
-        {
-            text = _("Auto (book language)"),
-            checked_func = function()
-                return self.pronunciation_language == "auto"
-            end,
-            callback = function() self:setPronunciationLanguage("auto") end,
-        },
-    }
-    for _, pack in ipairs(self:installedLanguagePacks()) do
-        pronunciation_language_items[#pronunciation_language_items + 1] = {
-            text = pack.name,
-            checked_func = function()
-                return self.pronunciation_language == pack.code
-            end,
-            callback = function() self:setPronunciationLanguage(pack.code) end,
-        }
-    end
     menu_items.pronunciation_lookup = {
         sorting_hint = "search",
         text = _("Pronunciation lookup"),
@@ -1894,7 +1903,9 @@ function Pronunciation:addToMainMenu(menu_items)
                     return _("Pronunciation language") .. ": "
                         .. (pack and pack.name or self.pronunciation_language)
                 end,
-                sub_item_table = pronunciation_language_items,
+                sub_item_table_func = function()
+                    return self:pronunciationLanguageMenuItems()
+                end,
             },
             {
                 text = _("Clear cached pronunciations"),

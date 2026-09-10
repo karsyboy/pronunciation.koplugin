@@ -69,7 +69,7 @@ preload("ui/network/manager", NetworkMgr)
 local SQ3 = {}
 preload("lua-ljsqlite3/init", SQ3)
 local lfs_entries = { "en" }
-preload("lfs", {
+local lfs_stub = {
     dir = function()
         local index = 0
         return function()
@@ -77,7 +77,9 @@ preload("lfs", {
             return lfs_entries[index]
         end
     end,
-})
+}
+preload("libs/libkoreader-lfs", lfs_stub)
+preload("lfs", lfs_stub)
 preload("ui/uimanager", UIManager)
 preload("ui/widget/container/widgetcontainer", {
     extend = function(_, value) return value end,
@@ -590,9 +592,13 @@ equal(Plugin.ai_provider_configs.gemini.model,
 equal(model_menu_updates, 1, "fetched model list did not refresh its menu")
 Plugin.ai_models_request = nil
 local pronunciation_language_menu =
-    menu.pronunciation.sub_item_table[3].sub_item_table
+    menu.pronunciation.sub_item_table[3].sub_item_table_func()
 equal(#pronunciation_language_menu, 2,
     "pronunciation-language menu should contain Auto and installed English")
+equal(package.loaded["libs/libkoreader-lfs"], lfs_stub,
+    "language-pack discovery did not use KOReader's filesystem module")
+equal(package.loaded["lfs"], nil,
+    "language-pack discovery unnecessarily used desktop LuaFileSystem")
 equal(pronunciation_language_menu[2].text, "English",
     "English pack appeared with a regional database label")
 pronunciation_language_menu[2].callback()
@@ -639,6 +645,14 @@ Plugin.language_packs = nil
 Plugin.language_pack_aliases = nil
 equal(#Plugin:installedLanguagePacks(), 2,
     "installed language pack discovery missed a pack")
+local refreshed_language_menu =
+    menu.pronunciation.sub_item_table[3].sub_item_table_func()
+equal(#refreshed_language_menu, 3,
+    "language menu did not refresh after another pack was installed")
+equal(refreshed_language_menu[2].text, "English",
+    "refreshed language menu lost alphabetical ordering")
+equal(refreshed_language_menu[3].text, "French",
+    "installed French pack was missing from the language menu")
 equal(Plugin:normalizePronunciationLanguage("en-US"), "en",
     "en-US did not collapse to en")
 equal(Plugin:normalizePronunciationLanguage("en-GB"), "en",

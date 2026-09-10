@@ -99,8 +99,9 @@ python3 tools/build_language_pack.py --all
 ```
 
 Copy the generated `data/<language-code>/` directory into the plugin's `data/`
-directory and restart KOReader. Each pack contains sourced IPA, a readable
-converter, and a local G2P model when a compatible MFA model exists.
+directory, then reopen the **Pronunciation language** menu. Each pack contains
+sourced IPA, a readable converter, and a local G2P model when a compatible MFA
+model exists.
 
 ## Limitations and licenses
 
