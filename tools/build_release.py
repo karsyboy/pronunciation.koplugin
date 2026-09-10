@@ -22,8 +22,9 @@ RELEASE_FILES = (
     "LICENSES.txt",
     "data/en/pronunciations.sqlite3",
     "data/en/pack.tsv",
-    "data/mfa_english_g2p.bin",
-    "data/mfa_english_g2p.SOURCE.txt",
+    "data/en/readable.tsv",
+    "data/en/g2p.bin",
+    "data/en/g2p.SOURCE.txt",
 )
 ZIP_TIMESTAMP = (2026, 1, 1, 0, 0, 0)
 VERSION_PATTERN = re.compile(
@@ -34,10 +35,13 @@ VERSION_PATTERN = re.compile(
     r"(?:\+[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?"
 )
 DATABASE_SHA256 = (
-    "ffa93ff3028abcd18ea9d2107cc860c7b752cbfac41e70a57cb6c9962e87ec11"
+    "1793fd545bdd6b488a277eaabb48744a6c7adde891945d2aa89b681acf6a3fe4"
 )
 G2P_SHA256 = (
-    "9b4d3730a451c530da2a81f2c378a9e4635ec706e14f43d22fee945effd17f84"
+    "4056b000fb0b7b6b972a1bebaad89d21556fe1b64b199870608839d3d9d4b22c"
+)
+READABLE_SHA256 = (
+    "3505d7c55e1a0a0cb2fec298e08856248c109d3153e9b085939f023ed18bbf0a"
 )
 
 
@@ -86,7 +90,7 @@ def validate_inputs() -> None:
     try:
         if database.execute("PRAGMA quick_check").fetchone()[0] != "ok":
             raise RuntimeError("pronunciation database failed quick_check")
-        if database.execute("PRAGMA user_version").fetchone()[0] != 7:
+        if database.execute("PRAGMA user_version").fetchone()[0] != 8:
             raise RuntimeError("pronunciation database schema is not release-ready")
         metadata = dict(database.execute("SELECT key, value FROM metadata"))
         if metadata.get("version") != PLUGIN_VERSION:
@@ -115,7 +119,9 @@ def validate_inputs() -> None:
     )
     if (pack_metadata.get("language_code") != "en"
             or pack_metadata.get("language_name") != "English"
-            or pack_metadata.get("schema_version") != "7"):
+            or pack_metadata.get("schema_version") != "8"
+            or pack_metadata.get("readable_converter") != "readable.tsv"
+            or pack_metadata.get("g2p_model") != "g2p.bin"):
         raise RuntimeError("bundled English pack sidecar is invalid")
     if pack_metadata.get("aliases") != metadata.get("language_aliases"):
         raise RuntimeError("bundled pack sidecar does not match database metadata")
@@ -129,10 +135,19 @@ def validate_inputs() -> None:
     if f'local PLUGIN_VERSION = "{PLUGIN_VERSION}"' not in runtime_source:
         raise RuntimeError("runtime version does not match release")
 
-    with (ROOT / "data/mfa_english_g2p.bin").open("rb") as model:
-        if model.read(8) != b"KPG2P3\0\0":
+    readable_path = ROOT / "data/en/readable.tsv"
+    if not readable_path.read_text(encoding="utf-8").startswith(
+        "ipa\treadable\n"
+    ):
+        raise RuntimeError("bundled readable converter is invalid")
+    if sha256(readable_path) != READABLE_SHA256:
+        raise RuntimeError("readable converter failed the release integrity check")
+
+    g2p_path = ROOT / "data/en/g2p.bin"
+    with g2p_path.open("rb") as model:
+        if model.read(8) not in (b"KPG2P3\0\0", b"KPG2P4\0\0"):
             raise RuntimeError("G2P model format is not release-ready")
-    if sha256(ROOT / "data/mfa_english_g2p.bin") != G2P_SHA256:
+    if sha256(g2p_path) != G2P_SHA256:
         raise RuntimeError("G2P model failed the release integrity check")
 
 

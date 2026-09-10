@@ -75,10 +75,10 @@ local function loadOnlineModules()
     url = require("socket.url")
 end
 
-local PLUGIN_VERSION = "0.7.0"
+local PLUGIN_VERSION = "0.8.0"
 local DICTIONARY_BUTTON_ID = "pronunciation_lookup"
 local CACHE_VERSION = 6
-local GENERATOR_VERSION = 3
+local GENERATOR_VERSION = 4
 local SOURCED_CACHE_LIMIT = 256
 local GENERATED_CACHE_LIMIT = 128
 local GENERATED_CACHE_PREFIX = "generator:" .. GENERATOR_VERSION .. "|"
@@ -441,10 +441,16 @@ local function readPackMetadata(path)
             or name == "" then return nil end
     local aliases = {}
     for alias in (metadata.aliases or code):gmatch("[^,]+") do
-        alias = normalizeLanguageKey(alias)
-        if alias ~= "" then aliases[#aliases + 1] = alias end
+        local normalized_alias = normalizeLanguageKey(alias)
+        if normalized_alias ~= "" then aliases[#aliases + 1] = normalized_alias end
     end
-    return { code = code, name = name, aliases = aliases }
+    return {
+        code = code,
+        name = name,
+        aliases = aliases,
+        readable_converter = metadata.readable_converter,
+        g2p_model = metadata.g2p_model,
+    }
 end
 
 local function fileExists(path)
@@ -468,7 +474,14 @@ function Pronunciation:discoverLanguagePacks(force)
         local metadata = readPackMetadata(directory .. "/pack.tsv")
         local database_path = directory .. "/pronunciations.sqlite3"
         if metadata and metadata.code == code and fileExists(database_path) then
+            metadata.directory = directory
             metadata.path = database_path
+            local readable_name = metadata.readable_converter or "readable.tsv"
+            local readable_path = directory .. "/" .. readable_name
+            if fileExists(readable_path) then metadata.readable_path = readable_path end
+            local g2p_name = metadata.g2p_model or "g2p.bin"
+            local g2p_path = directory .. "/" .. g2p_name
+            if fileExists(g2p_path) then metadata.g2p_path = g2p_path end
             packs[code] = metadata
         end
     end
@@ -559,9 +572,6 @@ local function mergeLanguageHints(...)
     end
     return merged
 end
-
-local GENERATION_LANGUAGE_ORDER = { "english" }
-local SELECTABLE_GENERATION_LANGUAGES = { en = true }
 
 local ARPABET_IPA = {
     AA = "ɑ", AE = "æ", AO = "ɔ", AW = "aʊ", AY = "aɪ",
@@ -659,15 +669,15 @@ local function readSignedLittleEndian16(data, position)
     return value >= 32768 and value - 65536 or value
 end
 
-local G2P_HEADER_SIZE = 30
+local G2P3_HEADER_SIZE = 30
+local G2P4_HEADER_SIZE = 32
 local G2P_STATE_RECORD_SIZE = 2
-local G2P_ARC_RECORD_SIZE = 6
 local G2P_RANK_RECORD_SIZE = 3
 local G2P_INFINITE_FINAL = 65535
 local G2P_PACKED_LIMIT = 16777216
 local G2P_STATE_OFFSET_BLOCK = 256
 local G2P_FINAL_RANK_BLOCK = 256
-local G2P_MAX_WORD_BYTES = 64
+local G2P_MAX_INPUTS = 64
 local G2P_MAX_RELAXATIONS = 500000
 
 local G2P_POPCOUNT = {}
@@ -681,31 +691,32 @@ for value = 0, 255 do
     G2P_POPCOUNT[value] = count
 end
 
--- Portable US-English inference from Montreal Forced Aligner's weighted
--- Pynini G2P graph. The bundled graph is repacked into fixed-width records;
--- this loader retains only its compact index and reads arc blocks on demand.
-function Pronunciation:_loadEnglishG2pModel()
-    if self.english_g2p_model ~= nil then
-        return self.english_g2p_model or nil
-    end
-    if not self.path then
-        self.english_g2p_model = false
-        return nil
+-- MFA/Pynini graphs are repacked into fixed-width records. Only the selected
+-- language's index is retained; arc blocks continue to be read lazily.
+function Pronunciation:_loadG2pModel(pack)
+    if not pack or not pack.g2p_path then return nil end
+    self.g2p_models = self.g2p_models or {}
+    if self.g2p_models[pack.code] ~= nil then
+        return self.g2p_models[pack.code] or nil
     end
 
-    local model_path = self.path .. "/data/mfa_english_g2p.bin"
+    local model_path = pack.g2p_path
     local handle = io.open(model_path, "rb")
     if not handle then
-        self.english_g2p_model = false
+        self.g2p_models[pack.code] = false
         return nil
     end
 
-    local header = handle:read(G2P_HEADER_SIZE)
-    if not header or #header ~= G2P_HEADER_SIZE
-            or header:sub(1, 8) ~= "KPG2P3\0\0" then
+    local magic = handle:read(8)
+    local version = magic == "KPG2P3\0\0" and 3
+        or (magic == "KPG2P4\0\0" and 4 or nil)
+    local header_size = version == 3 and G2P3_HEADER_SIZE or G2P4_HEADER_SIZE
+    local rest = version and handle:read(header_size - 8)
+    local header = rest and magic .. rest
+    if not version or not rest or #header ~= header_size then
         handle:close()
-        logger.warn("Pronunciation: invalid bundled English G2P model header")
-        self.english_g2p_model = false
+        logger.warn("Pronunciation: invalid G2P model header for", pack.code)
+        self.g2p_models[pack.code] = false
         return nil
     end
 
@@ -713,10 +724,14 @@ function Pronunciation:_loadEnglishG2pModel()
     local arc_count = readLittleEndian32(header, 13)
     local start_state = readLittleEndian32(header, 17)
     local weight_scale = readLittleEndian16(header, 21)
-    local phone_count = header:byte(23)
-    local state_record_size = header:byte(24)
-    local arc_record_size = header:byte(25)
-    local final_count = readLittleEndian32(header, 27)
+    local phone_count = version == 3 and header:byte(23)
+        or readLittleEndian16(header, 23)
+    local state_record_size = header:byte(version == 3 and 24 or 25)
+    local arc_record_size = header:byte(version == 3 and 25 or 26)
+    local output_format = version == 3 and 1 or header:byte(27)
+    local reserved = header:byte(version == 3 and 26 or 28)
+    local final_count = readLittleEndian32(header, version == 3 and 27 or 29)
+    local expected_arc_size = version == 3 and 6 or 10
     if not state_count or state_count == 0 or not arc_count or arc_count == 0
             or state_count >= G2P_PACKED_LIMIT
             or arc_count >= G2P_PACKED_LIMIT
@@ -724,24 +739,26 @@ function Pronunciation:_loadEnglishG2pModel()
             or not weight_scale or weight_scale == 0 or not phone_count
             or phone_count == 0
             or state_record_size ~= G2P_STATE_RECORD_SIZE
-            or arc_record_size ~= G2P_ARC_RECORD_SIZE
-            or header:byte(26) ~= 0
+            or arc_record_size ~= expected_arc_size
+            or (output_format ~= 1 and output_format ~= 2)
+            or reserved ~= 0
             or not final_count or final_count > state_count then
         handle:close()
-        logger.warn("Pronunciation: unsupported bundled English G2P model")
-        self.english_g2p_model = false
+        logger.warn("Pronunciation: unsupported G2P model for", pack.code)
+        self.g2p_models[pack.code] = false
         return nil
     end
 
     local phone_table = {}
     for index = 1, phone_count do
-        local length_data = handle:read(1)
-        local length = length_data and length_data:byte(1)
+        local length_data = handle:read(version == 3 and 1 or 2)
+        local length = length_data and (version == 3
+            and length_data:byte(1) or readLittleEndian16(length_data, 1))
         local phone = length and handle:read(length)
-        if not phone or #phone ~= length or not phone:match("^[A-Z]+[012]?$") then
+        if not phone or #phone ~= length or length == 0 then
             handle:close()
-            logger.warn("Pronunciation: invalid English G2P phone table")
-            self.english_g2p_model = false
+            logger.warn("Pronunciation: invalid G2P phone table for", pack.code)
+            self.g2p_models[pack.code] = false
             return nil
         end
         phone_table[index] = phone
@@ -781,12 +798,12 @@ function Pronunciation:_loadEnglishG2pModel()
             or readLittleEndian24(final_ranks,
                 (final_rank_count - 1) * G2P_RANK_RECORD_SIZE + 1)
                 ~= final_count then
-        logger.warn("Pronunciation: bundled English G2P model is truncated")
-        self.english_g2p_model = false
+        logger.warn("Pronunciation: G2P model is truncated for", pack.code)
+        self.g2p_models[pack.code] = false
         return nil
     end
 
-    self.english_g2p_model = {
+    self.g2p_models[pack.code] = {
         path = model_path,
         state_offset_bases = state_offset_bases,
         state_offset_deltas = state_offset_deltas,
@@ -799,8 +816,12 @@ function Pronunciation:_loadEnglishG2pModel()
         weight_scale = weight_scale,
         phone_table = phone_table,
         arc_table_offset = arc_table_offset,
+        arc_record_size = arc_record_size,
+        output_format = output_format,
+        version = version,
+        language_code = pack.code,
     }
-    return self.english_g2p_model
+    return self.g2p_models[pack.code]
 end
 
 local LATIN_ASCII_FOLD = {
@@ -834,10 +855,43 @@ local function foldEnglishSpelling(word)
     return folded ~= "" and folded or nil
 end
 
-function Pronunciation:_englishG2pPhones(word)
-    local model = self:_loadEnglishG2pModel()
-    local spelling = foldEnglishSpelling(word)
-    if not model or not spelling or #spelling > G2P_MAX_WORD_BYTES then return nil end
+local function utf8Codepoint(character)
+    local first, second, third, fourth = character:byte(1, 4)
+    if not first then return nil end
+    if first < 128 then return first end
+    if first < 224 and second then return (first - 192) * 64 + second - 128 end
+    if first < 240 and second and third then
+        return (first - 224) * 4096 + (second - 128) * 64 + third - 128
+    end
+    if first < 245 and second and third and fourth then
+        return (first - 240) * 262144 + (second - 128) * 4096
+            + (third - 128) * 64 + fourth - 128
+    end
+end
+
+local function spellingInputs(word, legacy_english)
+    local spelling = legacy_english and foldEnglishSpelling(word)
+        or normalizeWord(word)
+    if not spelling then return nil end
+    local inputs = {}
+    local position = 1
+    while position <= #spelling do
+        local character = nextUtf8Character(spelling, position)
+        if not character then return nil end
+        if character ~= "-" and character ~= " " then
+            local codepoint = utf8Codepoint(character)
+            if not codepoint then return nil end
+            inputs[#inputs + 1] = codepoint
+        end
+        position = position + #character
+    end
+    return #inputs > 0 and inputs or nil
+end
+
+function Pronunciation:_g2pPhones(pack, word)
+    local model = self:_loadG2pModel(pack)
+    local inputs = model and spellingInputs(word, pack.code == "en")
+    if not model or not inputs or #inputs > G2P_MAX_INPUTS then return nil end
 
     local handle = io.open(model.path, "rb")
     if not handle then return nil end
@@ -898,12 +952,12 @@ function Pronunciation:_englishG2pPhones(word)
         if not first_arc or not arc_count
                 or first_arc + arc_count > model.arc_count
                 or not handle:seek("set", model.arc_table_offset
-                    + first_arc * G2P_ARC_RECORD_SIZE) then
+                    + first_arc * model.arc_record_size) then
             decode_failed = true
             return
         end
-        local data = handle:read(arc_count * G2P_ARC_RECORD_SIZE)
-        if not data or #data ~= arc_count * G2P_ARC_RECORD_SIZE then
+        local data = handle:read(arc_count * model.arc_record_size)
+        if not data or #data ~= arc_count * model.arc_record_size then
             decode_failed = true
             return
         end
@@ -930,7 +984,7 @@ function Pronunciation:_englishG2pPhones(word)
         local state = key % model.state_count
         local input_position = (key - state) / model.state_count
         local cost = distances[key]
-        local at_end = input_position == #spelling
+        local at_end = input_position == #inputs
         local first_arc, arc_count, final_weight = stateInfo(state, at_end)
         if decode_failed then break end
 
@@ -944,20 +998,28 @@ function Pronunciation:_englishG2pPhones(word)
 
         local arcs = stateArcs(state, first_arc, arc_count)
         if decode_failed then break end
-        local wanted = spelling:byte(input_position + 1)
-        for position = 1, #arcs, G2P_ARC_RECORD_SIZE do
-            local packed_input = arcs:byte(position)
-            local input_code = packed_input % 32
-            local input_label = input_code == 0 and 0
-                or (input_code == 1 and 39 or input_code + 95)
-            if input_label == 0 or input_label == wanted then
+        local wanted = inputs[input_position + 1]
+        for position = 1, #arcs, model.arc_record_size do
+            local input_label, output_label, weight, next_state
+            if model.version == 3 then
+                local packed_input = arcs:byte(position)
+                local input_code = packed_input % 32
+                input_label = input_code == 0 and 0
+                    or (input_code == 1 and 39 or input_code + 95)
                 local packed_output = arcs:byte(position + 1)
-                local output_label = packed_output % 128
-                local weight = readSignedLittleEndian16(arcs, position + 2)
+                output_label = packed_output % 128
+                weight = readSignedLittleEndian16(arcs, position + 2)
                 local next_state_low = readLittleEndian16(arcs, position + 4)
-                local next_state = next_state_low and next_state_low
+                next_state = next_state_low and next_state_low
                     + (math.floor(packed_input / 32)
                         + math.floor(packed_output / 128) * 8) * 65536
+            else
+                input_label = readLittleEndian24(arcs, position)
+                output_label = readLittleEndian16(arcs, position + 3)
+                weight = readSignedLittleEndian16(arcs, position + 5)
+                next_state = readLittleEndian24(arcs, position + 7)
+            end
+            if input_label == 0 or input_label == wanted then
                 if not weight or not next_state
                         or next_state >= model.state_count
                         or output_label > #model.phone_table then
@@ -972,10 +1034,11 @@ function Pronunciation:_englishG2pPhones(word)
                 local old_cost = distances[next_key]
                 if not old_cost or next_cost < old_cost then
                     distances[next_key] = next_cost
-                    predecessors[next_key] = key * 128 + output_label
+                    predecessors[next_key] = key * 65536 + output_label
                     relaxations = relaxations + 1
                     if relaxations > G2P_MAX_RELAXATIONS then
-                        logger.warn("Pronunciation: English G2P decode limit exceeded")
+                        logger.warn("Pronunciation: G2P decode limit exceeded for",
+                            pack.code)
                         decode_failed = true
                         break
                     end
@@ -995,13 +1058,13 @@ function Pronunciation:_englishG2pPhones(word)
     local key = best_key
     local path_steps = 0
     while key ~= start_key do
-        local packed = predecessors[key]
-        if not packed then return nil end
-        local output_label = packed % 128
+        local predecessor = predecessors[key]
+        if not predecessor then return nil end
+        local output_label = predecessor % 65536
         if output_label ~= 0 then
             output[#output + 1] = model.phone_table[output_label]
         end
-        key = math.floor(packed / 128)
+        key = math.floor(predecessor / 65536)
         path_steps = path_steps + 1
         if path_steps > G2P_MAX_RELAXATIONS then return nil end
     end
@@ -1010,120 +1073,121 @@ function Pronunciation:_englishG2pPhones(word)
         local right = #output - left + 1
         output[left], output[right] = output[right], output[left]
     end
-    return output
+    return output, model.output_format
 end
 
-local PORTABLE_GENERATORS = {
-    en = function(plugin, word)
-        local phones = plugin:_englishG2pPhones(word)
-        if not phones then return nil end
-        return {
-            ipa = arpabetPhonesToIpa(phones),
-            arpabet = table.concat(phones, " "),
-            source = "MFA/Pynini English G2P",
-            confidence = 45,
-        }
-    end,
-}
+function Pronunciation:_readableConverter(pack)
+    self.readable_converters = self.readable_converters or {}
+    if not pack or not pack.readable_path then return nil end
+    if self.readable_converters[pack.code] ~= nil then
+        return self.readable_converters[pack.code] or nil
+    end
+    local file = io.open(pack.readable_path, "r")
+    if not file then
+        self.readable_converters[pack.code] = false
+        return nil
+    end
+    local converter = {}
+    for line in file:lines() do
+        local ipa, readable = line:match("^([^\t]+)\t(.*)$")
+        if ipa and ipa ~= "ipa" and readable ~= "" then
+            converter[ipa] = readable
+        end
+    end
+    file:close()
+    self.readable_converters[pack.code] = converter
+    return converter
+end
 
-function Pronunciation:generatePronunciations(word, hints)
+function Pronunciation:_readableFromPhones(pack, phones)
+    local converter = self:_readableConverter(pack)
+    if not converter then return nil end
+    local chunks = {}
+    for _, original in ipairs(phones or {}) do
+        local phone = original
+        local stressed = phone:find("ˈ", 1, true) or phone:find("ˌ", 1, true)
+        phone = phone:gsub("ˈ", ""):gsub("ˌ", "")
+        local readable = converter[phone] or phone
+        if readable then
+            if stressed and #chunks > 0 then chunks[#chunks + 1] = "-" end
+            chunks[#chunks + 1] = readable
+        end
+    end
+    local result = table.concat(chunks):gsub("%-+", "-")
+    return result ~= "" and result or nil
+end
+
+function Pronunciation:_readableFromPackIpa(pack, ipa)
+    local converter = self:_readableConverter(pack)
+    local core = stripIpaWrappers(ipa)
+    if not converter or core == "" then return nil end
+    local chunks = {}
+    local position = 1
+    while position <= #core do
+        local marker = core:sub(position, position + 2)
+        if marker == "ˈ" or marker == "ˌ" then
+            if #chunks > 0 then chunks[#chunks + 1] = "-" end
+            position = position + #marker
+        else
+            local best_ipa, best_readable
+            for source, readable in pairs(converter) do
+                if #source > (best_ipa and #best_ipa or 0)
+                        and core:sub(position, position + #source - 1) == source then
+                    best_ipa, best_readable = source, readable
+                end
+            end
+            if best_ipa then
+                chunks[#chunks + 1] = best_readable
+                position = position + #best_ipa
+            else
+                local character = nextUtf8Character(core, position)
+                if not character then return nil end
+                position = position + #character
+            end
+        end
+    end
+    local result = table.concat(chunks):gsub("%-+", "-")
+        :gsub("^%-", ""):gsub("%-$", "")
+    return result ~= "" and result or nil
+end
+
+function Pronunciation:generationPack()
+    local selected = self:selectedLanguagePack()
+    if selected and selected.g2p_path then return selected end
+    local english = self:discoverLanguagePacks().en
+    if english and english.g2p_path then return english end
+end
+
+function Pronunciation:generatePronunciations(word)
     if not self.generated_fallback then return nil end
-    local results = {}
-    local seen = {}
-
-    local function add(generated, definition)
-        if not generated then return end
-        local ipa = normalizeOnlineIpa(generated.ipa)
-        if not ipa then return end
-        local key = stripIpaWrappers(ipa) .. "\0" .. definition.code
-        if seen[key] then return end
-        seen[key] = true
-        results[#results + 1] = {
-            ipa = ipa,
-            arpabet = generated.arpabet,
-            simple = readableFromIpa(ipa),
-            simple_approx = true,
-            language = definition.name,
-            region = definition.region,
-            source = generated.source,
-            confidence = generated.confidence,
-            generated = true,
-        }
-    end
-
-    for _, hint in ipairs(mergeLanguageHints(hints)) do
-        local generator = PORTABLE_GENERATORS[hint.code]
-        if generator then add(generator(self, word), hint) end
-    end
-
-    -- An unknown or unsupported book language still gets the portable US
-    -- English reading as an explicitly labeled adaptation.
-    if #results == 0 then
-        local english = LANGUAGE_DEFINITIONS.english
-        add(PORTABLE_GENERATORS.en(self, word), english)
-    end
-    if #results > 0 then return results end
+    local pack = self:generationPack()
+    local phones, output_format = self:_g2pPhones(pack, word)
+    if not phones then return nil end
+    local ipa = output_format == 1 and arpabetPhonesToIpa(phones)
+        or wrapIpa(table.concat(phones))
+    ipa = normalizeOnlineIpa(ipa)
+    if not ipa then return nil end
+    local simple = output_format == 2
+        and self:_readableFromPhones(pack, phones) or nil
+    if not simple and pack.code == "en" then simple = readableFromIpa(ipa) end
+    return {{
+        ipa = ipa,
+        arpabet = output_format == 1 and table.concat(phones, " ") or nil,
+        simple = simple,
+        simple_approx = simple ~= nil,
+        language = pack.name,
+        region = pack.code == "en" and "US" or nil,
+        source = "MFA/Pynini " .. pack.name .. " G2P",
+        confidence = 45,
+        generated = true,
+    }}
 end
 
-function Pronunciation:documentLanguageHints()
-    local document = self.ui and self.ui.document
-    if not document or type(document.getProps) ~= "function" then return {} end
-    local ok, properties = pcall(document.getProps, document)
-    if not ok or type(properties) ~= "table"
-            or type(properties.language) ~= "string" then return {} end
-
-    local hints = {}
-    for value in properties.language:gmatch("[^,;]+") do
-        local definition = languageDefinition(nil, value)
-        if definition then
-            hints[#hints + 1] = {
-                code = definition.code,
-                name = definition.name,
-                source = "Book metadata",
-            }
-        end
-    end
-    return mergeLanguageHints(hints)
-end
-
-function Pronunciation:generationHints(word, online_hints)
-    if self.generated_language and self.generated_language ~= "auto" then
-        local selected = languageDefinition(nil, self.generated_language)
-        if selected then
-            return mergeLanguageHints({{
-                code = selected.code,
-                name = selected.name,
-                source = "User-selected generated language",
-            }})
-        end
-    end
-    return mergeLanguageHints(
-        self:queryLanguageHints(word),
-        online_hints,
-        self:documentLanguageHints()
-    )
-end
-
-function Pronunciation:generationCacheKey(word, hints)
-    local languages = {}
-    local seen = {}
-    for _, hint in ipairs(mergeLanguageHints(hints)) do
-        if PORTABLE_GENERATORS[hint.code] and not seen[hint.code] then
-            seen[hint.code] = true
-            languages[#languages + 1] = hint.code
-        end
-    end
-    -- Unsupported or absent hints use the English fallback, so key the cache
-    -- by the generator that actually produced the result instead of by hints
-    -- that cannot affect it.
-    if #languages == 0 then
-        languages[1] = LANGUAGE_DEFINITIONS.english.code
-    end
-    local pack = self:selectedLanguagePack()
+function Pronunciation:generationCacheKey(word)
+    local pack = self:generationPack()
     local pack_code = pack and pack.code or "none"
     return "generator:" .. GENERATOR_VERSION
         .. "|pack:" .. pack_code
-        .. "|languages:" .. table.concat(languages, ",")
         .. "|word:" .. normalizeWord(word)
 end
 
@@ -1183,6 +1247,8 @@ function Pronunciation:init()
     self.data_path = self.path .. "/data"
     self.language_packs = nil
     self.language_pack_aliases = nil
+    self.g2p_models = {}
+    self.readable_converters = {}
     self.settings = LuaSettings:open(DataStorage:getSettingsDir() .. "/pronunciation.lua")
     self.overrides = self.settings:readSetting("overrides", {})
     self.cache = self.settings:readSetting("cache", {})
@@ -1198,14 +1264,6 @@ function Pronunciation:init()
             or self.pronunciation_language == "" then
         self.pronunciation_language = "auto"
     end
-    self.generated_language = self.settings:readSetting("generated_language", "auto")
-    if self.generated_language ~= "auto" then
-        local selected = languageDefinition(nil, self.generated_language)
-        self.generated_language = selected
-            and SELECTABLE_GENERATION_LANGUAGES[selected.code]
-            and selected.code or "auto"
-    end
-
     -- v0.5 separates sourced and generated caches. Generated entries are
     -- versioned and keyed by the generator languages that produced them.
     if self.settings:readSetting("cache_version") ~= CACHE_VERSION then
@@ -1428,28 +1486,6 @@ function Pronunciation:addToMainMenu(menu_items)
             callback = function() self:setPronunciationLanguage(pack.code) end,
         }
     end
-    local generated_language_items = {
-        {
-            text = _("Auto (word or book language)"),
-            checked_func = function() return self.generated_language == "auto" end,
-            callback = function() self:setGeneratedLanguage("auto") end,
-        },
-    }
-    for _, key in ipairs(GENERATION_LANGUAGE_ORDER) do
-        local definition = LANGUAGE_DEFINITIONS[key]
-        generated_language_items[#generated_language_items + 1] = {
-            text = definition.region
-                and definition.region .. " " .. definition.name
-                or definition.name,
-            checked_func = function()
-                return self.generated_language == definition.code
-            end,
-            callback = function()
-                self:setGeneratedLanguage(definition.code)
-            end,
-        }
-    end
-
     menu_items.pronunciation_lookup = {
         sorting_hint = "search",
         text = _("Pronunciation lookup"),
@@ -1506,22 +1542,6 @@ function Pronunciation:addToMainMenu(menu_items)
                 sub_item_table = pronunciation_language_items,
             },
             {
-                text_func = function()
-                    if self.generated_language == "auto" then
-                        return _("Generated language") .. ": " .. _("Auto")
-                    end
-                    local definition = languageDefinition(nil,
-                        self.generated_language)
-                    local label = definition and definition.name
-                        or self.generated_language
-                    if definition and definition.region then
-                        label = definition.region .. " " .. label
-                    end
-                    return _("Generated language") .. ": " .. label
-                end,
-                sub_item_table = generated_language_items,
-            },
-            {
                 text = _("Clear cached pronunciations"),
                 callback = function()
                     self.cache = {}
@@ -1552,15 +1572,6 @@ function Pronunciation:setPronunciationLanguage(code)
     end
     self.pronunciation_language = code
     self.settings:saveSetting("pronunciation_language", code)
-    self.settings:flush()
-end
-
-function Pronunciation:setGeneratedLanguage(code)
-    if code ~= "auto" and not SELECTABLE_GENERATION_LANGUAGES[code] then return end
-    self.generated_language = code
-    self.generated_cache = {}
-    self.settings:saveSetting("generated_language", code)
-    self.settings:saveSetting("generated_cache", self.generated_cache)
     self.settings:flush()
 end
 
@@ -1651,6 +1662,14 @@ function Pronunciation:_queryConnection(connection, word, statement, pack)
         return nil, results, nil
     end
     if #results > 0 then
+        if pack and pack.code ~= "en" then
+            for _, result in ipairs(results) do
+                if (not result.simple or result.simple == "") and result.ipa then
+                    result.simple = self:_readableFromPackIpa(pack, result.ipa)
+                    result.simple_approx = result.simple ~= nil
+                end
+            end
+        end
         ensureReadables(results)
         return results, nil, statement
     end
@@ -1674,40 +1693,6 @@ function Pronunciation:query(word)
         logger.err("Pronunciation: database lookup failed:", query_error)
     end
     return results
-end
-
-function Pronunciation:queryLanguageHints(word)
-    local connection
-    local statement
-    local normalized = normalizeWord(word)
-    local pack = self:selectedLanguagePack()
-    if not pack then return {} end
-    local ok, results = pcall(function()
-        connection = openDatabase(pack.path)
-        statement = connection:prepare([[
-            SELECT language_code, language_name, source
-              FROM language_hints
-             WHERE word = ?
-          ORDER BY language_name
-        ]])
-        statement:bind(normalized)
-        local rows = {}
-        while true do
-            local row = statement:step()
-            if not row then break end
-            rows[#rows + 1] = {
-                code = row[1],
-                name = row[2],
-                source = row[3],
-            }
-        end
-        return rows
-    end)
-    closeSqlResource(statement)
-    closeSqlResource(connection)
-    -- Older v0.3 databases do not have language_hints; treat that as no hint.
-    if not ok then return {} end
-    return mergeLanguageHints(results)
 end
 
 local function lastArpabetPhone(arpabet)
@@ -2264,15 +2249,7 @@ end
 
 function Pronunciation:getCachedGeneratedForWord(word)
     if not self.generated_fallback then return nil end
-    local hints
-    if self.generated_language and self.generated_language ~= "auto" then
-        hints = self:generationHints(word)
-    else
-        -- Book metadata is already resident. Avoid opening the database or
-        -- touching the network merely to decide whether a cache entry exists.
-        hints = self:documentLanguageHints()
-    end
-    local cache_key = self:generationCacheKey(word, hints)
+    local cache_key = self:generationCacheKey(word)
     return self:getGeneratedCache(cache_key)
 end
 
@@ -2288,11 +2265,10 @@ end
 
 function Pronunciation:generatedForWord(word, online_hints)
     if not self.generated_fallback then return nil end
-    local hints = self:generationHints(word, online_hints)
-    local cache_key = self:generationCacheKey(word, hints)
+    local cache_key = self:generationCacheKey(word)
     local cached = self:getGeneratedCache(cache_key)
     if cached then return cached end
-    local generated = self:generatePronunciations(word, hints)
+    local generated = self:generatePronunciations(word)
     if generated then self:saveGeneratedCache(cache_key, generated) end
     return generated
 end

@@ -1,37 +1,3 @@
-CMU Pronouncing Dictionary (BSD-3-Clause)
-=========================================
-
-Copyright (C) 1993-2015 Carnegie Mellon University. All rights reserved.
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
-
-1. Redistributions of source code must retain the above copyright notice,
-   this list of conditions and the following disclaimer. The contents of this
-   file are deemed to be source code.
-
-2. Redistributions in binary form must reproduce the above copyright notice,
-   this list of conditions and the following disclaimer in the documentation
-   and/or other materials provided with the distribution.
-
-This work was supported in part by funding from the Defense Advanced Research
-Projects Agency, the Office of Naval Research and the National Science
-Foundation of the United States of America, and by member companies of the
-Carnegie Mellon Sphinx Speech Consortium. We acknowledge the contributions of
-many volunteers to the expansion and improvement of this dictionary.
-
-THIS SOFTWARE IS PROVIDED BY CARNEGIE MELLON UNIVERSITY ``AS IS'' AND ANY
-EXPRESSED OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
-WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL CARNEGIE MELLON UNIVERSITY NOR ITS EMPLOYEES BE
-LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE
-GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
-HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
-LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
-OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
-
 Plugin code (MIT License)
 =========================
 
@@ -82,9 +48,9 @@ Attribution: Wiktionary contributors; extraction by the WikiPron project
 Miller, Alan Wong, Arya D. McCarthy, and Kyle Gorman). No WikiPron program code
 is bundled in this plugin.
 
-The pronunciation database is a collection containing CMUdict records under
-their BSD-3-Clause terms, WikiPron/Wiktionary records under CC BY-SA 4.0, and
-original curated records. Each record retains its source label, and the
+The pronunciation database is a collection containing WikiPron/Wiktionary
+records under CC BY-SA 4.0 and original curated records. Each record retains
+its source label, and the
 database metadata records the WikiPron release/tag, source revision, language,
 profiles, record counts, and attribution. Individual WikiPron TSV files are
 discovered from the selected stable release and are not SHA-256 pinned. The
@@ -94,7 +60,7 @@ final English SQLite artifact remains SHA-256 checked by the release tooling.
 Montreal Forced Aligner English US ARPA G2P model (CC BY 4.0)
 ================================================================
 
-The portable graph in data/mfa_english_g2p.bin is derived from the English US
+The portable graph in data/en/g2p.bin is derived from the English US
 ARPA G2P model published by Montreal Corpus Tools for Montreal Forced Aligner:
 
   Model catalog: https://mfa-models.readthedocs.io/en/latest/g2p/English/index.html
@@ -111,8 +77,14 @@ Attribution 4.0 International license:
 
 Changes: the OpenFst vector graph was converted to a custom fixed-width,
 little-endian format; floating-point tropical weights were rounded to signed
-integers at 1/1024 precision; graph topology, labels, and shortest-path
-semantics were retained. The plugin includes neither Pynini nor OpenFst code.
+integers at 1/1024 precision; Unicode input labels and UTF-8 output phones were
+retained along with graph topology and shortest-path semantics. The plugin
+includes neither Pynini nor OpenFst code.
 The dependency-free decoder and conversion tool are original plugin code under
 the MIT license above. Complete dimensions, hashes, and build instructions are
-in data/mfa_english_g2p.SOURCE.txt.
+in data/en/g2p.SOURCE.txt.
+
+Optional G2P models are not part of the normal release. Anyone distributing an
+additional `data/<language-code>/g2p.bin` must retain the license and
+attribution of that model's source archive; the builder records its identity
+and SHA-256 in the adjacent `g2p.SOURCE.txt`.

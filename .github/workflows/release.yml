@@ -82,7 +82,8 @@ jobs:
             main.lua \
             tools/build_release.py \
             data/en/pronunciations.sqlite3 \
-            data/en/pack.tsv
+            data/en/pack.tsv \
+            data/en/readable.tsv
 
           if git diff --cached --quiet; then
             echo "Release inputs are already synchronized."

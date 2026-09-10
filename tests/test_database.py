@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
@@ -20,19 +21,18 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 from build_database import (  # noqa: E402
     PLUGIN_VERSION as DATABASE_PLUGIN_VERSION,
-    arpabet_to_ipa,
-    arpabet_to_readable,
     build_database,
     default_database_path,
     discover_wikipron_languages,
     latest_github_release,
     resolve_requested_language,
-    sync_git_checkout,
     sync_git_release_checkout,
 )
+from build_g2p_model import build_model, parse_phone_symbols  # noqa: E402
 from build_release import (  # noqa: E402
     DATABASE_SHA256,
     G2P_SHA256,
+    READABLE_SHA256,
     PLUGIN_DIRECTORY,
     PLUGIN_VERSION,
     RELEASE_FILES,
@@ -42,23 +42,13 @@ from build_release import (  # noqa: E402
 )
 from prepare_release import (  # noqa: E402
     synchronize_database_hash,
+    synchronize_readable_hash,
     synchronize_runtime_version,
 )
 
 
-def check_conversion() -> None:
-    assert DATABASE_PLUGIN_VERSION == PLUGIN_VERSION
-    assert arpabet_to_ipa("K AE1 T".split()) == "/ˈkæt/"
-    assert arpabet_to_readable("K AE1 T".split()) == "KAT"
-    epitome = "IH0 P IH1 T AH0 M IY0".split()
-    assert arpabet_to_ipa(epitome) == "/ɪˈpɪtəmi/"
-    assert arpabet_to_readable(epitome) == "ih-PIT-uh-mee"
-    colour = "K AH1 L ER0".split()
-    assert arpabet_to_ipa(colour) == "/ˈkʌlɚ/"
-    assert arpabet_to_readable(colour) == "KUHL-er"
-
-
 def check_database() -> None:
+    assert DATABASE_PLUGIN_VERSION == PLUGIN_VERSION
     database = ROOT / "data" / "en" / "pronunciations.sqlite3"
     assert not (ROOT / "data" / "pronunciations.sqlite3").exists()
     assert not (ROOT / "data" / "wikipron_sources.tsv").exists()
@@ -66,7 +56,7 @@ def check_database() -> None:
     connection = sqlite3.connect(database)
     try:
         assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
         columns = {
             row[1] for row in connection.execute("PRAGMA table_info(pronunciations)")
         }
@@ -81,24 +71,18 @@ def check_database() -> None:
         assert object_types["pronunciation_entries"] == "table"
         assert connection.execute(
             "SELECT COUNT(*) FROM pronunciation_sources"
-        ).fetchone()[0] == 3
+        ).fetchone()[0] == 2
         assert connection.execute(
             "SELECT COUNT(*) FROM pronunciation_profiles"
-        ).fetchone()[0] >= 8
+        ).fetchone()[0] >= 3
         headwords, records = connection.execute(
             "SELECT COUNT(DISTINCT word), COUNT(*) FROM pronunciations"
         ).fetchone()
-        assert headwords >= 176_000
-        assert records >= 345_000
-
-        for ipa, arpabet, simple in connection.execute(
-            "SELECT ipa, arpabet, simple FROM pronunciations "
-            "WHERE source = 'CMUdict'"
-        ):
-            phones = arpabet.split()
-            assert ipa == arpabet_to_ipa(phones)
-            assert simple == arpabet_to_readable(phones)
-            assert ipa.count("/") == 2
+        assert headwords >= 85_000
+        assert records >= 210_000
+        assert connection.execute(
+            "SELECT COUNT(*) FROM pronunciations WHERE source = 'CMUdict'"
+        ).fetchone()[0] == 0
 
         def pronunciations(word: str):
             return connection.execute(
@@ -106,8 +90,9 @@ def check_database() -> None:
                 (word,),
             ).fetchall()
 
-        assert ("/ˈkæt/", "KAT") in pronunciations("cat")
-        assert ("/ɪˈpɪtəmi/", "ih-PIT-uh-mee") in pronunciations("epitome")
+        assert any(ipa == "/kæt/" and simple for ipa, simple in pronunciations("cat"))
+        assert any(ipa == "/ɪpɪtəmi/" and simple
+                   for ipa, simple in pronunciations("epitome"))
         assert any(ipa == "/ˈklʊərɪkɔːnz/"
                    for ipa, _ in pronunciations("clurichauns"))
         regional_tomato = connection.execute(
@@ -115,29 +100,27 @@ def check_database() -> None:
             "WHERE word = 'tomato' AND source = 'WikiPron/Wiktionary'"
         ).fetchall()
         assert {region for _, region, _ in regional_tomato} == {"US", "UK"}
-        assert ("/təmɑːtəʊ/", "UK", 0) in regional_tomato
-        assert ("/təmeɪtoʊ/", "US", 0) in regional_tomato
+        assert ("/təmɑːtəʊ/", "UK", 1) in regional_tomato
+        assert ("/təmeɪtoʊ/", "US", 1) in regional_tomato
         assert connection.execute(
             "SELECT COUNT(*) FROM pronunciations "
             "WHERE source = 'WikiPron/Wiktionary' "
             "AND (ipa NOT LIKE '/%/' "
             "OR LENGTH(ipa) - LENGTH(REPLACE(ipa, '/', '')) != 2)"
         ).fetchone()[0] == 0
-        assert connection.execute(
-            "SELECT COUNT(*) FROM language_hints"
-        ).fetchone()[0] == 0
+        assert "language_hints" not in object_types
         metadata = dict(connection.execute("SELECT key, value FROM metadata"))
         assert metadata["version"] == PLUGIN_VERSION
         assert metadata["language_code"] == "en"
         assert metadata["language_name"] == "English"
         assert metadata["language_iso6393"] == "eng"
-        assert metadata["schema_version"] == "7"
-        assert len(metadata["cmudict_revision"]) == 40
+        assert metadata["schema_version"] == "8"
         assert len(metadata["supplement_sha256"]) == 64
-        assert len(metadata["language_hints_sha256"]) == 64
         assert len(metadata["wikipron_revision"]) == 40
         assert metadata["wikipron_release"].startswith("v")
         assert metadata["wikipron_profiles"] == "2"
+        assert metadata["readable_converter"] == "readable.tsv"
+        assert int(metadata["readable_converter_mappings"]) > 0
         assert not any(
             key.startswith("wikipron_") and key.endswith("_sha256")
             for key in metadata
@@ -145,7 +128,11 @@ def check_database() -> None:
         assert metadata["converter"] == (
             "tools/build_database.py discovery profile schema v5"
         )
-        assert database.stat().st_size < 15_000_000
+        assert database.stat().st_size < 18_000_000
+        readable = ROOT / "data" / "en" / "readable.tsv"
+        assert readable.read_text(encoding="utf-8").startswith("ipa\treadable\n")
+        assert not (ROOT / "data" / "language_hints.tsv").exists()
+        assert hashlib.sha256(readable.read_bytes()).hexdigest() == READABLE_SHA256
     finally:
         connection.close()
 
@@ -153,17 +140,10 @@ def check_database() -> None:
 def check_compact_database_build() -> None:
     with tempfile.TemporaryDirectory(prefix="pronunciation-db-test-") as directory:
         directory = Path(directory)
-        cmudict = directory / "cmudict.dict"
-        cmudict.write_text("cat K AE1 T\n", encoding="utf-8")
         supplement = directory / "supplemental.tsv"
         supplement.write_text(
             "word\tipa\tsimple\tregion\tconfidence\tnote\n"
             "projectword\t/ˈpɹɑdʒɛkt/\tPRAH-jekt\tUS\t90\tFixture\n",
-            encoding="utf-8",
-        )
-        hints = directory / "language_hints.tsv"
-        hints.write_text(
-            "word\tlanguage_code\tlanguage_name\tsource\tnote\n",
             encoding="utf-8",
         )
         scrape = directory / "scrape"
@@ -239,19 +219,16 @@ def check_compact_database_build() -> None:
             "v-test",
             "test-wikipron-revision",
             "2026-01-01",
-            cmudict=cmudict,
-            cmudict_revision="test-cmudict-revision",
             supplement=supplement,
-            language_hints=hints,
         )
         assert headwords > 2 and records > 2
         connection = sqlite3.connect(output)
         try:
             assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
             assert connection.execute(
-                "SELECT ipa, arpabet, simple FROM pronunciations WHERE word='cat'"
-            ).fetchone() == ("/ˈkæt/", "K AE1 T", "KAT")
+                "SELECT COUNT(*) FROM pronunciations WHERE source='CMUdict'"
+            ).fetchone()[0] == 0
             assert connection.execute(
                 "SELECT region FROM pronunciations "
                 "WHERE word='test' AND source='WikiPron/Wiktionary' "
@@ -287,10 +264,12 @@ def check_compact_database_build() -> None:
             assert connection.execute(
                 "SELECT COUNT(*) FROM pronunciations WHERE word='filtered-only'"
             ).fetchone()[0] == 0
-            assert connection.execute(
+            simple, code, name = connection.execute(
                 "SELECT simple, language_code, language_name FROM pronunciations "
                 "WHERE word='bonjour' LIMIT 1"
-            ).fetchone() == (None, "fr", "French")
+            ).fetchone()
+            assert simple
+            assert (code, name) == ("fr", "French")
         finally:
             connection.close()
 
@@ -302,6 +281,11 @@ def check_compact_database_build() -> None:
         assert sidecar["language_code"] == "fr"
         assert sidecar["language_name"] == "French"
         assert "fre" in sidecar["aliases"].split(",")
+        assert sidecar["readable_converter"] == "readable.tsv"
+        converter = french_output.parent / "readable.tsv"
+        assert converter.read_text(encoding="utf-8").startswith(
+            "ipa\treadable\n"
+        )
 
         common = [
             "--wikipron-root", str(tsv),
@@ -312,9 +296,8 @@ def check_compact_database_build() -> None:
         command = [sys.executable, ROOT / "tools" / "build_database.py"]
         default_root = directory / "default-output"
         subprocess.run(command + common + [
-            "--data-dir", str(default_root), "--cmudict", str(cmudict),
-            "--cmudict-revision", "test-cmudict-revision",
-            "--supplement", str(supplement), "--language-hints", str(hints),
+            "--data-dir", str(default_root),
+            "--supplement", str(supplement),
         ], check=True, capture_output=True, text=True)
         assert default_database_path(default_root, "en").is_file()
 
@@ -334,9 +317,8 @@ def check_compact_database_build() -> None:
 
         all_root = directory / "all-output"
         subprocess.run(command + common + [
-            "--all", "--data-dir", str(all_root), "--cmudict", str(cmudict),
-            "--cmudict-revision", "test-cmudict-revision",
-            "--supplement", str(supplement), "--language-hints", str(hints),
+            "--all", "--data-dir", str(all_root),
+            "--supplement", str(supplement),
         ], check=True, capture_output=True, text=True)
         assert {
             path.parent.name for path in all_root.glob("*/pronunciations.sqlite3")
@@ -377,7 +359,6 @@ def check_source_checkout_update() -> None:
     ) as directory:
         directory = Path(directory)
         upstream = directory / "upstream"
-        checkout = directory / "checkout"
         subprocess.run(
             ["git", "init", upstream], check=True, capture_output=True, text=True
         )
@@ -399,8 +380,10 @@ def check_source_checkout_update() -> None:
         )
         subprocess.run(["git", "-C", upstream, "tag", "v1.0.0"], check=True)
 
-        first_revision = sync_git_checkout(str(upstream.resolve()), checkout)
-        assert (checkout / "source.txt").read_text(encoding="utf-8") == "first\n"
+        first_revision = subprocess.run(
+            ["git", "-C", upstream, "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
 
         source.write_text("second\n", encoding="utf-8")
         subprocess.run(["git", "-C", upstream, "add", "source.txt"], check=True)
@@ -409,10 +392,6 @@ def check_source_checkout_update() -> None:
             check=True,
             capture_output=True,
         )
-        second_revision = sync_git_checkout(str(upstream.resolve()), checkout)
-        assert second_revision != first_revision
-        assert (checkout / "source.txt").read_text(encoding="utf-8") == "second\n"
-
         release_checkout = directory / "release-checkout"
         release_revision = sync_git_release_checkout(
             str(upstream.resolve()), release_checkout, "v1.0.0"
@@ -449,31 +428,124 @@ def check_release_preparation() -> None:
         assert database_hash == hashlib.sha256(database.read_bytes()).hexdigest()
         assert database_hash in release_builder.read_text(encoding="utf-8")
 
+        readable = directory / "readable.tsv"
+        readable.write_text("ipa\treadable\na\ta\n", encoding="utf-8")
+        with release_builder.open("a", encoding="utf-8") as target:
+            target.write('READABLE_SHA256 = (\n    "' + "0" * 64 + '"\n)\n')
+        readable_hash = synchronize_readable_hash(readable, release_builder)
+        assert readable_hash == hashlib.sha256(readable.read_bytes()).hexdigest()
+        assert readable_hash in release_builder.read_text(encoding="utf-8")
+
 
 def check_g2p_model() -> None:
     assert not (ROOT / "data" / "cmu_flite_lts.bin").exists()
     assert not (ROOT / "data" / "cmu_flite_lts.SOURCE.txt").exists()
     assert not (ROOT / "tools" / "build_lts_model.py").exists()
-    model = ROOT / "data" / "mfa_english_g2p.bin"
+    model = ROOT / "data" / "en" / "g2p.bin"
     data = model.read_bytes()
-    assert data[:8] == b"KPG2P3\0\0"
+    assert data[:8] == b"KPG2P4\0\0"
     assert int.from_bytes(data[8:12], "little") == 532_450
     assert int.from_bytes(data[12:16], "little") == 1_450_681
     assert int.from_bytes(data[16:20], "little") == 1
     assert int.from_bytes(data[20:22], "little") == 1_024
-    assert data[22:26] == bytes((69, 2, 6, 0))
-    assert int.from_bytes(data[26:30], "little") == 81_768
-    assert len(data) == 10_011_830
+    assert int.from_bytes(data[22:24], "little") == 69
+    assert data[24:28] == bytes((2, 10, 1, 0))
+    assert int.from_bytes(data[28:32], "little") == 81_768
+    assert len(data) == 15_814_625
     assert hashlib.sha256(data).hexdigest() == G2P_SHA256
-    source = (ROOT / "data" / "mfa_english_g2p.SOURCE.txt").read_text()
-    assert "g2p-english_us_arpa-v2.0.0" in source
+    source = (ROOT / "data" / "en" / "g2p.SOURCE.txt").read_text()
+    assert "Model: english_us_arpa" in source
+    assert "https://github.com/MontrealCorpusTools/mfa-models" in source
     assert "f079ae88f792458fa7c123b256e5b86cc55c29ac2ffc457c673e6c60c36cd143" in source
+    assert parse_phone_symbols("<eps>\t0\ne\t1\n<UNK>\t2\n") == ["e"]
+
+
+def make_test_g2p_archive(path: Path, character: str, phone: str) -> None:
+    def string(value: str) -> bytes:
+        encoded = value.encode("ascii")
+        return len(encoded).to_bytes(4, "little", signed=True) + encoded
+
+    fst = bytearray()
+    fst.extend((0x7EB2FDD6).to_bytes(4, "little"))
+    fst.extend(string("vector"))
+    fst.extend(string("standard"))
+    fst.extend((2).to_bytes(4, "little", signed=True))
+    fst.extend((0).to_bytes(4, "little", signed=True))
+    fst.extend((0).to_bytes(8, "little"))
+    fst.extend((0).to_bytes(8, "little", signed=True))
+    fst.extend((2).to_bytes(8, "little", signed=True))
+    fst.extend((1).to_bytes(8, "little", signed=True))
+    fst.extend(struct.pack("<fq", float("inf"), 1))
+    fst.extend(struct.pack("<iifi", ord(character), 1, 0.0, 1))
+    fst.extend(struct.pack("<fq", 0.0, 0))
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("fixture/meta.json", json.dumps({
+            "architecture": "pynini", "name": "Fixture", "version": "1",
+            "phones": [phone],
+        }))
+        archive.writestr(
+            "fixture/phones.sym", f"<eps>\t0\n{phone}\t1\n<UNK>\t2\n"
+        )
+        archive.writestr("fixture/model.fst", fst)
+
+
+def check_multilingual_g2p_build() -> None:
+    with tempfile.TemporaryDirectory(prefix="pronunciation-g2p-test-") as directory:
+        directory = Path(directory)
+        en_archive = directory / "en.zip"
+        fr_archive = directory / "fr.zip"
+        make_test_g2p_archive(en_archive, "a", "æ")
+        make_test_g2p_archive(fr_archive, "é", "e")
+        output = directory / "direct.bin"
+        states, arcs, metadata = build_model(fr_archive, output)
+        assert (states, arcs, metadata["architecture"]) == (2, 1, "pynini")
+        packed = output.read_bytes()
+        assert packed[:8] == b"KPG2P4\0\0"
+        assert packed[26] == 2  # IPA output symbols
+
+        packs = directory / "packs"
+        for code, name in (("en", "English"), ("fr", "French")):
+            pack = packs / code
+            pack.mkdir(parents=True)
+            (pack / "pack.tsv").write_text(
+                f"language_code\t{code}\nlanguage_name\t{name}\n",
+                encoding="utf-8",
+            )
+        subprocess.run([
+            sys.executable, ROOT / "tools" / "build_g2p_model.py",
+            "--language", "en", "--model-archive", en_archive,
+            "--language", "fr", "--model-archive", fr_archive,
+            "--data-dir", packs,
+        ], check=True, capture_output=True, text=True)
+        for code in ("en", "fr"):
+            assert (packs / code / "g2p.bin").read_bytes()[:8] == b"KPG2P4\0\0"
+            assert (packs / code / "g2p.SOURCE.txt").is_file()
+            assert "g2p_model\tg2p.bin" in (packs / code / "pack.tsv").read_text()
+
+        all_packs = directory / "all-packs"
+        subprocess.run([
+            sys.executable, ROOT / "tools" / "build_g2p_model.py",
+            "--all", "--models-dir", directory, "--data-dir", all_packs,
+        ], check=True, capture_output=True, text=True)
+        assert {
+            path.parent.name for path in all_packs.glob("*/g2p.bin")
+        } == {"en", "fr"}
+
+        conflict = subprocess.run([
+            sys.executable, ROOT / "tools" / "build_g2p_model.py",
+            "--all", "--models-dir", directory, "--language", "fr",
+        ], capture_output=True, text=True)
+        assert conflict.returncode != 0
+        assert "cannot be combined" in conflict.stderr
 
 
 def check_release_build() -> None:
     assert read_plugin_version() == PLUGIN_VERSION
     assert "data/en/pronunciations.sqlite3" in RELEASE_FILES
+    assert "data/en/readable.tsv" in RELEASE_FILES
+    assert "data/en/g2p.bin" in RELEASE_FILES
     assert "data/pronunciations.sqlite3" not in RELEASE_FILES
+    assert "data/mfa_english_g2p.bin" not in RELEASE_FILES
     assert not any(
         relative.startswith("data/fr/") or relative.startswith("data/de/")
         for relative in RELEASE_FILES
@@ -519,7 +591,7 @@ def check_release_build() -> None:
         installed_size, archive_size = build_release(output)
         build_release(second_output)
         assert output.read_bytes() == second_output.read_bytes()
-        assert installed_size < 26_000_000
+        assert installed_size < 35_000_000
         assert archive_size < installed_size
         with zipfile.ZipFile(output) as archive:
             assert archive.namelist() == [
@@ -533,12 +605,12 @@ def check_release_build() -> None:
 
 
 if __name__ == "__main__":
-    check_conversion()
     check_database()
     check_compact_database_build()
     check_latest_release_resolution()
     check_source_checkout_update()
     check_release_preparation()
     check_g2p_model()
+    check_multilingual_g2p_build()
     check_release_build()
     print("database regression tests: OK")

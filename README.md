@@ -5,7 +5,7 @@ Offline IPA and readable pronunciation lookup for KOReader.
 ## Features
 
 - One lazily opened offline database per base language (`data/en/`, `data/fr/`, …)
-- Bundled English pack with US and UK pronunciations from CMUdict and WikiPron
+- Bundled English pack with US and UK pronunciations from WikiPron
 - Automatic book-language detection and manual installed-pack selection
 - Readable spellings, IPA, regional labels, and source attribution
 - Offline estimates for unfamiliar names and invented words
@@ -53,11 +53,11 @@ If you use the Storefront plugin manager for KOReader, you can install and updat
 Settings are under **Search → Settings → Pronunciation settings**:
 
 - **Online fallback** enables Dictionary API and Wiktionary lookup.
-- **Generated fallback** enables the bundled unfamiliar-word model.
+- **Generated fallback** enables the selected pack's unfamiliar-word model,
+  falling back to the bundled English model when no matching model is installed.
 - **Pronunciation language** offers **Auto** plus every installed offline pack.
   Auto normalizes locales such as `en-US` or `fr-CA` to their base language
   and uses English when the requested pack is unavailable.
-- **Generated language** offers **Auto** or **US English**.
 - **Clear cached pronunciations** removes sourced and generated caches without deleting personal overrides.
 >[!Note]
 > Turning off online fallback can greatly increase the time it takes to generate a pronunciation.
@@ -67,10 +67,11 @@ Settings are under **Search → Settings → Pronunciation settings**:
 1. Personal override
 2. Cached sourced or generated result
 3. The selected installed language pack (the bundled English pack contains
-   CMUdict plus US/UK WikiPron data)
+   US/UK WikiPron data plus the project supplement)
 4. English inflection derived from a known base
 5. Dictionary API and the English section of Wiktionary
-6. Bundled US-English G2P estimate
+6. The selected pack's G2P estimate, or the clearly labeled bundled
+   US-English G2P estimate when that pack has no model
 
 Personal overrides and cached results return immediately. On a cache miss,
 sourced results take priority over generated estimates. Generated entries are
@@ -89,7 +90,9 @@ python3 tools/build_database.py --language fr --language de
 python3 tools/build_database.py --all
 ```
 
-Copy the resulting complete `data/<language-code>/` directory into the
+Each build also produces `readable.tsv`, a deterministic, language-specific
+IPA-to-readable mapping learned from that language's WikiPron spellings. Copy
+the resulting complete `data/<language-code>/` directory into the
 plugin's `data/` directory and restart KOReader. Packs use a common ISO 639-1
 code when one exists and otherwise a stable ISO 639-3 code. Regional profiles
 are merged into that base pack, so English is always `en`, never `en-US` or
@@ -98,7 +101,6 @@ are merged into that base pack, so English is always `en`, never `en-US` or
 ## Data and licenses
 
 - Plugin code: [MIT](LICENSE)
-- CMUdict: BSD-3-Clause
 - WikiPron/Wiktionary records: CC BY-SA 4.0
 - Montreal Forced Aligner English US ARPA model: CC BY 4.0
 
@@ -107,10 +109,12 @@ Full terms, attribution, release provenance, artifact hashes, and modifications 
 
 ## Limitations
 
-Only English is bundled by default, and the generated model remains US
-English-only. Optional non-English WikiPron packs display correct IPA but do
-not run IPA through the English readable-spelling converter. Spelling alone
-cannot determine an author's intended pronunciation,
+Only English is bundled by default. Optional packs include sourced IPA and a
+language-specific readable approximation; generated fallback for such a pack
+requires installing a separately built MFA/Pynini model in the same language
+directory. The readable converter is learned from proportional IPA/spelling
+alignments and is an aid rather than a phonological transliteration standard.
+Spelling alone cannot determine an author's intended pronunciation,
 especially for names and fictional words. Generated IPA and readable spellings
 are estimates. Disable **Generated fallback** when only sourced results are
 wanted.

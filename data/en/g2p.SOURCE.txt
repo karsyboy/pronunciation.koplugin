@@ -1,0 +1,13 @@
+Language: en
+Model: english_us_arpa
+Version: 2.0.0rc4.dev0+gd5230fd.d20220126
+Format: compact pronunciation.koplugin KPG2P4 graph
+Source archive: english_us_arpa.zip
+Source archive SHA-256: f079ae88f792458fa7c123b256e5b86cc55c29ac2ffc457c673e6c60c36cd143
+Source project: https://github.com/MontrealCorpusTools/mfa-models
+License: see the source model metadata and LICENSES.txt
+Output: g2p.bin
+Output size: 15814625
+Output SHA-256: 4056b000fb0b7b6b972a1bebaad89d21556fe1b64b199870608839d3d9d4b22c
+States: 532450
+Arcs: 1450681

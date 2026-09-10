@@ -372,9 +372,6 @@ equal(Plugin:readableFromIpa("/ɪˈpɪtəmi/"), "ih-PIT-uh-mee",
 equal(Plugin:readableFromIpa("/həˈloʊ/"), "huh-LOH", "hello readable")
 equal(Plugin:readableFromIpa("/laminak/"), "lah-mee-nahk",
     "generic IPA readable")
-equal(#Plugin:queryLanguageHints("unlisted-word"), 0,
-    "missing legacy language-hint table was not handled safely")
-
 -- The bundled, pure-Lua weighted G2P path handles arbitrary spellings without
 -- an installed executable or a dictionary entry.
 local fantasy = Plugin:generatePronunciations("zyrathion", {})
@@ -407,30 +404,6 @@ equal(Plugin:generatePronunciations("“Faërun”", {})[1].arpabet,
     accented_fantasy[1].arpabet,
     "typographic query wrappers were not normalized")
 
--- Auto mode uses safe, optional book metadata on old and new KOReader builds.
-local query_language_hints_method = Plugin.queryLanguageHints
-Plugin.queryLanguageHints = function() return {} end
-Plugin.generated_language = "auto"
-Plugin.ui.document = {
-    getProps = function() return { language = "es-ES" } end,
-}
-local book_hints = Plugin:generationHints("fantasia")
-equal(#book_hints, 1, "book language hint is missing")
-equal(book_hints[1].code, "es", "BCP-47 book language was not normalized")
-local foreign_cache_key = Plugin:generationCacheKey("fantasia", book_hints)
-Plugin.ui.document.getProps = function() return { language = "en-US" } end
-local english_cache_key = Plugin:generationCacheKey(
-    "fantasia", Plugin:generationHints("fantasia"))
-equal(foreign_cache_key, english_cache_key,
-    "unsupported language fragmented the English generator cache")
-
-Plugin.generated_language = "en"
-Plugin.ui.document.getProps = function() return { language = "es" } end
-equal(Plugin:generationHints("fantasia")[1].code, "en",
-    "explicit generated language did not override book metadata")
-Plugin.generated_language = "auto"
-Plugin.ui.document = nil
-
 Plugin.generated_cache = {}
 Plugin.settings = {
     saveSetting = function() end,
@@ -439,13 +412,13 @@ Plugin.settings = {
 
 -- Both public generated-fallback paths must go through the generated cache.
 -- Normalized spelling variants share an entry and never decode the model twice.
-local cached_g2p_method = Plugin._englishG2pPhones
+local cached_g2p_method = Plugin._g2pPhones
 local cached_lookup_offline = Plugin.lookupOffline
 local cached_online_fallback = Plugin.online_fallback
 local cached_g2p_calls = 0
-Plugin._englishG2pPhones = function(plugin, word)
+Plugin._g2pPhones = function(plugin, pack, word)
     cached_g2p_calls = cached_g2p_calls + 1
-    return cached_g2p_method(plugin, word)
+    return cached_g2p_method(plugin, pack, word)
 end
 Plugin.lookupOffline = function() return nil end
 Plugin.online_fallback = false
@@ -457,11 +430,10 @@ end
 Plugin:_lookupAndShow("“ZYRATHION”")
 equal(cached_g2p_calls, 1,
     "offline generated fallback did not reuse its cached result")
-local normalized_generated_key = Plugin:generationCacheKey(
-    "zyrathion", Plugin:generationHints("zyrathion"))
+local normalized_generated_key = Plugin:generationCacheKey("zyrathion")
 truthy(Plugin.generated_cache[normalized_generated_key],
     "offline generated fallback did not save its result")
-Plugin._englishG2pPhones = cached_g2p_method
+Plugin._g2pPhones = cached_g2p_method
 Plugin.lookupOffline = cached_lookup_offline
 Plugin.online_fallback = cached_online_fallback
 
@@ -513,14 +485,6 @@ equal(Plugin.pronunciation_language, "en",
 pronunciation_language_menu[1].callback()
 equal(Plugin.pronunciation_language, "auto",
     "pronunciation-language menu did not return to Auto")
-local language_menu = menu.pronunciation.sub_item_table[4].sub_item_table
-equal(#language_menu, 2,
-    "generated-language menu should contain only Auto and US English")
-language_menu[2].callback()
-equal(Plugin.generated_language, "en",
-    "generated-language menu did not select US English")
-Plugin.generated_language = "auto"
-
 -- Offline packs are discovered from data/{base-code}/ sidecars without
 -- opening SQLite. Locale and ISO aliases select one base-language database.
 local pack_root = "/tmp/pronunciation-koplugin-pack-test"
@@ -531,12 +495,17 @@ local function writePack(code, name, iso6393, aliases)
     sidecar:write("language_name\t", name, "\n")
     sidecar:write("iso6393\t", iso6393, "\n")
     sidecar:write("aliases\t", aliases, "\n")
-    sidecar:write("schema_version\t7\n")
+    sidecar:write("schema_version\t8\n")
+    sidecar:write("readable_converter\treadable.tsv\n")
     sidecar:close()
     local database = assert(io.open(
         pack_root .. "/" .. code .. "/pronunciations.sqlite3", "wb"))
     database:write("fixture")
     database:close()
+    local readable = assert(io.open(pack_root .. "/" .. code .. "/readable.tsv", "w"))
+    readable:write("ipa\treadable\n")
+    if code == "fr" then readable:write("b\tb\nɔ̃\ton\nʒ\tj\nu\tou\nʁ\tr\n") end
+    readable:close()
 end
 writePack("en", "English", "eng", "en,eng")
 writePack("fr", "French", "fra", "fr,fra,fre")
@@ -568,9 +537,14 @@ Plugin.pronunciation_language = "auto"
 Plugin.ui.document.getProps = function() return { language = "de-DE" } end
 equal(Plugin:selectedLanguagePack().code, "en",
     "missing requested pack did not fall back to installed English")
+local french_pack = Plugin:discoverLanguagePacks().fr
+equal(Plugin:_readableFromPhones(french_pack, { "b", "ɔ̃", "ʒ", "u", "ʁ" }),
+    "bonjour", "foreign readable converter did not use its language pack")
+equal(Plugin:_readableFromPackIpa(french_pack, "/bɔ̃ʒuʁ/"), "bonjour",
+    "foreign IPA fallback did not use its language-pack converter")
 
--- A foreign database result remains valid IPA-only and is never passed
--- through the English-oriented readable-pronunciation converter.
+-- A foreign database result remains valid IPA-only when a readable value is
+-- unavailable; language-pack converters are applied during database builds.
 local foreign_returned = false
 local foreign_statement = {
     bind = function() end,
@@ -608,8 +582,10 @@ Plugin.pronunciation_language = "auto"
 Plugin.ui.document = nil
 os.remove(pack_root .. "/en/pack.tsv")
 os.remove(pack_root .. "/en/pronunciations.sqlite3")
+os.remove(pack_root .. "/en/readable.tsv")
 os.remove(pack_root .. "/fr/pack.tsv")
 os.remove(pack_root .. "/fr/pronunciations.sqlite3")
+os.remove(pack_root .. "/fr/readable.tsv")
 os.execute("rmdir " .. pack_root .. "/en " .. pack_root .. "/fr " .. pack_root)
 
 -- Manual pronunciation lookup mirrors KOReader's dictionary lookup dialog.
@@ -651,17 +627,17 @@ Plugin.lookupAndShow = menu_lookup
 -- history must not grow the startup settings table without bound.
 Plugin.generated_cache = { ["generator:2|old"] = {{ ipa = "/oʊld/" }} }
 for index = 1, 140 do
-    Plugin.generated_cache["generator:3|test:" .. index] = {{ ipa = "/tɛst/" }}
+    Plugin.generated_cache["generator:4|test:" .. index] = {{ ipa = "/tɛst/" }}
 end
-Plugin:saveGeneratedCache("generator:3|test:current", {{ ipa = "/kɝənt/" }})
+Plugin:saveGeneratedCache("generator:4|test:current", {{ ipa = "/kɝənt/" }})
 local generated_cache_count = 0
 for key in pairs(Plugin.generated_cache) do
     generated_cache_count = generated_cache_count + 1
-    truthy(key:find("generator:3|", 1, true) == 1,
+    truthy(key:find("generator:4|", 1, true) == 1,
         "stale generator cache version survived pruning")
 end
 truthy(generated_cache_count <= 128, "generated cache limit was not enforced")
-truthy(Plugin.generated_cache["generator:3|test:current"],
+truthy(Plugin.generated_cache["generator:4|test:current"],
     "new generated cache entry was pruned")
 
 -- Online results are recoverable, so their settings cache is bounded and
@@ -728,7 +704,7 @@ Plugin._queryConnection = function(_, _, word)
         return {{
             ipa = "/ɹʌn/",
             arpabet = "R AH1 N",
-            source = "CMUdict",
+            source = "Fixture dictionary",
             confidence = 80,
             region = "US",
         }}
@@ -766,7 +742,7 @@ local fake_statement = {
     step = function(self)
         if active_word == "cat" and not self.returned then
             self.returned = true
-            return { "/ˈkæt/", "K AE1 T", "KAT", "CMUdict", 80,
+            return { "/ˈkæt/", "K AE1 T", "KAT", "Fixture dictionary", 80,
                 "US", 0 }
         end
     end,
@@ -815,33 +791,6 @@ equal(prepare_count, 2, "direct query did not prepare exactly one statement")
 equal(statement_close_count, 2, "direct query did not close its statement")
 equal(query_connection_close_count, 1,
     "direct query did not close its database connection")
-
-local hint_bind_count = 0
-local hint_word
-local hint_returned = false
-local hint_statement = {
-    bind = function(_, ...)
-        hint_bind_count = select("#", ...)
-        hint_word = ...
-    end,
-    step = function()
-        if hint_returned then return nil end
-        hint_returned = true
-        return { "es", "Spanish", "test language hint" }
-    end,
-    close = function() end,
-}
-SQ3.open = function()
-    return {
-        prepare = function() return hint_statement end,
-        close = function() end,
-    }
-end
-local normalized_hints = query_language_hints_method(Plugin, "“FANTASIA”")
-equal(hint_bind_count, 1,
-    "language-hint query received an extra bound value")
-equal(hint_word, "fantasia", "language-hint query did not normalize its word")
-equal(normalized_hints[1].code, "es", "language-hint query lost its result")
 SQ3.open = query_open
 
 local wiktionary_fixture = [[
@@ -940,7 +889,7 @@ local force_repaint = UIManager.forceRePaint
 Plugin.lookupOffline = function()
     return {{
         ipa = "/ˈkæt/",
-        source = "CMUdict",
+        source = "Fixture dictionary",
         confidence = 95,
     }}, "cat"
 end
@@ -954,7 +903,7 @@ equal(shown_widgets[1].text, "Looking up pronunciation…",
     "legacy offline progress text changed")
 equal(closed_widgets[1], shown_widgets[1],
     "legacy offline progress was not closed")
-truthy(shown_widget.text:find("Source: CMUdict", 1, true),
+truthy(shown_widget.text:find("Source: Fixture dictionary", 1, true),
     "legacy offline result was not shown")
 Plugin.lookupOffline = lookup_offline
 UIManager.nextTick = next_tick
@@ -974,15 +923,12 @@ Plugin.lookupOnline = function()
     online_lookup_calls = online_lookup_calls + 1
     return nil, {{ code = "es", name = "Spanish" }}
 end
-Plugin.queryLanguageHints = function()
-    return {{ code = "es", name = "Spanish" }}
-end
 Plugin.online_fallback = true
-local online_g2p_method = Plugin._englishG2pPhones
+local online_g2p_method = Plugin._g2pPhones
 local online_g2p_calls = 0
-Plugin._englishG2pPhones = function(plugin, word)
+Plugin._g2pPhones = function(plugin, pack, word)
     online_g2p_calls = online_g2p_calls + 1
-    return online_g2p_method(plugin, word)
+    return online_g2p_method(plugin, pack, word)
 end
 shown_widget = nil
 shown_widgets = {}
@@ -1018,7 +964,7 @@ equal(repaint_count, repaint_before_cached_lookup,
     "cached generated result triggered an extra repaint")
 equal(next_tick_count, ticks_before_cached_lookup,
     "cached generated result deferred work to the event loop")
-Plugin._englishG2pPhones = online_g2p_method
+Plugin._g2pPhones = online_g2p_method
 
 -- A canceled Wi-Fi prompt never runs its callback, so the first progress
 -- message must be closed before control passes to KOReader's network manager.

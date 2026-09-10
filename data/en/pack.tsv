@@ -2,4 +2,6 @@ language_code	en
 language_name	English
 iso6393	eng
 aliases	en,eng
-schema_version	7
+schema_version	8
+readable_converter	readable.tsv
+g2p_model	g2p.bin
