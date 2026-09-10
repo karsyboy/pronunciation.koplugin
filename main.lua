@@ -1311,6 +1311,7 @@ function Pronunciation:init()
         settings_changed = true
     end
     local ai = aiModule(self)
+    self.ai_available_models = {}
     self.ai_provider_configs = ai.normalizeConfigs(
         self.settings:readSetting("ai_provider_configs", {}))
     self.ai_selected_providers = self.settings:readSetting(
@@ -1561,6 +1562,10 @@ function Pronunciation:saveAIProviderConfig(provider_id, field, value)
     if field == "format" and value ~= "openai" and value ~= "anthropic" then
         return
     end
+    if config[field] ~= value and field ~= "model"
+            and self.ai_available_models then
+        self.ai_available_models[provider_id] = nil
+    end
     config[field] = value
     self.settings:saveSetting("ai_provider_configs", self.ai_provider_configs)
     self.settings:flush()
@@ -1568,31 +1573,164 @@ end
 
 function Pronunciation:showAISettingDialog(provider_id, field, title, hint)
     local config = self.ai_provider_configs[provider_id]
-    if not config then return end
-    if not InputDialog then InputDialog = require("ui/widget/inputdialog") end
+    if not config then return false end
     local dialog
-    dialog = InputDialog:new{
-        title = title,
-        input = config[field] or "",
-        input_hint = hint,
-        input_type = "text",
-        buttons = {{
-            {
-                text = _("Cancel"), id = "close",
-                callback = function() UIManager:close(dialog) end,
-            },
-            {
-                text = _("Save"), is_enter_default = true,
-                callback = function()
-                    self:saveAIProviderConfig(provider_id, field,
-                        dialog:getInputText() or "")
-                    UIManager:close(dialog)
-                end,
-            },
-        }},
+    local ok = pcall(function()
+        if not InputDialog then
+            InputDialog = require("ui/widget/inputdialog")
+        end
+        dialog = InputDialog:new{
+            title = title,
+            input = config[field] or "",
+            input_hint = hint or "",
+            text_type = field == "api_key" and "password" or nil,
+            buttons = {{
+                {
+                    text = _("Cancel"), id = "close",
+                    callback = function() UIManager:close(dialog) end,
+                },
+                {
+                    text = _("Save"), is_enter_default = true,
+                    callback = function()
+                        self:saveAIProviderConfig(provider_id, field,
+                            dialog:getInputText() or "")
+                        UIManager:close(dialog)
+                    end,
+                },
+            }},
+        }
+        UIManager:show(dialog)
+        dialog:onShowKeyboard()
+    end)
+    if not ok then
+        -- Do not include the exception: widget construction may contain the
+        -- current input value, which can be an API key.
+        logger.err("Pronunciation: AI setting editor could not be opened")
+        if dialog then pcall(UIManager.close, UIManager, dialog) end
+        UIManager:show(newInfoMessage{
+            text = _("Could not open the AI setting editor. Restart KOReader and try again."),
+        })
+        return false
+    end
+    return true
+end
+
+function Pronunciation:_populateAIModelMenu(items, provider_id, provider_name)
+    for index = #items, 1, -1 do items[index] = nil end
+    items[#items + 1] = {
+        text = _("Fetch available models"),
+        keep_menu_open = true,
+        callback = function(touchmenu_instance)
+            self:fetchAIModels(provider_id, provider_name, items,
+                touchmenu_instance)
+        end,
+        separator = true,
     }
-    UIManager:show(dialog)
-    dialog:onShowKeyboard()
+    items[#items + 1] = {
+        text = _("Enter model manually…"),
+        keep_menu_open = true,
+        callback = function()
+            self:showAISettingDialog(provider_id, "model",
+                provider_name .. ": " .. _("Model"))
+        end,
+    }
+
+    local config = self.ai_provider_configs[provider_id] or {}
+    local current = trim(config.model)
+    local models = self.ai_available_models
+        and self.ai_available_models[provider_id] or {}
+    local ordered, seen = {}, {}
+    if current ~= "" then
+        ordered[#ordered + 1] = current
+        seen[current] = true
+    end
+    for _, model in ipairs(models) do
+        if type(model) == "string" and not seen[model] then
+            seen[model] = true
+            ordered[#ordered + 1] = model
+        end
+    end
+    for _, model in ipairs(ordered) do
+        local model_id = model
+        items[#items + 1] = {
+            text = model_id,
+            checked_func = function()
+                local saved = self.ai_provider_configs[provider_id]
+                return saved and saved.model == model_id
+            end,
+            callback = function(touchmenu_instance)
+                self:saveAIProviderConfig(provider_id, "model", model_id)
+                updateTouchMenu(touchmenu_instance)
+            end,
+        }
+    end
+end
+
+function Pronunciation:aiModelMenuItems(provider_id, provider_name)
+    local items = {}
+    self:_populateAIModelMenu(items, provider_id, provider_name)
+    return items
+end
+
+function Pronunciation:fetchAIModels(provider_id, provider_name, menu_items,
+        touchmenu_instance)
+    local ai = aiModule(self)
+    local config = self.ai_provider_configs[provider_id]
+    if not ai.buildModelsRequest(provider_id, config) then
+        UIManager:show(newInfoMessage{
+            text = provider_name .. ": "
+                .. _("configure the API key and endpoint first"),
+        })
+        return
+    end
+    if not NetworkMgr then NetworkMgr = require("ui/network/manager") end
+    NetworkMgr:runWhenOnline(function()
+        local progress = newInfoMessage{
+            text = provider_name .. ": " .. _("fetching available models…"),
+            dismissable = true,
+            show_icon = false,
+        }
+        UIManager:show(progress)
+        if type(UIManager.forceRePaint) == "function" then
+            UIManager:forceRePaint()
+        end
+        afterLookupProgress(function()
+            runInTrapper(function()
+                local request_function
+                if type(self.ai_models_request) == "function" then
+                    request_function = function(request, request_progress)
+                        return self:ai_models_request(request, request_progress)
+                    end
+                end
+                local ok, models, error_message = pcall(ai.listModels,
+                    provider_id, config, progress, request_function)
+                UIManager:close(progress)
+                if not ok then
+                    logger.err("Pronunciation: model discovery failed for",
+                        provider_name)
+                    error_message = "request failed"
+                    models = nil
+                end
+                if not models then
+                    UIManager:show(newInfoMessage{
+                        text = provider_name .. ": "
+                            .. (error_message or _("request failed")),
+                    })
+                    return
+                end
+                self.ai_available_models = self.ai_available_models or {}
+                self.ai_available_models[provider_id] = models
+                self:_populateAIModelMenu(menu_items, provider_id,
+                    provider_name)
+                updateTouchMenu(touchmenu_instance)
+                UIManager:show(newInfoMessage{
+                    text = provider_name .. ": " .. tostring(#models)
+                        .. " " .. _("models available"),
+                    timeout = 3,
+                })
+            end)
+        end)
+    end)
 end
 
 function Pronunciation:addToMainMenu(menu_items)
@@ -1636,7 +1774,12 @@ function Pronunciation:addToMainMenu(menu_items)
 
     local provider_selection_items = {}
     local provider_configuration_items = {}
-    for _, provider in ipairs(aiModule(self).providers) do
+    -- Do not name the discarded index `_`: callbacks below need the gettext
+    -- `_` upvalue after this function returns. Capturing the numeric loop index
+    -- here caused KOReader to crash as soon as a provider submenu was opened.
+    local ai_providers = aiModule(self).providers
+    for provider_index = 1, #ai_providers do
+        local provider = ai_providers[provider_index]
         local provider_id, provider_name = provider.id, provider.name
         provider_selection_items[#provider_selection_items + 1] = {
             text = provider_name,
@@ -1653,35 +1796,39 @@ function Pronunciation:addToMainMenu(menu_items)
         local config_items = {
             {
                 text_func = function()
-                    local key = self.ai_provider_configs[provider_id].api_key
+                    local config = self.ai_provider_configs[provider_id] or {}
+                    local key = config.api_key or ""
                     return _("API key") .. ": "
                         .. (key ~= "" and _("configured") or _("not set"))
                 end,
+                keep_menu_open = true,
                 callback = function()
                     self:showAISettingDialog(provider_id, "api_key",
-                        provider_name .. " — " .. _("API key"))
+                        provider_name .. ": " .. _("API key"))
                 end,
             },
             {
                 text_func = function()
+                    local config = self.ai_provider_configs[provider_id] or {}
                     return _("Model") .. ": "
-                        .. (self.ai_provider_configs[provider_id].model or "")
+                        .. (config.model or "")
                 end,
-                callback = function()
-                    self:showAISettingDialog(provider_id, "model",
-                        provider_name .. " — " .. _("Model"))
+                sub_item_table_func = function()
+                    return self:aiModelMenuItems(provider_id, provider_name)
                 end,
             },
         }
         if provider_id == "custom1" or provider_id == "custom2" then
             config_items[#config_items + 1] = {
                 text_func = function()
+                    local config = self.ai_provider_configs[provider_id] or {}
                     return _("Endpoint") .. ": "
-                        .. (self.ai_provider_configs[provider_id].endpoint or "")
+                        .. (config.endpoint or "")
                 end,
+                keep_menu_open = true,
                 callback = function()
                     self:showAISettingDialog(provider_id, "endpoint",
-                        provider_name .. " — " .. _("Endpoint"),
+                        provider_name .. ": " .. _("Endpoint"),
                         "https://…/v1/chat/completions")
                 end,
             }
@@ -2147,29 +2294,64 @@ function Pronunciation:saveGeneratedCache(key, results)
 end
 
 function Pronunciation:aiLanguage()
-    local code, definition, raw_identity
     if self.pronunciation_language and self.pronunciation_language ~= "auto" then
-        code = self:normalizePronunciationLanguage(self.pronunciation_language)
-    else
-        code = self:documentPronunciationLanguage()
-        if not code then
-            for _, value in ipairs(self:documentLanguageValues()) do
-                local key = normalizeLanguageKey(value)
-                if key ~= "" and not raw_identity then raw_identity = key end
-                definition = languageDefinition(nil, value)
-                if definition then break end
+        local code = self:normalizePronunciationLanguage(
+            self.pronunciation_language)
+        local definition = code and self:discoverLanguagePacks()[code] or nil
+        if definition then
+            local prompt_language = definition.code == "en"
+                and "English (standard US English)" or definition.name
+            return definition.code, prompt_language, definition.code,
+                definition.name
+        end
+        return "manual:none", nil, nil, nil
+    end
+
+    -- A book's language tag is reliable metadata even when no matching local
+    -- pack is installed. Keep the locale in the cache identity and send it to
+    -- the provider, while rejecting free-form metadata that could be mistaken
+    -- for an instruction.
+    for _, value in ipairs(self:documentLanguageValues()) do
+        local key = normalizeLanguageKey(value)
+        local is_tag = key:match("^[a-z][a-z]$")
+            or key:match("^[a-z][a-z][a-z]$")
+            or key:match("^[a-z][a-z][a-z]?%-[a-z0-9%-]+$")
+        local known_definition = languageDefinition(nil, key)
+        if key ~= "" and #key <= 64 and (is_tag or known_definition) then
+            local code = self:normalizePronunciationLanguage(key)
+            local definition = (code and self:discoverLanguagePacks()[code])
+                or known_definition
+            local prompt_language = key
+            local language_code = key:match("^([a-z][a-z][a-z]?)")
+            local language_name
+            if definition then
+                language_code = definition.code
+                language_name = definition.name
+                if definition.code == "en" then
+                    prompt_language = "English (standard US English)"
+                elseif key == definition.code
+                        or key == definition.name:lower() then
+                    prompt_language = definition.name
+                else
+                    prompt_language = definition.name .. " (" .. key .. ")"
+                end
             end
+            return "auto:" .. key, prompt_language, language_code,
+                language_name
         end
     end
-    local pack = code and self:discoverLanguagePacks()[code] or nil
-    definition = pack or definition
+
+    -- Some document backends can normalize a language without exposing the
+    -- raw property through getProps(). Preserve that compatibility fallback.
+    local code = self:documentPronunciationLanguage()
+    local definition = code and self:discoverLanguagePacks()[code] or nil
     if definition then
         local prompt_language = definition.code == "en"
             and "English (standard US English)" or definition.name
         return definition.code, prompt_language, definition.code,
             definition.name
     end
-    return "auto:" .. (raw_identity or "none"), nil, nil, nil
+    return "auto:none", nil, nil, nil
 end
 
 function Pronunciation:aiGenerationCacheKey(word, language_identity,

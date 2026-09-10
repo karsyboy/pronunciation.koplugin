@@ -15,6 +15,9 @@ python3 tests/test_database.py
 python3 tools/build_release.py
 ```
 
+The Lua regression suite mocks pronunciation and model-list API responses; it
+must not make paid live-provider calls.
+
 The release builder validates versions, the bundled English database's schema,
 metadata and final SHA-256, the readable converter and G2P model SHA-256,
 required licenses, and

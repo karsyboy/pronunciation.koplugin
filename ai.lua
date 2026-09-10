@@ -4,6 +4,8 @@ local M = {}
 
 M.MAX_OUTPUT_TOKENS = 128
 M.MAX_HTTP_RESPONSE_BYTES = 65536
+M.MAX_MODEL_LIST_BYTES = 262144
+M.MAX_MODELS = 1000
 M.MAX_MODEL_TEXT_BYTES = 2048
 
 M.PROMPT = [[Pronounce the input word.
@@ -32,7 +34,7 @@ M.providers = {
     {
         id = "claude", name = "Anthropic Claude",
         endpoint = "https://api.anthropic.com/v1/messages",
-        model = "claude-3-5-haiku-20241022", format = "anthropic",
+        model = "claude-haiku-4-5-20251001", format = "anthropic",
     },
     { id = "custom1", name = "Custom API 1", format = "openai" },
     { id = "custom2", name = "Custom API 2", format = "openai" },
@@ -142,6 +144,73 @@ local function safeEndpoint(endpoint)
     return endpoint
 end
 
+local function customModelsEndpoint(endpoint)
+    endpoint = safeEndpoint(endpoint)
+    if not endpoint then return nil end
+    endpoint = endpoint:gsub("[?#].*$", ""):gsub("/+$", "")
+    if endpoint:sub(-7) == "/models" then return endpoint end
+    local replaced
+    for _, suffix in ipairs({ "/chat/completions", "/responses", "/messages" }) do
+        if endpoint:sub(-#suffix) == suffix then
+            endpoint = endpoint:sub(1, -#suffix - 1) .. "/models"
+            replaced = true
+            break
+        end
+    end
+    if not replaced then endpoint = endpoint .. "/models" end
+    return endpoint
+end
+
+function M.buildModelsRequest(id, config)
+    local provider = providers_by_id[id]
+    if not provider or type(config) ~= "table"
+            or trim(config.api_key) == "" then return nil end
+
+    local endpoint
+    if id == "gemini" then
+        endpoint = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000"
+    elseif id == "openai" then
+        endpoint = "https://api.openai.com/v1/models"
+    elseif id == "deepseek" then
+        endpoint = "https://api.deepseek.com/models"
+    elseif id == "claude" then
+        endpoint = "https://api.anthropic.com/v1/models?limit=1000"
+    else
+        endpoint = customModelsEndpoint(config.endpoint)
+    end
+    if not endpoint then return nil end
+
+    local headers = {
+        ["Accept"] = "application/json",
+        ["Accept-Encoding"] = "identity",
+    }
+    local format = provider.format
+    if id == "custom1" or id == "custom2" then
+        format = config.format
+        if format ~= "openai" and format ~= "anthropic" then return nil end
+    end
+    if id == "gemini" then
+        headers["x-goog-api-key"] = config.api_key
+    elseif id == "claude" then
+        headers["anthropic-version"] = "2023-06-01"
+        headers["x-api-key"] = config.api_key
+    elseif format == "anthropic"
+            and endpoint:find("api.anthropic.com", 1, true) then
+        headers["anthropic-version"] = "2023-06-01"
+        headers["x-api-key"] = config.api_key
+    else
+        headers["Authorization"] = "Bearer " .. config.api_key
+    end
+    return {
+        url = endpoint,
+        method = "GET",
+        headers = headers,
+        provider = id,
+        provider_name = provider.name,
+        max_response_bytes = M.MAX_MODEL_LIST_BYTES,
+    }
+end
+
 function M.buildRequest(id, config, word, language)
     local provider = providers_by_id[id]
     local json = jsonModule()
@@ -238,12 +307,17 @@ local function performHttpRequest(request)
         return nil, "unavailable"
     end
     local response = {}
+    local max_response_bytes = tonumber(request.max_response_bytes)
+        or M.MAX_HTTP_RESPONSE_BYTES
+    if max_response_bytes < 1 or max_response_bytes > M.MAX_MODEL_LIST_BYTES then
+        max_response_bytes = M.MAX_HTTP_RESPONSE_BYTES
+    end
     local response_size = 0
     local oversized = false
     local function boundedSink(chunk)
         if chunk then
             response_size = response_size + #chunk
-            if response_size > M.MAX_HTTP_RESPONSE_BYTES then
+            if response_size > max_response_bytes then
                 oversized = true
                 return nil, "response too large"
             end
@@ -253,22 +327,75 @@ local function performHttpRequest(request)
     end
     socketutil:set_timeout(15, 25)
     local pcall_ok, ok, code, headers, status = pcall(function()
-        return http.request({
+        local options = {
             url = request.url,
-            method = "POST",
+            method = request.method or "POST",
             headers = request.headers,
-            source = ltn12.source.string(request.body),
             sink = boundedSink,
-        })
+        }
+        if type(request.body) == "string" then
+            options.source = ltn12.source.string(request.body)
+        end
+        return http.request(options)
     end)
     socketutil:reset_timeout()
     if not pcall_ok or oversized then return nil, "failed" end
     local text = table.concat(response)
-    if #text > M.MAX_HTTP_RESPONSE_BYTES then return nil, "oversized" end
+    if #text > max_response_bytes then return nil, "oversized" end
     local expected = headers and tonumber(headers["content-length"]
         or headers["Content-Length"])
     if expected and #text < expected then return nil, "incomplete" end
     return ok, code, text, status
+end
+
+function M.extractModels(id, response)
+    if type(response) ~= "string" or #response == 0
+            or #response > M.MAX_MODEL_LIST_BYTES then return nil end
+    local json = jsonModule()
+    if not json then return nil end
+    local decoded = jsonDecode(json, response)
+    if type(decoded) ~= "table" then return nil end
+
+    local rows = id == "gemini" and decoded.models or decoded.data
+    if type(rows) ~= "table" then return nil end
+    local models, seen = {}, {}
+    for _, row in ipairs(rows) do
+        local allowed = true
+        if id == "gemini" then
+            allowed = false
+            for _, method in ipairs(type(row) == "table"
+                    and row.supportedGenerationMethods or {}) do
+                if method == "generateContent" then
+                    allowed = true
+                    break
+                end
+            end
+        end
+        local model = type(row) == "table" and (row.id or row.name) or nil
+        if id == "gemini" and type(model) == "string" then
+            model = model:gsub("^models/", "")
+        end
+        model = safeModel(model)
+        if allowed and model and not seen[model] then
+            seen[model] = true
+            models[#models + 1] = model
+            if #models >= M.MAX_MODELS then break end
+        end
+    end
+    table.sort(models, function(left, right)
+        return left:lower() < right:lower()
+    end)
+    return #models > 0 and models or nil
+end
+
+function M.listModels(id, config, progress, request_function)
+    local request = M.buildModelsRequest(id, config)
+    if not request then return nil, "configure API key and endpoint" end
+    local response, request_error = (request_function or M.request)(request, progress)
+    if not response then return nil, request_error or "request failed" end
+    local models = M.extractModels(id, response)
+    if not models then return nil, "invalid response" end
+    return models
 end
 
 function M.request(request, progress)

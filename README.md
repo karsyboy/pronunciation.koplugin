@@ -62,17 +62,23 @@ Settings are under **Search → Settings → Pronunciation settings**:
     back to Local.
 - **AI settings → Providers** supports selecting any combination of Google
   Gemini, OpenAI, DeepSeek, Anthropic Claude, and two custom API slots.
-- **AI settings → API keys and models** configures each provider. Custom slots
-  additionally accept an endpoint and OpenAI-compatible or Anthropic request
-  format.
+- **AI settings → API keys and models** configures each provider. Open a
+  provider's **Model** menu to fetch the models available to that API key and
+  select one, or enter a model ID manually. Custom slots additionally accept
+  an endpoint and OpenAI-compatible or Anthropic request format; their model
+  list is requested from the corresponding `/models` endpoint.
 - **Pronunciation language** offers **Auto** plus every installed offline pack.
   Auto normalizes locales such as `en-US` or `fr-CA` to their base language
-  and uses English when the requested pack is unavailable.
+  and uses English when the requested local pack is unavailable. In AI mode,
+  valid book-language metadata is sent with the word even when no matching
+  offline pack is installed, and the locale remains part of the cache key.
 - **Clear cached pronunciations** removes local-G2P and AI results without
   deleting personal overrides.
 
 API keys are stored in KOReader's persistent pronunciation settings. They are
 not written to pronunciation caches, logs, release files, or error messages.
+Model lists are fetched on demand and kept only for the current KOReader
+session.
 If AI mode has no selected provider with the required key/model/endpoint, the
 lookup reports what must be configured.
 
