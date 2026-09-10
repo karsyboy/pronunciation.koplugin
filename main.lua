@@ -78,7 +78,7 @@ local function runLookupSafely(word, progress, callback)
         word .. "\n\n" .. _("Pronunciation lookup failed. Please try again."))
 end
 
-local PLUGIN_VERSION = "0.9.0"
+local PLUGIN_VERSION = "1.0.0"
 local DICTIONARY_BUTTON_ID = "pronunciation_lookup"
 local CACHE_VERSION = 8
 local GENERATOR_VERSION = 5
