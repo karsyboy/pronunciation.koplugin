@@ -1571,7 +1571,8 @@ function Pronunciation:saveAIProviderConfig(provider_id, field, value)
     self.settings:flush()
 end
 
-function Pronunciation:showAISettingDialog(provider_id, field, title, hint)
+function Pronunciation:showAISettingDialog(provider_id, field, title, hint,
+        touchmenu_instance)
     local config = self.ai_provider_configs[provider_id]
     if not config then return false end
     local dialog
@@ -1595,6 +1596,7 @@ function Pronunciation:showAISettingDialog(provider_id, field, title, hint)
                         self:saveAIProviderConfig(provider_id, field,
                             dialog:getInputText() or "")
                         UIManager:close(dialog)
+                        updateTouchMenu(touchmenu_instance)
                     end,
                 },
             }},
@@ -1629,9 +1631,10 @@ function Pronunciation:_populateAIModelMenu(items, provider_id, provider_name)
     items[#items + 1] = {
         text = _("Enter model manually…"),
         keep_menu_open = true,
-        callback = function()
+        callback = function(touchmenu_instance)
             self:showAISettingDialog(provider_id, "model",
-                provider_name .. ": " .. _("Model"))
+                provider_name .. ": " .. _("Model"), nil,
+                touchmenu_instance)
         end,
     }
 
@@ -1802,9 +1805,10 @@ function Pronunciation:addToMainMenu(menu_items)
                         .. (key ~= "" and _("configured") or _("not set"))
                 end,
                 keep_menu_open = true,
-                callback = function()
+                callback = function(touchmenu_instance)
                     self:showAISettingDialog(provider_id, "api_key",
-                        provider_name .. ": " .. _("API key"))
+                        provider_name .. ": " .. _("API key"), nil,
+                        touchmenu_instance)
                 end,
             },
             {
@@ -1826,10 +1830,10 @@ function Pronunciation:addToMainMenu(menu_items)
                         .. (config.endpoint or "")
                 end,
                 keep_menu_open = true,
-                callback = function()
+                callback = function(touchmenu_instance)
                     self:showAISettingDialog(provider_id, "endpoint",
                         provider_name .. ": " .. _("Endpoint"),
-                        "https://…/v1/chat/completions")
+                        "https://…/v1/chat/completions", touchmenu_instance)
                 end,
             }
             config_items[#config_items + 1] = {
@@ -2372,9 +2376,10 @@ function Pronunciation:format(original, results, matched)
     lines[#lines + 1] = ""
     for index, result in ipairs(results) do
         if result.ai_generated then
-            lines[#lines + 1] = result.provider_name .. " (" .. result.model .. ")"
             lines[#lines + 1] = _("IPA") .. ": " .. result.ipa
-            lines[#lines + 1] = _("Pronunciation") .. ": " .. result.simple
+            lines[#lines + 1] = _("Readable") .. ": " .. result.simple
+            lines[#lines + 1] = _("Source") .. ": "
+                .. result.provider_name .. " (" .. result.model .. ")"
         else
             local location
             if result.language and result.region then

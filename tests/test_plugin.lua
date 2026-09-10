@@ -531,12 +531,22 @@ truthy(gemini_configuration[1].keep_menu_open,
     "API key editor closes its parent menu after opening the dialog")
 shown_widgets = {}
 keyboard_show_count = 0
-local key_dialog_ok, key_dialog_error = pcall(gemini_configuration[1].callback)
+local key_menu_updates = 0
+local key_dialog_ok, key_dialog_error = pcall(
+    gemini_configuration[1].callback, {
+        updateItems = function() key_menu_updates = key_menu_updates + 1 end,
+    })
 truthy(key_dialog_ok, "opening the provider API key editor crashed: "
     .. tostring(key_dialog_error))
 local key_dialog = shown_widgets[#shown_widgets]
 equal(key_dialog.text_type, "password", "API key input was not obscured")
 equal(keyboard_show_count, 1, "API key editor did not show the keyboard")
+key_dialog.input = "saved-key"
+key_dialog.buttons[1][2].callback()
+equal(key_menu_updates, 1,
+    "saving an API key did not refresh the settings menu")
+equal(gemini_configuration[1].text_func(), "API key: configured",
+    "refreshed API key status did not reflect the saved setting")
 
 local gemini_model_menu = gemini_configuration[2].sub_item_table_func()
 equal(gemini_model_menu[1].text, "Fetch available models",
@@ -1155,10 +1165,16 @@ equal(#multi_errors, 1, "provider failure was not reported independently")
 equal(multi_results[1].provider, "gemini", "provider result order changed")
 equal(multi_results[2].provider, "claude", "successful Claude result missing")
 local multi_formatted = Plugin:formatAIOutcome("hello", multi_results, multi_errors)
-truthy(multi_formatted:find("Google Gemini (", 1, true),
-    "Gemini/model attribution missing from UI")
-truthy(multi_formatted:find("Anthropic Claude (", 1, true),
-    "Claude/model attribution missing from UI")
+truthy(multi_formatted:find("IPA: /", 1, true),
+    "AI IPA did not use the standard result format")
+truthy(multi_formatted:find("Readable: ", 1, true),
+    "AI readable pronunciation did not use the standard result format")
+truthy(multi_formatted:find("Source: Google Gemini (", 1, true),
+    "Gemini/model source attribution missing from UI")
+truthy(multi_formatted:find("Source: Anthropic Claude (", 1, true),
+    "Claude/model source attribution missing from UI")
+truthy(not multi_formatted:find("Pronunciation:", 1, true),
+    "AI UI retained its old Pronunciation label")
 truthy(multi_formatted:find("OpenAI: request failed", 1, true),
     "failed provider error missing from UI")
 
