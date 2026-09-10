@@ -19,7 +19,7 @@ jobs:
           sudo apt-get install --yes lua5.1 luajit
       - name: Validate Lua runtime
         run: |
-          luac5.1 -p main.lua
+          luac5.1 -p main.lua ai.lua
           luajit tests/test_plugin.lua
           lua5.1 tests/test_plugin.lua
       - name: Validate data and release build

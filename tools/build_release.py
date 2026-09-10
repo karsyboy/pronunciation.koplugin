@@ -17,6 +17,7 @@ PLUGIN_DIRECTORY = "pronunciation.koplugin"
 RELEASE_FILES = (
     "_meta.lua",
     "main.lua",
+    "ai.lua",
     "README.md",
     "LICENSE",
     "LICENSES.txt",

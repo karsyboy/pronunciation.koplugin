@@ -27,6 +27,16 @@ local UIManager = {
 local NetworkMgr = {
     runWhenOnline = function(_, callback) callback() end,
 }
+local trap_wrap_count = 0
+preload("ui/trapper", {
+    wrap = function(_, callback)
+        trap_wrap_count = trap_wrap_count + 1
+        callback()
+    end,
+    dismissableRunInSubprocess = function(_, callback)
+        return true, callback()
+    end,
+})
 
 preload("datastorage", {})
 preload("ui/widget/infomessage", { new = function(_, value) return value end })
@@ -45,7 +55,15 @@ local TextBoxWidget = {
     PTF_BOLD_END = "</bold>",
 }
 preload("ui/widget/textboxwidget", TextBoxWidget)
-preload("json", { decode = function() return {} end })
+local decoded_json = {}
+local encoded_payloads = {}
+preload("json", {
+    encode = function(value)
+        encoded_payloads[#encoded_payloads + 1] = value
+        return "{}"
+    end,
+    decode = function(value) return decoded_json[value] or {} end,
+})
 preload("luasettings", {})
 preload("ui/network/manager", NetworkMgr)
 local SQ3 = {}
@@ -71,7 +89,15 @@ function DictQuickLookup:init()
     self.test_buttons = buttons
 end
 preload("ui/widget/dictquicklookup", DictQuickLookup)
-preload("logger", { err = function() end, warn = function() end })
+local log_messages = {}
+local function captureLog(...)
+    local parts = {}
+    for index = 1, select("#", ...) do
+        parts[#parts + 1] = tostring(select(index, ...))
+    end
+    log_messages[#log_messages + 1] = table.concat(parts, " ")
+end
+preload("logger", { err = captureLog, warn = captureLog })
 preload("ltn12", { sink = { table = function() return function() end end } })
 preload("socket", { skip = function(_, value) return value end })
 preload("socket.http", { request = function() return nil, 500 end })
@@ -86,7 +112,7 @@ local Plugin = dofile("main.lua")
 Plugin.path = "."
 Plugin.data_path = "./data"
 Plugin.pronunciation_language = "auto"
-Plugin.generated_fallback = true
+Plugin.generated_mode = "local"
 
 -- Heavy feature modules stay out of the startup path on memory-limited devices.
 assert(package.loaded["json"] == nil, "JSON was loaded during plugin startup")
@@ -96,6 +122,10 @@ assert(package.loaded["socket.http"] == nil,
     "HTTP was loaded during plugin startup")
 assert(package.loaded["ui/widget/dictquicklookup"] == nil,
     "legacy dictionary widget was loaded during modern plugin startup")
+
+local AI = dofile("ai.lua")
+Plugin.ai_provider_configs = AI.defaultConfig()
+Plugin.ai_selected_providers = {}
 
 local function equal(actual, expected, message)
     if actual ~= expected then
@@ -344,7 +374,7 @@ local duplicate_buttons = {}
 Plugin:onDictButtonsReady({ lookupword = "cat" }, duplicate_buttons)
 equal(#duplicate_buttons, 0, "modern KOReader received a duplicate legacy button")
 
--- Inflections work from IPA when online results have no ARPABET.
+-- Inflections work from IPA when a sourced result has no ARPABET.
 local function derive(ipa, kind)
     return Plugin:derive({{
         ipa = ipa,
@@ -378,7 +408,7 @@ equal(Plugin:readableFromIpa("/qɑ/"), nil,
     "unknown IPA phone was silently dropped from readable output")
 -- The bundled, pure-Lua weighted G2P path handles arbitrary spellings without
 -- an installed executable or a dictionary entry.
-local fantasy = Plugin:generatePronunciations("zyrathion", {})
+local fantasy = Plugin:generateLocalPronunciations("zyrathion", {})
 truthy(fantasy, "portable English fantasy-word fallback is missing")
 equal(#fantasy, 1, "unexpected fantasy-word result count")
 equal(fantasy[1].language, "English", "fantasy fallback language")
@@ -391,23 +421,23 @@ equal(fantasy[1].arpabet, "Z ER0 AE1 TH IY0 AO0 N",
     "portable model diverged from the pinned MFA/Pynini output")
 truthy(fantasy[1].source:find("MFA/Pynini", 1, true),
     "fantasy fallback provenance is missing")
-local laminak = Plugin:generatePronunciations("laminak", {})
+local laminak = Plugin:generateLocalPronunciations("laminak", {})
 truthy(laminak and laminak[1], "laminak G2P regression is missing")
 equal(laminak[1].arpabet, "L AE1 M AH0 N AH0 K",
     "laminak diverged from the pinned MFA/Pynini output")
-local medical = Plugin:generatePronunciations("otorhinolaryngological", {})
+local medical = Plugin:generateLocalPronunciations("otorhinolaryngological", {})
 truthy(medical and medical[1] and medical[1].ipa and medical[1].simple,
     "long unfamiliar English word lost G2P IPA or readable output")
 
-local accented_fantasy = Plugin:generatePronunciations("Faërun", {})
+local accented_fantasy = Plugin:generateLocalPronunciations("Faërun", {})
 truthy(accented_fantasy and accented_fantasy[1].ipa,
     "portable English fallback did not fold a Latin-script name")
 equal(accented_fantasy[1].arpabet, "F EH1 R AH0 N",
     "Latin folding changed the pinned MFA/Pynini output")
-equal(Plugin:generatePronunciations("FAËRUN", {})[1].arpabet,
+equal(Plugin:generateLocalPronunciations("FAËRUN", {})[1].arpabet,
     accented_fantasy[1].arpabet,
     "uppercase accented Latin spelling was not normalized")
-equal(Plugin:generatePronunciations("“Faërun”", {})[1].arpabet,
+equal(Plugin:generateLocalPronunciations("“Faërun”", {})[1].arpabet,
     accented_fantasy[1].arpabet,
     "typographic query wrappers were not normalized")
 
@@ -417,18 +447,17 @@ Plugin.settings = {
     flush = function() end,
 }
 
--- Both public generated-fallback paths must go through the generated cache.
--- Normalized spelling variants share an entry and never decode the model twice.
+-- Local generation is mode-gated, cached by language/model artifact, and
+-- rechecked only after the exact database path.
 local cached_g2p_method = Plugin._g2pPhones
 local cached_lookup_offline = Plugin.lookupOffline
-local cached_online_fallback = Plugin.online_fallback
 local cached_g2p_calls = 0
 Plugin._g2pPhones = function(plugin, pack, word)
     cached_g2p_calls = cached_g2p_calls + 1
     return cached_g2p_method(plugin, pack, word)
 end
 Plugin.lookupOffline = function() return nil end
-Plugin.online_fallback = false
+Plugin.generated_mode = "local"
 Plugin.generated_cache = {}
 Plugin:_lookupAndShow("Zyrathion")
 local repeated_offline_checks = 0
@@ -437,18 +466,18 @@ Plugin.lookupOffline = function()
     return nil
 end
 Plugin:_lookupAndShow("“ZYRATHION”")
-equal(cached_g2p_calls, 1,
-    "offline generated fallback did not reuse its cached result")
+equal(cached_g2p_calls, 1, "Local mode did not reuse its cached G2P result")
 equal(repeated_offline_checks, 1,
     "cached generation bypassed a newer exact database lookup")
-local normalized_generated_key = Plugin:generationCacheKey("zyrathion")
+local normalized_generated_key = Plugin:localGenerationCacheKey("zyrathion")
 truthy(Plugin.generated_cache[normalized_generated_key],
-    "offline generated fallback did not save its result")
+    "Local mode did not save its result")
 truthy(normalized_generated_key:find("|model:4056b000", 1, true),
-    "generated cache identity omitted the G2P artifact hash")
-Plugin.generated_cache[Plugin:generationCacheKey("priority")] = {{
-    ipa = "/pɹaɪɔɹəti/", source = "generated fixture", generated = true,
-    language_code = "en", language = "English",
+    "local cache identity omitted the G2P artifact hash")
+Plugin.generated_cache[Plugin:localGenerationCacheKey("priority")] = {{
+    ipa = "/pɹaɪɔɹəti/", simple = "pry-OR-ih-tee",
+    source = "generated fixture", generated = true,
+    generation_mode = "local", language_code = "en", language = "English",
 }}
 Plugin.lookupOffline = function()
     return {{
@@ -464,7 +493,6 @@ truthy(not shown_widget.text:find("Source: generated fixture", 1, true),
     "exact database lookup displayed cached generation")
 Plugin._g2pPhones = cached_g2p_method
 Plugin.lookupOffline = cached_lookup_offline
-Plugin.online_fallback = cached_online_fallback
 
 local menu = {}
 Plugin:addToMainMenu(menu)
@@ -474,34 +502,26 @@ equal(menu.pronunciation_lookup.text, "Pronunciation lookup",
     "manual pronunciation lookup menu label")
 equal(menu.pronunciation.sorting_hint, "search_settings",
     "pronunciation settings were not assigned beside Dictionary settings")
-local online_fallback_item = menu.pronunciation.sub_item_table[1]
-local generated_fallback_item = menu.pronunciation.sub_item_table[2]
+local generated_item = menu.pronunciation.sub_item_table[1]
+local ai_settings_item = menu.pronunciation.sub_item_table[2]
+equal(generated_item.text_func(), "Generated pronunciation: Local",
+    "generated-pronunciation menu label")
+equal(#generated_item.sub_item_table, 3,
+    "generated-pronunciation menu does not offer Off/Local/AI")
+generated_item.sub_item_table[1].callback()
+equal(Plugin.generated_mode, "off", "Off mode was not saved")
+generated_item.sub_item_table[3].callback()
+equal(Plugin.generated_mode, "ai", "AI mode was not saved")
+truthy(ai_settings_item.enabled_func(), "AI settings disabled in AI mode")
+local provider_items = ai_settings_item.sub_item_table[1].sub_item_table
+equal(#provider_items, 6, "AI provider selection list is incomplete")
 local menu_update_count = 0
-local touchmenu_instance = {
-    updateItems = function()
-        menu_update_count = menu_update_count + 1
-    end,
-}
-Plugin.online_fallback = true
-equal(online_fallback_item.text_func(), "Online fallback: on",
-    "online fallback initial menu label")
-online_fallback_item.callback(touchmenu_instance)
-equal(online_fallback_item.text_func(), "Online fallback: off",
-    "online fallback label did not update after disabling")
-online_fallback_item.callback(touchmenu_instance)
-equal(online_fallback_item.text_func(), "Online fallback: on",
-    "online fallback label did not update after enabling")
-Plugin.generated_fallback = true
-equal(generated_fallback_item.text_func(), "Generated fallback: on",
-    "generated fallback initial menu label")
-generated_fallback_item.callback(touchmenu_instance)
-equal(generated_fallback_item.text_func(), "Generated fallback: off",
-    "generated fallback label did not update after disabling")
-generated_fallback_item.callback(touchmenu_instance)
-equal(generated_fallback_item.text_func(), "Generated fallback: on",
-    "generated fallback label did not update after enabling")
-equal(menu_update_count, 4,
-    "fallback toggles did not refresh the open settings menu")
+provider_items[1].callback({
+    updateItems = function() menu_update_count = menu_update_count + 1 end,
+})
+equal(Plugin.ai_selected_providers.gemini, true,
+    "provider checkbox did not support multiple selection state")
+equal(menu_update_count, 1, "provider checkbox did not refresh the menu")
 local pronunciation_language_menu =
     menu.pronunciation.sub_item_table[3].sub_item_table
 equal(#pronunciation_language_menu, 2,
@@ -514,6 +534,7 @@ equal(Plugin.pronunciation_language, "en",
 pronunciation_language_menu[1].callback()
 equal(Plugin.pronunciation_language, "auto",
     "pronunciation-language menu did not return to Auto")
+Plugin.generated_mode = "local"
 -- Offline packs are discovered from data/{base-code}/ sidecars without
 -- opening SQLite. Locale and ISO aliases select one base-language database.
 local pack_root = "/tmp/pronunciation-koplugin-pack-test"
@@ -646,23 +667,11 @@ equal(Plugin:getOverride("legacy"), nil,
     "legacy English override contaminated a foreign lookup")
 equal(Plugin:generationPack(), nil,
     "foreign pack without G2P fell through to the English model")
-equal(Plugin:generatePronunciations("bonjour"), nil,
+equal(Plugin:generateLocalPronunciations("bonjour"), nil,
     "English G2P generated a foreign-language pronunciation")
-Plugin.cache = { ["language:fr|word:cache-test"] = {{
-    ipa = "/bɔ̃ʒuʁ/", language_code = "fr", source = "foreign fixture",
-}} }
-equal(Plugin:getCache("cache-test")[1].simple, nil,
-    "foreign cache entry used the English readable converter")
-Plugin.cache = {}
-local foreign_online_calls = 0
-local saved_dict_api, saved_wiktionary = Plugin.dictApi, Plugin.wiktionary
-Plugin.dictApi = function() foreign_online_calls = foreign_online_calls + 1 end
-Plugin.wiktionary = function() foreign_online_calls = foreign_online_calls + 1 end
-equal(Plugin:lookupOnline("bonjour"), nil,
-    "foreign lookup returned English online data")
-equal(foreign_online_calls, 0,
-    "foreign lookup contacted English-only online services")
-Plugin.dictApi, Plugin.wiktionary = saved_dict_api, saved_wiktionary
+local ai_identity, ai_prompt_language = Plugin:aiLanguage()
+equal(ai_identity, "fr", "manual language was omitted from AI cache identity")
+equal(ai_prompt_language, "French", "manual language was not passed to AI")
 Plugin.pronunciation_language = "en"
 equal(Plugin:getOverride("chat")[1].ipa, "/tʃæt/",
     "English override was contaminated by the French override")
@@ -746,62 +755,24 @@ Plugin.lookupAndShow = menu_lookup
 -- history must not grow the startup settings table without bound.
 Plugin.generated_cache = { ["generator:2|old"] = {{ ipa = "/oʊld/" }} }
 for index = 1, 140 do
-    Plugin.generated_cache["generator:4|pack:en|test:" .. index] = {{
-        ipa = "/tɛst/", generated = true, language_code = "en",
+    Plugin.generated_cache["generator:5|pack:en|test:" .. index] = {{
+        ipa = "/tɛst/", simple = "TEST", generated = true,
+        language_code = "en",
     }}
 end
-Plugin:saveGeneratedCache("generator:4|pack:en|test:current", {{
-    ipa = "/kɝənt/", generated = true, language_code = "en",
+Plugin:saveGeneratedCache("generator:5|pack:en|test:current", {{
+    ipa = "/kɝənt/", simple = "KER-uhnt", generated = true,
+    language_code = "en",
 }})
 local generated_cache_count = 0
 for key in pairs(Plugin.generated_cache) do
     generated_cache_count = generated_cache_count + 1
-    truthy(key:find("generator:4|", 1, true) == 1,
+    truthy(key:find("generator:5|", 1, true) == 1,
         "stale generator cache version survived pruning")
 end
 truthy(generated_cache_count <= 128, "generated cache limit was not enforced")
-truthy(Plugin.generated_cache["generator:4|pack:en|test:current"],
+truthy(Plugin.generated_cache["generator:5|pack:en|test:current"],
     "new generated cache entry was pruned")
-
--- Online results are recoverable, so their settings cache is bounded and
--- unused descriptions are stripped before serialization.
-Plugin.cache = {}
-for index = 1, 270 do
-    Plugin.cache["cached-" .. index] = {{
-        ipa = "/tɛst/",
-        note = "unused description",
-    }}
-end
-Plugin:saveCache("cached-current", {{
-    ipa = "/kɝənt/",
-    note = "unused description",
-}})
-local sourced_cache_count = 0
-for _, results in pairs(Plugin.cache) do
-    sourced_cache_count = sourced_cache_count + 1
-    equal(results[1].note, nil, "sourced cache retained an unused description")
-end
-truthy(sourced_cache_count <= 256, "sourced cache limit was not enforced")
-truthy(Plugin.cache["language:en|word:cached-current"],
-    "new language-scoped sourced cache entry was pruned")
-local cached_overrides = Plugin.overrides
-local cached_database_open = SQ3.open
-local cached_database_open_count = 0
-Plugin.overrides = {}
-SQ3.open = function()
-    cached_database_open_count = cached_database_open_count + 1
-    error("sourced cache lookup opened the database")
-end
-local cached_sourced, cached_sourced_match =
-    Plugin:lookupOffline("“CACHED-CURRENT”")
-truthy(cached_sourced and cached_sourced[1],
-    "offline lookup did not reuse the normalized sourced cache entry")
-equal(cached_sourced_match, "cached-current",
-    "sourced cache returned the wrong normalized match")
-equal(cached_database_open_count, 1,
-    "sourced cache bypassed a newer exact database pronunciation")
-Plugin.overrides = cached_overrides
-SQ3.open = cached_database_open
 
 truthy(hasCandidate("running", "run", "ing"), "running -> run missing")
 truthy(hasCandidate("stopped", "stop", "past"), "stopped -> stop missing")
@@ -814,7 +785,6 @@ truthy(hasCandidate("lying", "lie", "ing"), "lying -> lie missing")
 local original_open = SQ3.open
 local original_query_connection = Plugin._queryConnection
 local original_overrides = Plugin.overrides
-local original_cache = Plugin.cache
 local open_count, close_count = 0, 0
 local database_mode
 SQ3.open = function(_, mode)
@@ -834,7 +804,6 @@ Plugin._queryConnection = function(_, _, word)
     end
 end
 Plugin.overrides = {}
-Plugin.cache = {}
 local offline_derived, offline_match = Plugin:lookupOffline("running")
 equal(open_count, 1, "offline candidates reopened the database")
 equal(close_count, 1, "offline lookup did not close the database")
@@ -844,7 +813,6 @@ equal(offline_derived[1].ipa, "/ɹʌnɪŋ/", "offline candidate derivation chang
 SQ3.open = original_open
 Plugin._queryConnection = original_query_connection
 Plugin.overrides = original_overrides
-Plugin.cache = original_cache
 
 -- The real query path prepares once and resets the same statement for each
 -- inflection candidate checked on a connection.
@@ -916,250 +884,337 @@ equal(query_connection_close_count, 1,
     "direct query did not close its database connection")
 SQ3.open = query_open
 
-local wiktionary_fixture = [[
-<div class="mw-heading mw-heading2"><h2 id="English">English</h2></div>
-<h3 id="Pronunciation">Pronunciation</h3>
-<ul>
-<li>(General American) IPA: <span class="IPA">/ɹɪˈzum/</span></li>
-<li>(Received Pronunciation) IPA: <span class="IPA">/ɹɪˈzjuːm/</span></li>
-<li>Rhymes: <span class="IPA">-uːm</span></li>
-<li>Suffix: <span class="IPA">/-ʃʊ-/</span></li>
-</ul>
-<div class="mw-heading mw-heading2"><h2 id="Indonesian">Indonesian</h2></div>
-<ul><li>IPA: <span class="IPA">/reˈsume/</span></li></ul>
-]]
-local parsed = Plugin:parseWiktionaryHtml(wiktionary_fixture)
-equal(#parsed, 2, "Wiktionary parser leaked a non-English pronunciation")
-equal(parsed[1].region, "US", "US label was not retained")
-equal(parsed[2].region, "UK", "UK label was not retained")
-truthy(parsed[1].simple, "online readable was not generated")
-equal(parsed[1].simple_approx, true, "generated readable must be identified")
+-- Runtime online dictionary/Wiktionary lookup code is gone; WikiPron remains
+-- a database-builder source and is covered by tests/test_database.py.
+local runtime_file = assert(io.open("main.lua", "r"))
+local runtime = runtime_file:read("*all")
+runtime_file:close()
+truthy(not runtime:find("dictionaryapi.dev", 1, true),
+    "Dictionary API runtime endpoint survived")
+truthy(not runtime:find("en.wiktionary.org", 1, true),
+    "Wiktionary runtime endpoint survived")
+truthy(not runtime:find("parseWiktionary", 1, true),
+    "Wiktionary runtime parser survived")
 
-local dictionary_api = Plugin:parseDictionaryApi({{
-    phonetic = "həˈloʊ",
-    phonetics = {
-        { text = "həˈloʊ", audio = "hello--_us_1.mp3" },
-        { text = "hɛˈləʊ", audio = "hello--_gb_1.mp3" },
-    },
-}})
-equal(#dictionary_api, 2, "Dictionary API duplicate was not removed")
-equal(dictionary_api[1].region, "US", "Dictionary API US label missing")
-equal(dictionary_api[2].region, "UK", "Dictionary API UK label missing")
-truthy(dictionary_api[1].simple, "Dictionary API readable missing")
-local normalized_api = Plugin:parseDictionaryApi({{ phonetic = "/tɛst" }})
-equal(normalized_api[1].ipa, "/tɛst/",
-    "online IPA with one wrapper was not normalized")
+-- Strict two-line validation accepts harmless whitespace and an unambiguous
+-- fence, but rejects prose, missing fields, empty fields, and oversized output.
+local valid_ai = AI.parseOutput(" IPA: /həˈloʊ/ \n Pronunciation: huh-LOH ")
+equal(valid_ai.ipa, "/həˈloʊ/", "AI IPA normalization changed")
+equal(valid_ai.simple, "huh-LOH", "AI readable pronunciation changed")
+truthy(AI.parseOutput("~~~\nIPA: /x/\nPronunciation: X\n~~~") == nil,
+    "nonstandard markdown wrapper was accepted")
+truthy(AI.parseOutput("Here you go\nIPA: /x/\nPronunciation: X") == nil,
+    "surrounding prose was accepted")
+truthy(AI.parseOutput("IPA: //\nPronunciation: X") == nil,
+    "empty IPA was accepted")
+truthy(AI.parseOutput("IPA: /x/\nPronunciation: ") == nil,
+    "empty readable pronunciation was accepted")
+truthy(AI.parseOutput(string.rep("x", AI.MAX_MODEL_TEXT_BYTES + 1)) == nil,
+    "oversized model output was accepted")
+local grave = string.char(96)
+truthy(AI.parseOutput(grave .. "IPA: /x/" .. grave
+    .. "\nPronunciation: X") == nil, "inline markdown was accepted")
+truthy(AI.parseOutput(string.rep(grave, 3)
+    .. "text\nIPA: /tɛst/\nPronunciation: TEST\n"
+    .. string.rep(grave, 3)),
+    "unambiguous fenced response was not normalized")
 
-local dict_api_method = Plugin.dictApi
-local wiktionary_method = Plugin.wiktionary
-Plugin.dictApi = function()
-    return {{ ipa = "/dɪkt/", source = "Dictionary", confidence = 75 }}
+decoded_json.gemini_ok = {
+    candidates = {{ content = { parts = {
+        { text = "ignored", thought = true },
+        { text = "IPA: /dʒɛmɪnaɪ/\nPronunciation: JEM-ih-nye" },
+    } } }},
+}
+decoded_json.openai_ok = {
+    choices = {{ message = {
+        content = "IPA: /oʊpən eɪaɪ/\nPronunciation: OH-puhn ay-EYE",
+    } }},
+}
+decoded_json.claude_ok = {
+    content = {{
+        type = "text",
+        text = "IPA: /klɔd/\nPronunciation: KLAWD",
+    }},
+}
+decoded_json.invalid_ok = {
+    choices = {{ message = { content = "I cannot help with that." } }},
+}
+truthy(AI.extractText("gemini", "gemini_ok"):find("IPA:", 1, true),
+    "Gemini response extraction failed")
+truthy(AI.extractText("openai", "openai_ok"):find("IPA:", 1, true),
+    "OpenAI/DeepSeek response extraction failed")
+truthy(AI.extractText("anthropic", "claude_ok"):find("IPA:", 1, true),
+    "Anthropic response extraction failed")
+truthy(AI.extractText("openai", "missing") == nil,
+    "malformed provider JSON was accepted")
+
+local secret = "SECRET-API-KEY"
+local gemini_config = AI.defaultConfig().gemini
+gemini_config.api_key = secret
+local gemini_request = AI.buildRequest("gemini", gemini_config, "hello",
+    "English (standard US English)")
+truthy(gemini_request.url:find(gemini_config.model, 1, true),
+    "Gemini model was omitted from its URL")
+equal(gemini_request.headers["x-goog-api-key"], secret,
+    "Gemini authentication header changed")
+truthy(not gemini_request.body:find(secret, 1, true),
+    "Gemini API key leaked into its request body")
+local gemini_payload = encoded_payloads[#encoded_payloads]
+equal(gemini_payload.generationConfig.maxOutputTokens, 128,
+    "Gemini output limit is not token-efficient")
+equal(gemini_payload.generationConfig.temperature, 0,
+    "Gemini request is not deterministic")
+truthy(gemini_payload.contents[1].parts[1].text:find(
+    "Word: hello\nLanguage: English", 1, true),
+    "known English language was not sent to Gemini")
+truthy(not gemini_payload.contents[1].parts[1].text:find("book", 1, true),
+    "book context leaked into the pronunciation request")
+
+local openai_config = AI.defaultConfig().openai
+openai_config.api_key = secret
+local openai_request = AI.buildRequest("openai", openai_config, "hello")
+equal(openai_request.headers.Authorization, "Bearer " .. secret,
+    "OpenAI authentication header changed")
+local openai_payload = encoded_payloads[#encoded_payloads]
+equal(openai_payload.max_completion_tokens, 128,
+    "OpenAI output limit is not token-efficient")
+equal(openai_payload.reasoning_effort, "low",
+    "OpenAI reasoning was not minimized")
+truthy(openai_payload.temperature == nil,
+    "unsupported reasoning-model temperature was sent")
+equal(openai_payload.messages[2].content, "Word: hello",
+    "unknown language should be inferred without a Language field")
+local network_response, network_error = AI.request(openai_request, {})
+equal(network_response, nil, "failed HTTP request returned a response")
+equal(network_error, "request failed", "HTTP failure handling changed")
+for _, message in ipairs(log_messages) do
+    truthy(not message:find(secret, 1, true), "API key leaked into logs")
 end
-Plugin.wiktionary = function()
-    return {{ ipa = "/wɪki/", source = "Wiktionary", confidence = 85 }}
+
+local deepseek_config = AI.defaultConfig().deepseek
+deepseek_config.api_key = secret
+AI.buildRequest("deepseek", deepseek_config, "hello")
+local deepseek_payload = encoded_payloads[#encoded_payloads]
+equal(deepseek_payload.max_tokens, 128,
+    "DeepSeek output limit is not token-efficient")
+truthy(deepseek_payload.reasoning_effort == nil,
+    "unsupported DeepSeek reasoning control was sent")
+
+local claude_config = AI.defaultConfig().claude
+claude_config.api_key = secret
+local claude_request = AI.buildRequest("claude", claude_config, "hello")
+equal(claude_request.headers["x-api-key"], secret,
+    "Anthropic authentication header changed")
+local claude_payload = encoded_payloads[#encoded_payloads]
+equal(claude_payload.max_tokens, 128,
+    "Anthropic output limit is not token-efficient")
+
+local custom = AI.defaultConfig().custom1
+custom.api_key = secret
+custom.endpoint = "https://example.invalid/v1/messages"
+custom.model = "example/model"
+custom.format = "anthropic"
+local custom_request = AI.buildRequest("custom1", custom, "hello")
+equal(custom_request.format, "anthropic",
+    "custom Anthropic request format was ignored")
+equal(custom_request.url, custom.endpoint, "custom endpoint was ignored")
+truthy(AI.buildRequest("custom1", {
+    api_key = secret, endpoint = "file:///tmp/no", model = "x", format = "openai",
+}, "hello") == nil, "unsafe custom endpoint was accepted")
+
+local parsed_gemini = AI.query("gemini", gemini_config, "hello", nil, nil,
+    function() return "gemini_ok" end)
+equal(parsed_gemini.provider, "gemini", "single-provider query attribution")
+equal(parsed_gemini.model, gemini_config.model, "single-provider model attribution")
+local malformed, malformed_error = AI.query("openai", openai_config,
+    "hello", nil, nil, function() return "invalid_ok" end)
+equal(malformed, nil, "malformed AI output became a pronunciation")
+equal(malformed_error, "invalid response", "malformed output error changed")
+local failed, failed_error = AI.query("openai", openai_config,
+    "hello", nil, nil, function() return nil, "request failed" end)
+equal(failed, nil, "network failure became a pronunciation")
+equal(failed_error, "request failed", "network failure error changed")
+
+Plugin.settings = {
+    saveSetting = function() end,
+    flush = function() end,
+}
+Plugin.generated_cache = {}
+Plugin.ai_provider_configs = AI.defaultConfig()
+for _, id in ipairs({ "gemini", "openai", "claude" }) do
+    Plugin.ai_provider_configs[id].api_key = secret
 end
-local ordered_online = Plugin:lookupOnline("test")
-equal(ordered_online[1].source, "Wiktionary",
-    "online results were not ordered by confidence")
-Plugin.dictApi = dict_api_method
-Plugin.wiktionary = wiktionary_method
+Plugin.ai_selected_providers = {
+    gemini = true, openai = true, claude = true,
+}
+Plugin.generated_mode = "ai"
+Plugin.pronunciation_language = "en"
+Plugin.language_packs = nil
+Plugin.language_pack_aliases = nil
+local ai_calls = {}
+Plugin.ai_request = function(_, request)
+    ai_calls[#ai_calls + 1] = request.provider
+    if request.provider == "openai" then return nil, "request failed" end
+    return request.provider .. "_ok"
+end
+local multi_results, multi_errors = Plugin:aiGeneratedForWord("hello")
+equal(#ai_calls, 3, "not every selected provider was queried")
+equal(#multi_results, 2, "one provider failure discarded successes")
+equal(#multi_errors, 1, "provider failure was not reported independently")
+equal(multi_results[1].provider, "gemini", "provider result order changed")
+equal(multi_results[2].provider, "claude", "successful Claude result missing")
+local multi_formatted = Plugin:formatAIOutcome("hello", multi_results, multi_errors)
+truthy(multi_formatted:find("Google Gemini (", 1, true),
+    "Gemini/model attribution missing from UI")
+truthy(multi_formatted:find("Anthropic Claude (", 1, true),
+    "Claude/model attribution missing from UI")
+truthy(multi_formatted:find("OpenAI: request failed", 1, true),
+    "failed provider error missing from UI")
 
-local etymology_fixture = [[
-<div class="mw-heading mw-heading2"><h2 id="English">English</h2></div>
-<div class="mw-heading mw-heading3"><h3 id="Etymology">Etymology</h3></div>
-<p><span class="etyl"><a href="/wiki/Spanish">Spanish</a></span>.</p>
-<div class="mw-heading mw-heading3"><h3 id="Noun">Noun</h3></div>
-]]
-local missing_ipa, language_hints = Plugin:parseWiktionaryHtml(etymology_fixture)
-equal(missing_ipa, nil, "etymology-only page invented an exact IPA")
-equal(#language_hints, 1, "Spanish etymology hint missing")
-equal(language_hints[1].code, "es", "Spanish etymology code")
+ai_calls = {}
+Plugin:aiGeneratedForWord("hello")
+equal(#ai_calls, 1, "successful provider cache was not reused")
+equal(ai_calls[1], "openai", "network failures were cached permanently")
 
-local formatted = Plugin:format("resume", parsed, "resume")
-truthy(formatted:find("<formatted><bold>resume</bold>", 1, true) == 1,
+Plugin.generated_cache = {}
+Plugin.ai_selected_providers = { gemini = true }
+ai_calls = {}
+local one_result = Plugin:aiGeneratedForWord("hello")
+equal(#ai_calls, 1, "one selected provider did not execute exactly once")
+equal(#one_result, 1, "single-provider result count changed")
+
+Plugin.generated_cache = {}
+Plugin.ai_selected_providers = {
+    gemini = true, openai = true, claude = true,
+}
+Plugin.ai_request = function(_, request)
+    ai_calls[#ai_calls + 1] = request.provider
+    return request.provider .. "_ok"
+end
+ai_calls = {}
+local all_results, all_errors = Plugin:aiGeneratedForWord("hello")
+equal(#ai_calls, 3, "multi-provider success did not execute every provider")
+equal(#all_results, 3, "multi-provider successes were merged or discarded")
+equal(#all_errors, 0, "successful multi-provider query reported an error")
+truthy(all_results[1].ipa ~= all_results[2].ipa,
+    "differing provider answers were hidden as consensus")
+
+local en_key = Plugin:aiGenerationCacheKey("hello", "en", "openai",
+    openai_config.model)
+local fr_key = Plugin:aiGenerationCacheKey("hello", "fr", "openai",
+    openai_config.model)
+local model_key = Plugin:aiGenerationCacheKey("hello", "en", "openai",
+    openai_config.model .. "-other")
+local provider_key = Plugin:aiGenerationCacheKey("hello", "en", "gemini",
+    openai_config.model)
+local endpoint_key = Plugin:aiGenerationCacheKey("hello", "en", "openai",
+    openai_config.model, "openai|https://another.example/v1")
+truthy(en_key ~= fr_key, "AI cache identity omitted language")
+truthy(en_key ~= model_key, "AI cache identity omitted model")
+truthy(en_key ~= provider_key, "AI cache identity omitted provider")
+truthy(en_key ~= endpoint_key, "AI cache identity omitted custom endpoint")
+
+local saved_discover = Plugin.discoverLanguagePacks
+local saved_document_language = Plugin.documentPronunciationLanguage
+Plugin.discoverLanguagePacks = function()
+    return {
+        en = { code = "en", name = "English" },
+        fr = { code = "fr", name = "French" },
+    }
+end
+Plugin.documentPronunciationLanguage = function() return "fr" end
+Plugin.pronunciation_language = "auto"
+local auto_identity, auto_language = Plugin:aiLanguage()
+equal(auto_identity, "fr", "Auto language missing from AI cache identity")
+equal(auto_language, "French", "Auto language was not passed to AI")
+Plugin.pronunciation_language = "en"
+local manual_identity, manual_language = Plugin:aiLanguage()
+equal(manual_identity, "en", "manual language missing from AI cache identity")
+equal(manual_language, "English (standard US English)",
+    "English standard behavior was not requested")
+Plugin.discoverLanguagePacks = saved_discover
+Plugin.documentPronunciationLanguage = saved_document_language
+Plugin.language_packs = nil
+Plugin.language_pack_aliases = nil
+
+local function containsSecret(value)
+    if type(value) == "string" then return value:find(secret, 1, true) ~= nil end
+    if type(value) ~= "table" then return false end
+    for key, child in pairs(value) do
+        if containsSecret(key) or containsSecret(child) then return true end
+    end
+    return false
+end
+truthy(not containsSecret(Plugin.generated_cache),
+    "API key leaked into the pronunciation cache")
+truthy(not multi_formatted:find(secret, 1, true),
+    "API key leaked into a user-visible error")
+
+local saved_lookup_offline = Plugin.lookupOffline
+local saved_g2p = Plugin._g2pPhones
+local generated_calls, network_calls = 0, 0
+Plugin.lookupOffline = function() return nil end
+Plugin._g2pPhones = function()
+    generated_calls = generated_calls + 1
+    return { "T", "EH1", "S", "T" }, 1
+end
+Plugin.ai_request = function()
+    network_calls = network_calls + 1
+    return "gemini_ok"
+end
+Plugin.generated_cache = {}
+Plugin.generated_mode = "off"
+Plugin:_lookupAndShow("modecheck")
+equal(generated_calls, 0, "Off mode invoked local generation")
+equal(network_calls, 0, "Off mode invoked AI networking")
+Plugin.generated_mode = "local"
+Plugin:_lookupAndShow("modecheck")
+equal(generated_calls, 1, "Local mode did not invoke G2P")
+equal(network_calls, 0, "Local mode silently fell through to AI")
+Plugin.generated_mode = "ai"
+Plugin.ai_selected_providers = { gemini = true }
+Plugin.generated_cache = {}
+local wraps_before_ai = trap_wrap_count
+Plugin:_lookupAndShow("modecheck")
+equal(generated_calls, 1, "AI mode silently fell through to G2P")
+equal(network_calls, 1, "AI mode did not invoke its selected provider")
+equal(trap_wrap_count, wraps_before_ai + 1,
+    "AI network work did not run through KOReader's coroutine trapper")
+
+Plugin.ai_selected_providers = {}
+Plugin.generated_cache = {}
+local no_provider_results, no_provider_errors =
+    Plugin:aiGeneratedForWord("unconfigured")
+equal(no_provider_results, nil, "AI without a provider returned a result")
+truthy(no_provider_errors[1]:find("Select one", 1, true),
+    "AI without a provider did not return an actionable error")
+
+Plugin.lookupOffline = saved_lookup_offline
+Plugin._g2pPhones = saved_g2p
+Plugin.ai_request = nil
+Plugin.generated_mode = "local"
+
+local sourced_fixture = {{
+    ipa = "/ˈkæt/", simple = "KAT", source = "WikiPron/Wiktionary",
+    region = "US", language = "English",
+}}
+local formatted = Plugin:format("cat", sourced_fixture, "cat")
+truthy(formatted:find("<formatted><bold>cat</bold>", 1, true) == 1,
     "queried word was not bolded")
 truthy(formatted:find("IPA (US English):", 1, true),
-    "formatted US English label missing")
-truthy(formatted:find("Readable (approx.):", 1, true),
-    "approximate readable label missing")
-truthy(formatted:find("Source: Wiktionary", 1, true),
-    "compact formatting lost source attribution")
+    "formatted sourced English label missing")
+truthy(formatted:find("Source: WikiPron/Wiktionary", 1, true),
+    "database source attribution changed")
 truthy(not formatted:find("Confidence:", 1, true),
-    "confidence score was not removed from the UI")
-truthy(not formatted:find("learned online and cached locally", 1, true),
-    "source description was not removed")
-local ptf_header = TextBoxWidget.PTF_HEADER
-TextBoxWidget.PTF_HEADER = nil
-local legacy_formatted = Plugin:format("resume", parsed, "resume")
-equal(legacy_formatted:sub(1, #"resume"), "resume",
-    "old KOReader heading fallback changed the query")
-TextBoxWidget.PTF_HEADER = ptf_header
+    "confidence score appeared in the UI")
 local generated_formatted = Plugin:format("zyrathion", fantasy, "zyrathion")
 truthy(generated_formatted:find("IPA (generated; US English):", 1, true),
-    "generated IPA label missing")
+    "local generated IPA label missing")
 
 local original_overrides = Plugin.overrides
 Plugin.overrides = { cat = { ipa = "[kæt]", simple = "KAT" } }
 equal(Plugin:getOverride("cat")[1].ipa, "/kæt/",
     "stored override IPA was not normalized")
 Plugin.overrides = original_overrides
-
--- Older KOReader builds without the repaint scheduling helpers still perform
--- an exact offline lookup and close the progress popup synchronously.
-local lookup_offline = Plugin.lookupOffline
-local next_tick = UIManager.nextTick
-local force_repaint = UIManager.forceRePaint
-Plugin.lookupOffline = function()
-    return {{
-        ipa = "/ˈkæt/",
-        source = "Fixture dictionary",
-        confidence = 95,
-    }}, "cat"
-end
-UIManager.nextTick = nil
-UIManager.forceRePaint = nil
-shown_widgets = {}
-closed_widgets = {}
-Plugin:lookupAndShow("cat")
-equal(#shown_widgets, 2, "legacy offline lookup did not show progress and result")
-equal(shown_widgets[1].text, "Looking up pronunciation…",
-    "legacy offline progress text changed")
-equal(closed_widgets[1], shown_widgets[1],
-    "legacy offline progress was not closed")
-truthy(shown_widget.text:find("Source: Fixture dictionary", 1, true),
-    "legacy offline result was not shown")
-Plugin.lookupOffline = lookup_offline
-UIManager.nextTick = next_tick
-UIManager.forceRePaint = force_repaint
-
--- End-to-end missing-word flow: sourced online lookup is attempted first,
--- then an unsupported language hint safely uses the general English fallback.
-Plugin.cache = {}
-Plugin.generated_cache = {}
-Plugin.settings = {
-    saveSetting = function() end,
-    flush = function() end,
-}
-Plugin.lookupOffline = function() return nil end
-local online_lookup_calls = 0
-Plugin.lookupOnline = function()
-    online_lookup_calls = online_lookup_calls + 1
-    return nil, {{ code = "es", name = "Spanish" }}
-end
-Plugin.online_fallback = true
-local online_g2p_method = Plugin._g2pPhones
-local online_g2p_calls = 0
-Plugin._g2pPhones = function(plugin, pack, word)
-    online_g2p_calls = online_g2p_calls + 1
-    return online_g2p_method(plugin, pack, word)
-end
-shown_widget = nil
-shown_widgets = {}
-closed_widgets = {}
-repaint_count = 0
-next_tick_count = 0
-Plugin:lookupAndShow("zyrathion")
-equal(#shown_widgets, 2, "online lookup did not reuse its painted progress popup")
-equal(shown_widgets[1].text, "Looking up pronunciation…",
-    "lookup progress text changed")
-equal(shown_widgets[1].dismissable, false,
-    "lookup progress can be dismissed while work is running")
-equal(repaint_count, 1, "lookup progress was not painted before blocking work")
-equal(next_tick_count, 2, "lookup work did not yield to the UI event loop")
-equal(online_lookup_calls, 1, "missing-word flow repeated its online lookup")
-equal(closed_widgets[1], shown_widgets[1], "offline progress was not closed")
-truthy(shown_widget and shown_widget.text, "missing-word result was not shown")
-truthy(shown_widget.text:find("MFA/Pynini", 1, true),
-    "missing-word flow lost generated provenance")
-truthy(shown_widget.text:find("generated; US English", 1, true),
-    "missing-word flow lost generated provenance")
-local shown_before_cached_lookup = #shown_widgets
-local repaint_before_cached_lookup = repaint_count
-local ticks_before_cached_lookup = next_tick_count
-Plugin:lookupAndShow("“ZYRATHION”")
-equal(online_g2p_calls, 1,
-    "online missing-word flow regenerated an existing cached pronunciation")
-equal(online_lookup_calls, 2,
-    "cached generation bypassed a newly available online source")
-equal(#shown_widgets, shown_before_cached_lookup + 2,
-    "source-priority recheck did not show progress and result")
-equal(repaint_count, repaint_before_cached_lookup + 1,
-    "source-priority recheck did not repaint its progress popup")
-equal(next_tick_count, ticks_before_cached_lookup + 2,
-    "source-priority recheck did not yield around online work")
-Plugin._g2pPhones = online_g2p_method
-
--- A canceled Wi-Fi prompt never runs its callback, so the first progress
--- message must be closed before control passes to KOReader's network manager.
-local run_when_online = NetworkMgr.runWhenOnline
-NetworkMgr.runWhenOnline = function() end
-shown_widgets = {}
-closed_widgets = {}
-Plugin:lookupAndShow("cancelled")
-equal(#shown_widgets, 1, "network handoff showed an unexpected popup")
-equal(#closed_widgets, 1, "network handoff stranded its progress popup")
-equal(closed_widgets[1], shown_widgets[1],
-    "network handoff did not close the initial progress popup")
-
--- If KOReader connects asynchronously, the plugin paints a new progress popup
--- immediately before the deferred HTTP lookup.
-local pending_online_callback
-NetworkMgr.runWhenOnline = function(_, callback)
-    pending_online_callback = callback
-end
-shown_widgets = {}
-closed_widgets = {}
-repaint_count = 0
-next_tick_count = 0
-Plugin:lookupAndShow("delayed")
-equal(#shown_widgets, 1, "deferred lookup showed an early online popup")
-equal(#closed_widgets, 1, "deferred lookup stranded its initial popup")
-truthy(pending_online_callback, "deferred lookup callback was not retained")
-pending_online_callback()
-equal(#shown_widgets, 3, "deferred online progress or result was not shown")
-equal(shown_widgets[2].text, "Looking up pronunciation…",
-    "deferred online progress text changed")
-equal(closed_widgets[2], shown_widgets[2],
-    "deferred online progress was not closed")
-equal(repaint_count, 2, "deferred online progress was not painted")
-NetworkMgr.runWhenOnline = run_when_online
-
-Plugin.cache = {}
-Plugin.generated_cache = {}
-Plugin.lookupOnline = function()
-    return {{
-        ipa = "/sɔːst/",
-        source = "Wiktionary",
-        confidence = 85,
-    }}, {{ code = "es", name = "Spanish" }}
-end
-Plugin.generatePronunciations = function()
-    error("generated fallback ran despite a sourced result")
-end
-Plugin:lookupAndShow("sourced")
-truthy(shown_widget.text:find("Source: Wiktionary", 1, true),
-    "sourced result did not win over generation")
-truthy(not shown_widget.text:find("generated", 1, true),
-    "sourced result was mislabeled as generated")
-
--- An optional HTML path allows a live MediaWiki response to be checked without
--- making the normal regression suite depend on network access.
-if arg[1] then
-    local fixture = assert(io.open(arg[1], "r"))
-    local live_html = fixture:read("*all")
-    fixture:close()
-    local live_results = assert(Plugin:parseWiktionaryHtml(live_html))
-    local has_us, has_uk = false, false
-    for _, result in ipairs(live_results) do
-        if result.ipa == "/reˈsume/" then
-            error("live parser leaked the Indonesian pronunciation")
-        end
-        has_us = has_us or result.region == "US"
-        has_uk = has_uk or result.region == "UK"
-    end
-    truthy(has_us, "live parser lost US labels")
-    truthy(has_uk, "live parser lost UK labels")
-    print("live English Wiktionary pronunciations:", #live_results)
-end
 
 print("plugin regression tests: OK")

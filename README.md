@@ -1,6 +1,7 @@
 # Pronunciation Dictionary for KOReader
 
-Offline IPA and readable pronunciation lookup for KOReader.
+English-first IPA and readable pronunciation lookup for KOReader, with
+offline language packs and optional local or AI generation.
 
 ## Features
 
@@ -8,8 +9,9 @@ Offline IPA and readable pronunciation lookup for KOReader.
 - Bundled English pack with US and UK pronunciations from WikiPron
 - Automatic book-language detection and manual installed-pack selection
 - Readable spellings, IPA, regional labels, and source attribution
-- Offline estimates for unfamiliar names and invented words
-- Optional online fallback through Dictionary API and English Wiktionary
+- Optional local G2P estimates for unfamiliar names and invented words
+- Optional low-token AI generation through one or more independently queried
+  providers
 - Personal pronunciation overrides
 
 ## Screenshots
@@ -52,15 +54,27 @@ If you use the Storefront plugin manager for KOReader, you can install and updat
 
 Settings are under **Search → Settings → Pronunciation settings**:
 
-- **Online fallback** enables Dictionary API and Wiktionary lookup.
-- **Generated fallback** enables the selected pack's unfamiliar-word model,
-  when that language pack includes a compatible model.
+- **Generated pronunciation** has three predictable modes:
+  - **Off** uses only personal overrides, sourced language-pack records, and
+    existing local inflection derivation.
+  - **Local** additionally uses the selected pack's `g2p.bin` model.
+  - **AI** queries every selected, usable AI provider. It never silently falls
+    back to Local.
+- **AI settings → Providers** supports selecting any combination of Google
+  Gemini, OpenAI, DeepSeek, Anthropic Claude, and two custom API slots.
+- **AI settings → API keys and models** configures each provider. Custom slots
+  additionally accept an endpoint and OpenAI-compatible or Anthropic request
+  format.
 - **Pronunciation language** offers **Auto** plus every installed offline pack.
   Auto normalizes locales such as `en-US` or `fr-CA` to their base language
   and uses English when the requested pack is unavailable.
-- **Clear cached pronunciations** removes sourced and generated caches without deleting personal overrides.
->[!Note]
-> Turning off online fallback can greatly increase the time it takes to generate a pronunciation.
+- **Clear cached pronunciations** removes local-G2P and AI results without
+  deleting personal overrides.
+
+API keys are stored in KOReader's persistent pronunciation settings. They are
+not written to pronunciation caches, logs, release files, or error messages.
+If AI mode has no selected provider with the required key/model/endpoint, the
+lookup reports what must be configured.
 
 ## Lookup order
 
@@ -68,17 +82,22 @@ Settings are under **Search → Settings → Pronunciation settings**:
 2. The selected installed language pack (the bundled English pack contains
    US/UK WikiPron data plus the project supplement)
 3. English inflection derived from a known base
-4. A cached sourced result
-5. Dictionary API and the English section of Wiktionary (English only)
-6. The selected pack's cached or newly generated G2P estimate
+4. A valid cached result for the selected generation mode
+5. A newly generated Local G2P or AI result, according to the selected mode
 
-Personal overrides return immediately. Current offline sourced data is checked
-before reusable online or generated cache entries, so pack updates cannot be
-masked by stale approximations. Generated entries are labeled `generated`, and
-readable text derived from IPA is labeled `approx.`
+Personal overrides return immediately. Current offline sourced data and valid
+local derivations are checked before reusable generated cache entries, so pack
+updates cannot be masked by stale estimates. Generated entries are labeled
+`generated`, and readable text derived from IPA is labeled `approx.`
 An installed foreign-language pack is not followed by an English-database
-lookup, English online lookup, or English G2P estimate merely because a word is
-absent from it.
+lookup or English G2P estimate merely because a word is absent from it.
+
+AI cache entries are isolated by normalized word, language, provider, model,
+custom endpoint/format fingerprint, and generator version. With several
+providers selected, every provider is queried independently and each successful
+IPA/readable pair is shown with its
+provider and model. Disagreements are displayed rather than merged. One
+provider's failure does not discard the others, and failures are not cached.
 
 ## Optional language packs
 
@@ -114,14 +133,16 @@ Full terms, attribution, release provenance, artifact hashes, and modifications 
 ## Limitations
 
 Only English is bundled by default. Optional packs always include sourced IPA
-and a language-specific readable approximation. Generated fallback is added
+and a language-specific readable approximation. Local generation is available
 when the official MFA catalog has a compatible model; languages without one
-remain fully usable for database lookup. The readable converter is learned from proportional IPA/spelling
+remain fully usable for database lookup and may use AI mode. The readable converter is learned from proportional IPA/spelling
 alignments and is an aid rather than a phonological transliteration standard.
 Spelling alone cannot determine an author's intended pronunciation,
 especially for names and fictional words. Generated IPA and readable spellings
-are estimates. Disable **Generated fallback** when only sourced results are
-wanted.
+are estimates. Select **Generated pronunciation → Off** when only sourced and
+existing non-generated results are wanted. AI availability, model behavior,
+cost, quotas, and privacy are determined by the configured provider; normal
+offline English lookup remains usable when AI is unavailable.
 
 ## Contributing
 

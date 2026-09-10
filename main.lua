@@ -5,11 +5,10 @@ local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
 local _ = require("gettext")
 
--- Keep database, network, JSON, and dialog modules out of the plugin's startup
+-- Keep database, AI networking, and dialog modules out of the plugin's startup
 -- footprint. They are loaded only when the corresponding feature is used.
-local DictQuickLookup, InfoMessage, InputDialog, JSON, LFS, NetworkMgr, SQ3
+local AI, DictQuickLookup, InfoMessage, InputDialog, LFS, NetworkMgr, SQ3
 local TextBoxWidget
-local ltn12, socket, http, socketutil, url
 
 local function sqliteModule()
     if not SQ3 then SQ3 = require("lua-ljsqlite3/init") end
@@ -20,20 +19,25 @@ local function openDatabase(path)
     return sqliteModule().open(path, "ro")
 end
 
+local function aiModule(plugin)
+    if not AI then AI = dofile((plugin and plugin.path or ".") .. "/ai.lua") end
+    return AI
+end
+
 local function newInfoMessage(options)
     if not InfoMessage then InfoMessage = require("ui/widget/infomessage") end
     return InfoMessage:new(options)
 end
 
-local function showLookupProgress()
+local function showLookupProgress(dismissable)
     local progress = newInfoMessage{
         text = _("Looking up pronunciation…"),
-        dismissable = false,
+        dismissable = dismissable == true,
         show_icon = false,
     }
     UIManager:show(progress)
-    -- Make the message visible before database, G2P, or HTTP work blocks the
-    -- event loop. Guard both APIs for compatibility with older KOReader builds.
+    -- Make the message visible before database, G2P, or subprocess work starts.
+    -- Guard the repaint API for compatibility with older KOReader builds.
     if type(UIManager.forceRePaint) == "function" then
         UIManager:forceRePaint()
     end
@@ -57,6 +61,15 @@ local function afterLookupProgress(callback)
     end
 end
 
+local function runInTrapper(callback)
+    local ok, Trapper = pcall(require, "ui/trapper")
+    if ok and Trapper and type(Trapper.wrap) == "function" then
+        Trapper:wrap(callback)
+    else
+        callback()
+    end
+end
+
 local function runLookupSafely(word, progress, callback)
     local ok, error_message = pcall(callback)
     if ok then return end
@@ -65,21 +78,10 @@ local function runLookupSafely(word, progress, callback)
         word .. "\n\n" .. _("Pronunciation lookup failed. Please try again."))
 end
 
-local function loadOnlineModules()
-    if http then return end
-    JSON = require("json")
-    ltn12 = require("ltn12")
-    socket = require("socket")
-    http = require("socket.http")
-    socketutil = require("socketutil")
-    url = require("socket.url")
-end
-
 local PLUGIN_VERSION = "0.9.0"
 local DICTIONARY_BUTTON_ID = "pronunciation_lookup"
-local CACHE_VERSION = 7
-local GENERATOR_VERSION = 4
-local SOURCED_CACHE_LIMIT = 256
+local CACHE_VERSION = 8
+local GENERATOR_VERSION = 5
 local GENERATED_CACHE_LIMIT = 128
 local GENERATED_CACHE_PREFIX = "generator:" .. GENERATOR_VERSION .. "|"
 
@@ -397,7 +399,7 @@ local function ensureReadables(results)
     return results
 end
 
-local normalizeOnlineIpa
+local normalizeGeneratedIpa = wrapIpa
 
 local LANGUAGE_DEFINITIONS = {
     catalan = { code = "ca", name = "Catalan" },
@@ -559,13 +561,21 @@ function Pronunciation:normalizePronunciationLanguage(value)
     return base and aliases[base] or nil
 end
 
-function Pronunciation:documentPronunciationLanguage()
+function Pronunciation:documentLanguageValues()
     local document = self.ui and self.ui.document
-    if not document or type(document.getProps) ~= "function" then return nil end
+    if not document or type(document.getProps) ~= "function" then return {} end
     local ok, properties = pcall(document.getProps, document)
     if not ok or type(properties) ~= "table"
-            or type(properties.language) ~= "string" then return nil end
+            or type(properties.language) ~= "string" then return {} end
+    local values = {}
     for value in properties.language:gmatch("[^,;]+") do
+        values[#values + 1] = value
+    end
+    return values
+end
+
+function Pronunciation:documentPronunciationLanguage()
+    for _, value in ipairs(self:documentLanguageValues()) do
         local code = self:normalizePronunciationLanguage(value)
         if code then return code end
     end
@@ -592,26 +602,6 @@ function Pronunciation:installedLanguagePacks()
         return left.code < right.code
     end)
     return ordered
-end
-
-local function mergeLanguageHints(...)
-    local merged = {}
-    local seen = {}
-    for index = 1, select("#", ...) do
-        for _, hint in ipairs(select(index, ...) or {}) do
-            local definition = languageDefinition(hint.name, hint.code)
-            if definition and not seen[definition.code] then
-                seen[definition.code] = true
-                merged[#merged + 1] = {
-                    code = definition.code,
-                    name = definition.name,
-                    region = definition.region,
-                    source = hint.source,
-                }
-            end
-        end
-    end
-    return merged
 end
 
 local ARPABET_IPA = {
@@ -1212,14 +1202,14 @@ function Pronunciation:generationPack()
     if selected and selected.g2p_path then return selected end
 end
 
-function Pronunciation:generatePronunciations(word)
-    if not self.generated_fallback then return nil end
+function Pronunciation:generateLocalPronunciations(word)
+    if self.generated_mode ~= "local" then return nil end
     local pack = self:generationPack()
     local phones, output_format = self:_g2pPhones(pack, word)
     if not phones then return nil end
     local ipa = output_format == 1 and arpabetPhonesToIpa(phones)
         or wrapIpa(table.concat(phones))
-    ipa = normalizeOnlineIpa(ipa)
+    ipa = normalizeGeneratedIpa(ipa)
     if not ipa then return nil end
     local simple = output_format == 2
         and self:_readableFromPhones(pack, phones) or nil
@@ -1238,12 +1228,12 @@ function Pronunciation:generatePronunciations(word)
     }}
 end
 
-function Pronunciation:generationCacheKey(word)
+function Pronunciation:localGenerationCacheKey(word)
     local pack = self:generationPack()
     local pack_code = pack and pack.code or "none"
     local model_hash = pack and pack.g2p_sha256 or "none"
     local readable_hash = pack and pack.readable_sha256 or "none"
-    return "generator:" .. GENERATOR_VERSION
+    return "generator:" .. GENERATOR_VERSION .. "|mode:local"
         .. "|pack:" .. pack_code
         .. "|model:" .. model_hash
         .. "|readable:" .. readable_hash
@@ -1293,10 +1283,6 @@ local function pruneResultCache(cache, limit, protected_key, required_prefix)
     return changed
 end
 
-local function pruneSourcedCache(cache, protected_key)
-    return pruneResultCache(cache, SOURCED_CACHE_LIMIT, protected_key)
-end
-
 local function pruneGeneratedCache(cache, protected_key)
     return pruneResultCache(cache, GENERATED_CACHE_LIMIT, protected_key,
         GENERATED_CACHE_PREFIX)
@@ -1310,41 +1296,60 @@ function Pronunciation:init()
     self.readable_converters = {}
     self.settings = LuaSettings:open(DataStorage:getSettingsDir() .. "/pronunciation.lua")
     self.overrides = self.settings:readSetting("overrides", {})
-    self.cache = self.settings:readSetting("cache", {})
     self.generated_cache = self.settings:readSetting("generated_cache", {})
     if type(self.overrides) ~= "table" then self.overrides = {} end
-    if type(self.cache) ~= "table" then self.cache = {} end
     if type(self.generated_cache) ~= "table" then self.generated_cache = {} end
-    self.online_fallback = self.settings:readSetting("online_fallback", true)
-    self.generated_fallback = self.settings:readSetting("generated_fallback", true)
+    local settings_changed = false
+    self.generated_mode = self.settings:readSetting("generated_mode")
+    if self.generated_mode ~= "off" and self.generated_mode ~= "local"
+            and self.generated_mode ~= "ai" then
+        -- The former generated-fallback switch controlled local G2P. Preserve
+        -- that intent while removing the unrelated online-fallback setting.
+        self.generated_mode = self.settings:readSetting(
+            "generated_fallback", true) and "local" or "off"
+        self.settings:saveSetting("generated_mode", self.generated_mode)
+        settings_changed = true
+    end
+    local ai = aiModule(self)
+    self.ai_provider_configs = ai.normalizeConfigs(
+        self.settings:readSetting("ai_provider_configs", {}))
+    self.ai_selected_providers = self.settings:readSetting(
+        "ai_selected_providers", {})
+    if type(self.ai_selected_providers) ~= "table" then
+        self.ai_selected_providers = {}
+    end
+    if type(self.settings.delSetting) == "function" then
+        for _, key in ipairs({
+            "online_fallback", "generated_fallback", "cache",
+        }) do
+            if self.settings:readSetting(key) ~= nil then
+                self.settings:delSetting(key)
+                settings_changed = true
+            end
+        end
+    end
     self.pronunciation_language = self.settings:readSetting(
         "pronunciation_language", "auto")
     if type(self.pronunciation_language) ~= "string"
             or self.pronunciation_language == "" then
         self.pronunciation_language = "auto"
     end
-    -- v0.5 separates sourced and generated caches. Generated entries are
-    -- versioned and keyed by the generator languages that produced them.
+    -- Cache v8 removes the former online-source cache and gives Local and AI
+    -- generation distinct, language-aware identities.
     if self.settings:readSetting("cache_version") ~= CACHE_VERSION then
-        self.cache = {}
         self.generated_cache = {}
-        self.settings:saveSetting("cache", self.cache)
         self.settings:saveSetting("generated_cache", self.generated_cache)
         self.settings:saveSetting("cache_version", CACHE_VERSION)
         self.settings:flush()
     else
         -- Old generator formats are never reused, and generated entries can
-        -- always be recreated offline. Both recoverable caches remain bounded
-        -- so pronunciation.lua cannot grow indefinitely on long-lived devices.
-        local cache_changed = pruneSourcedCache(self.cache)
+        -- always be recreated. Keep the recoverable cache bounded so
+        -- pronunciation.lua cannot grow indefinitely on long-lived devices.
         local generated_changed = pruneGeneratedCache(self.generated_cache)
-        if cache_changed then
-            self.settings:saveSetting("cache", self.cache)
-        end
         if generated_changed then
             self.settings:saveSetting("generated_cache", self.generated_cache)
         end
-        if cache_changed or generated_changed then self.settings:flush() end
+        if generated_changed or settings_changed then self.settings:flush() end
     end
 
     self.ui.menu:registerToMainMenu(self)
@@ -1526,6 +1531,70 @@ function Pronunciation:onShowPronunciationLookup(selection)
     return true
 end
 
+local function updateTouchMenu(touchmenu_instance)
+    if touchmenu_instance
+            and type(touchmenu_instance.updateItems) == "function" then
+        touchmenu_instance:updateItems()
+    end
+end
+
+function Pronunciation:setGeneratedMode(mode)
+    if mode ~= "off" and mode ~= "local" and mode ~= "ai" then return end
+    self.generated_mode = mode
+    self.settings:saveSetting("generated_mode", mode)
+    self.settings:flush()
+end
+
+function Pronunciation:setAIProviderSelected(provider_id, selected)
+    if not aiModule(self).provider(provider_id) then return end
+    self.ai_selected_providers[provider_id] = selected == true or nil
+    self.settings:saveSetting("ai_selected_providers",
+        self.ai_selected_providers)
+    self.settings:flush()
+end
+
+function Pronunciation:saveAIProviderConfig(provider_id, field, value)
+    local config = self.ai_provider_configs[provider_id]
+    if not config or (field ~= "api_key" and field ~= "model"
+            and field ~= "endpoint" and field ~= "format") then return end
+    value = trim(value)
+    if field == "format" and value ~= "openai" and value ~= "anthropic" then
+        return
+    end
+    config[field] = value
+    self.settings:saveSetting("ai_provider_configs", self.ai_provider_configs)
+    self.settings:flush()
+end
+
+function Pronunciation:showAISettingDialog(provider_id, field, title, hint)
+    local config = self.ai_provider_configs[provider_id]
+    if not config then return end
+    if not InputDialog then InputDialog = require("ui/widget/inputdialog") end
+    local dialog
+    dialog = InputDialog:new{
+        title = title,
+        input = config[field] or "",
+        input_hint = hint,
+        input_type = "text",
+        buttons = {{
+            {
+                text = _("Cancel"), id = "close",
+                callback = function() UIManager:close(dialog) end,
+            },
+            {
+                text = _("Save"), is_enter_default = true,
+                callback = function()
+                    self:saveAIProviderConfig(provider_id, field,
+                        dialog:getInputText() or "")
+                    UIManager:close(dialog)
+                end,
+            },
+        }},
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
 function Pronunciation:addToMainMenu(menu_items)
     local pronunciation_language_items = {
         {
@@ -1551,42 +1620,118 @@ function Pronunciation:addToMainMenu(menu_items)
         callback = function() self:onShowPronunciationLookup() end,
     }
 
+    local generated_mode_items = {}
+    for _, choice in ipairs({
+        { id = "off", name = _("Off") },
+        { id = "local", name = _("Local") },
+        { id = "ai", name = _("AI") },
+    }) do
+        local mode, name = choice.id, choice.name
+        generated_mode_items[#generated_mode_items + 1] = {
+            text = name,
+            checked_func = function() return self.generated_mode == mode end,
+            callback = function() self:setGeneratedMode(mode) end,
+        }
+    end
+
+    local provider_selection_items = {}
+    local provider_configuration_items = {}
+    for _, provider in ipairs(aiModule(self).providers) do
+        local provider_id, provider_name = provider.id, provider.name
+        provider_selection_items[#provider_selection_items + 1] = {
+            text = provider_name,
+            checked_func = function()
+                return self.ai_selected_providers[provider_id] == true
+            end,
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                self:setAIProviderSelected(provider_id,
+                    self.ai_selected_providers[provider_id] ~= true)
+                updateTouchMenu(touchmenu_instance)
+            end,
+        }
+        local config_items = {
+            {
+                text_func = function()
+                    local key = self.ai_provider_configs[provider_id].api_key
+                    return _("API key") .. ": "
+                        .. (key ~= "" and _("configured") or _("not set"))
+                end,
+                callback = function()
+                    self:showAISettingDialog(provider_id, "api_key",
+                        provider_name .. " — " .. _("API key"))
+                end,
+            },
+            {
+                text_func = function()
+                    return _("Model") .. ": "
+                        .. (self.ai_provider_configs[provider_id].model or "")
+                end,
+                callback = function()
+                    self:showAISettingDialog(provider_id, "model",
+                        provider_name .. " — " .. _("Model"))
+                end,
+            },
+        }
+        if provider_id == "custom1" or provider_id == "custom2" then
+            config_items[#config_items + 1] = {
+                text_func = function()
+                    return _("Endpoint") .. ": "
+                        .. (self.ai_provider_configs[provider_id].endpoint or "")
+                end,
+                callback = function()
+                    self:showAISettingDialog(provider_id, "endpoint",
+                        provider_name .. " — " .. _("Endpoint"),
+                        "https://…/v1/chat/completions")
+                end,
+            }
+            config_items[#config_items + 1] = {
+                text_func = function()
+                    return _("API format") .. ": "
+                        .. self.ai_provider_configs[provider_id].format
+                end,
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    local format = self.ai_provider_configs[provider_id].format
+                    self:saveAIProviderConfig(provider_id, "format",
+                        format == "openai" and "anthropic" or "openai")
+                    updateTouchMenu(touchmenu_instance)
+                end,
+            }
+        end
+        provider_configuration_items[#provider_configuration_items + 1] = {
+            text = provider_name,
+            sub_item_table = config_items,
+        }
+    end
+
     menu_items.pronunciation = {
         sorting_hint = "search_settings",
         text = _("Pronunciation settings"),
         sub_item_table = {
             {
                 text_func = function()
-                    return self.online_fallback
-                        and _("Online fallback: on") or _("Online fallback: off")
+                    local labels = {
+                        off = _("Off"), ["local"] = _("Local"), ai = _("AI"),
+                    }
+                    return _("Generated pronunciation") .. ": "
+                        .. (labels[self.generated_mode] or _("Off"))
                 end,
-                keep_menu_open = true,
-                callback = function(touchmenu_instance)
-                    self.online_fallback = not self.online_fallback
-                    self.settings:saveSetting("online_fallback", self.online_fallback)
-                    self.settings:flush()
-                    if touchmenu_instance
-                            and type(touchmenu_instance.updateItems) == "function" then
-                        touchmenu_instance:updateItems()
-                    end
-                end,
+                sub_item_table = generated_mode_items,
             },
             {
-                text_func = function()
-                    return self.generated_fallback
-                        and _("Generated fallback: on") or _("Generated fallback: off")
-                end,
-                keep_menu_open = true,
-                callback = function(touchmenu_instance)
-                    self.generated_fallback = not self.generated_fallback
-                    self.settings:saveSetting("generated_fallback",
-                        self.generated_fallback)
-                    self.settings:flush()
-                    if touchmenu_instance
-                            and type(touchmenu_instance.updateItems) == "function" then
-                        touchmenu_instance:updateItems()
-                    end
-                end,
+                text = _("AI settings"),
+                enabled_func = function() return self.generated_mode == "ai" end,
+                sub_item_table = {
+                    {
+                        text = _("Providers"),
+                        sub_item_table = provider_selection_items,
+                    },
+                    {
+                        text = _("API keys and models"),
+                        sub_item_table = provider_configuration_items,
+                    },
+                },
             },
             {
                 text_func = function()
@@ -1603,9 +1748,7 @@ function Pronunciation:addToMainMenu(menu_items)
             {
                 text = _("Clear cached pronunciations"),
                 callback = function()
-                    self.cache = {}
                     self.generated_cache = {}
-                    self.settings:saveSetting("cache", self.cache)
                     self.settings:saveSetting("generated_cache",
                         self.generated_cache)
                     self.settings:flush()
@@ -1615,7 +1758,7 @@ function Pronunciation:addToMainMenu(menu_items)
                 text = _("About pronunciation dictionary"),
                 callback = function()
                     UIManager:show(newInfoMessage{
-                        text = _("Offline language packs with automatic book-language selection, sourced online lookup, and a bundled US English fallback for unfamiliar words. Long-press Pronunciation to save an override.")
+                        text = _("Offline language packs with automatic book-language selection, optional local or AI generation, and personal overrides. Long-press Pronunciation to save an override.")
                             .. "\n\n" .. _("Version") .. ": " .. PLUGIN_VERSION,
                     })
                 end,
@@ -1651,29 +1794,6 @@ function Pronunciation:getOverride(word)
             confidence = 100,
             simple_approx = false,
         }}
-    end
-end
-
-function Pronunciation:getCache(word)
-    local normalized = normalizeWord(word)
-    local pack = self:selectedLanguagePack()
-    local code = pack and pack.code or "none"
-    local cached = (self.cache or {})[
-        "language:" .. code .. "|word:" .. normalized]
-    -- v0.6 and earlier cached English online results by unscoped word. They
-    -- remain safe to reuse only while the English pack is selected.
-    if not cached and code == "en" then cached = (self.cache or {})[normalized] end
-    if type(cached) == "table" and #cached > 0 then
-        for _, result in ipairs(cached) do
-            if type(result) ~= "table"
-                    or type(result.ipa) ~= "string"
-                    or not wrapIpa(result.ipa)
-                    or (result.language_code and result.language_code ~= code)
-                    or (code ~= "en" and not result.language_code) then
-                return nil
-            end
-        end
-        return ensureReadables(cached)
     end
 end
 
@@ -1970,331 +2090,51 @@ function Pronunciation:lookupOffline(word)
             and self:candidates(word) or {}) do
         local base = self:getOverride(candidate.word)
             or queryDatabase(candidate.word)
-            or self:getCache(candidate.word)
         if base then
             local derived = self:derive(base, candidate.kind, candidate.word)
             if derived then return finish(derived, candidate.word) end
         end
     end
-    results = self:getCache(word)
-    if results then return finish(results, word) end
     return finish()
 end
 
-local function httpGet(request_url)
-    loadOnlineModules()
-    local sink = {}
-    socketutil:set_timeout()
-    local ok, code, headers, status = pcall(function()
-        return socket.skip(1, http.request{
-            url = request_url,
-            method = "GET",
-            sink = socketutil.table_sink and socketutil.table_sink(sink)
-                or ltn12.sink.table(sink),
-            headers = {
-                ["Accept"] = "application/json",
-                ["Accept-Encoding"] = "identity",
-                ["User-Agent"] = socketutil.USER_AGENT
-                    or "KOReader-Pronunciation/" .. PLUGIN_VERSION,
-            },
-        })
-    end)
-    socketutil:reset_timeout()
-    if not ok or code ~= 200 then
-        logger.warn("Pronunciation: HTTP request failed:", request_url, status or code)
-        return nil
+local function cachePart(value)
+    local escaped = tostring(value or ""):gsub("%%", "%%25")
+        :gsub("|", "%%7C"):gsub("[\r\n]", "")
+    return escaped
+end
+
+local function cacheHash(value)
+    local hash = 5381
+    value = tostring(value or "")
+    for index = 1, #value do
+        hash = (hash * 33 + value:byte(index)) % 4294967296
     end
-    return table.concat(sink), headers
+    return string.format("%08x", hash)
 end
 
-local function decodeEntities(text)
-    return (text or "")
-        :gsub("&nbsp;", " ")
-        :gsub("&amp;", "&")
-        :gsub("&lt;", "<")
-        :gsub("&gt;", ">")
-        :gsub("&#39;", "'")
-        :gsub("&quot;", '"')
-end
-
-local function stripHtml(text)
-    return trim(decodeEntities((text or ""):gsub("<.->", " "))
-        :gsub("%s+", " "))
-end
-
-local function inferRegion(label)
-    local lower = stripHtml(label):lower()
-    if lower:find("general american", 1, true)
-            or lower:find("united states", 1, true)
-            or lower:find("(us)", 1, true)
-            or lower:find("california", 1, true) then
-        return "US"
-    elseif lower:find("received pronunciation", 1, true)
-            or lower:find("united kingdom", 1, true)
-            or lower:find("(uk)", 1, true)
-            or lower:find("british", 1, true) then
-        return "UK"
-    elseif lower:find("canada", 1, true) then
-        return "Canada"
-    elseif lower:find("australia", 1, true) then
-        return "Australia"
-    elseif lower:find("new zealand", 1, true) then
-        return "New Zealand"
-    elseif lower:find("ireland", 1, true) or lower:find("irish", 1, true) then
-        return "Ireland"
-    end
-end
-
-local function inferRegionFromAudio(audio)
-    local lower = (audio or ""):lower()
-    if lower:find("_us_", 1, true) or lower:find("-us-", 1, true)
-            or lower:find("american", 1, true) then
-        return "US"
-    elseif lower:find("_gb_", 1, true) or lower:find("_uk_", 1, true)
-            or lower:find("-uk-", 1, true) or lower:find("british", 1, true) then
-        return "UK"
-    end
-end
-
-normalizeOnlineIpa = function(ipa)
-    return wrapIpa(ipa)
-end
-
-local function resultKey(result)
-    return stripIpaWrappers(result.ipa) .. "\0"
-        .. (result.language or "") .. "\0" .. (result.region or "")
-end
-
-local function mergeResults(...)
-    local merged = {}
-    local by_key = {}
-    for i = 1, select("#", ...) do
-        for _, result in ipairs(select(i, ...) or {}) do
-            if result.ipa then
-                ensureReadable(result)
-                local key = resultKey(result)
-                local existing = by_key[key]
-                if not existing then
-                    by_key[key] = result
-                    merged[#merged + 1] = result
-                elseif result.source and existing.source
-                        and not existing.source:find(result.source, 1, true) then
-                    existing.source = existing.source .. " + " .. result.source
-                    existing.confidence = math.max(existing.confidence or 0,
-                        result.confidence or 0)
-                end
-            end
-        end
-    end
-    if #merged > 0 then
-        table.sort(merged, function(left, right)
-            local left_confidence = left.confidence or 0
-            local right_confidence = right.confidence or 0
-            if left_confidence ~= right_confidence then
-                return left_confidence > right_confidence
-            end
-            local left_key = (left.source or "") .. "\0"
-                .. (left.region or "") .. "\0" .. (left.ipa or "")
-            local right_key = (right.source or "") .. "\0"
-                .. (right.region or "") .. "\0" .. (right.ipa or "")
-            return left_key < right_key
-        end)
-        return merged
-    end
-end
-
-function Pronunciation:parseDictionaryApi(decoded)
-    if type(decoded) ~= "table" then return nil end
-    local results = {}
-    local seen = {}
-    local seen_ipa = {}
-    local function add(ipa, region)
-        ipa = normalizeOnlineIpa(ipa)
-        if not ipa then return end
-        local bare_ipa = stripIpaWrappers(ipa)
-        local key = bare_ipa .. "\0" .. (region or "")
-        if seen[key] then return end
-        seen[key] = true
-        seen_ipa[bare_ipa] = true
-        results[#results + 1] = {
-            ipa = ipa,
-            simple = readableFromIpa(ipa),
-            simple_approx = true,
-            language_code = "en",
-            language = "English",
-            region = region,
-            source = "Free Dictionary API",
-            confidence = 75,
-        }
-    end
-
-    for _, entry in ipairs(decoded) do
-        for _, phonetic in ipairs(entry.phonetics or {}) do
-            add(phonetic.text, inferRegionFromAudio(phonetic.audio))
-        end
-        local bare_entry_ipa = entry.phonetic
-            and stripIpaWrappers(entry.phonetic) or nil
-        if not bare_entry_ipa or not seen_ipa[bare_entry_ipa] then
-            add(entry.phonetic)
-        end
-    end
-    if #results > 0 then return results end
-end
-
-function Pronunciation:dictApi(word)
-    loadOnlineModules()
-    local body = httpGet("https://api.dictionaryapi.dev/api/v2/entries/en/"
-        .. url.escape(word))
-    if not body then return nil end
-    local ok, decoded = pcall(JSON.decode, body, JSON.decode.simple)
-    if not ok then return nil end
-    return self:parseDictionaryApi(decoded)
-end
-
-local function englishWiktionarySection(html)
-    local english_id = html:find('id="English"', 1, true)
-    if not english_id then return nil end
-    local next_h2 = html:find('<h2[^>]-id="', english_id + #('id="English"'))
-    local next_heading = html:find(
-        '<div[^>]-class="[^"]-mw%-heading2[^"]-"',
-        english_id + #('id="English"'))
-    local finish
-    if next_h2 and next_heading then finish = math.min(next_h2, next_heading) - 1
-    elseif next_h2 then finish = next_h2 - 1
-    elseif next_heading then finish = next_heading - 1
-    else finish = #html end
-    return html:sub(english_id, finish)
-end
-
-local function extractIpaSpans(fragment, callback)
-    local found = false
-    for raw_ipa in fragment:gmatch(
-            '<span[^>]-class="[^"]*IPA[^"]*"[^>]*>(.-)</span>') do
-        local text = stripHtml(raw_ipa)
-        local first = text:sub(1, 1)
-        local last = text:sub(-1)
-        local paired = (first == "/" and last == "/")
-            or (first == "[" and last == "]")
-        local core = paired and stripIpaWrappers(text) or ""
-        -- Wiktionary also marks rhyme endings and hyphenation fragments with
-        -- class=IPA. They are not complete word pronunciations.
-        local ipa
-        if core ~= "" and core:sub(1, 1) ~= "-"
-                and core:sub(-1) ~= "-" then
-            ipa = wrapIpa(core)
-        end
-        if ipa then
-            found = true
-            callback(ipa)
-        end
-    end
-    return found
-end
-
-local function extractEtymologyLanguageHints(english)
-    local hints = {}
-    for fragment in (english or ""):gmatch(
-            '<span[^>]-class="[^"]*etyl[^"]*"[^>]*>(.-)</span>') do
-        local name = stripHtml(fragment)
-        local definition = languageDefinition(name, nil)
-        if definition then
-            hints[#hints + 1] = {
-                code = definition.code,
-                name = definition.name,
-                source = "Wiktionary etymology",
-            }
-        end
-    end
-    return mergeLanguageHints(hints)
-end
-
-function Pronunciation:parseWiktionaryHtml(html)
-    local english = englishWiktionarySection(html or "")
-    if not english then return nil end
-    local language_hints = extractEtymologyLanguageHints(english)
-
-    local results = {}
-    local seen = {}
-    local function add(ipa, region)
-        local key = stripIpaWrappers(ipa) .. "\0" .. (region or "")
-        if seen[key] then return end
-        seen[key] = true
-        results[#results + 1] = {
-            ipa = ipa,
-            simple = readableFromIpa(ipa),
-            simple_approx = true,
-            language_code = "en",
-            language = "English",
-            region = region,
-            source = "Wiktionary",
-            confidence = 85,
-        }
-    end
-
-    local found_in_items = false
-    for item in english:gmatch("<li[^>]*>(.-)</li>") do
-        local region = inferRegion(item)
-        if extractIpaSpans(item, function(ipa) add(ipa, region) end) then
-            found_in_items = true
-        end
-    end
-    if not found_in_items then
-        extractIpaSpans(english, function(ipa) add(ipa, nil) end)
-    end
-    if #results > 0 then return results, language_hints end
-    return nil, language_hints
-end
-
-function Pronunciation:wiktionary(word)
-    loadOnlineModules()
-    local body = httpGet("https://en.wiktionary.org/w/api.php"
-        .. "?action=parse&format=json&formatversion=2&redirects=1&prop=text&page="
-        .. url.escape(word))
-    if not body then return nil end
-    local ok, decoded = pcall(JSON.decode, body, JSON.decode.simple)
-    if not ok or not decoded or not decoded.parse or not decoded.parse.text then
-        return nil
-    end
-    local html = decoded.parse.text
-    if type(html) == "table" then html = html["*"] end
-    if type(html) ~= "string" then return nil end
-    return self:parseWiktionaryHtml(html)
-end
-
-function Pronunciation:lookupOnline(word)
-    local pack = self:selectedLanguagePack()
-    if not pack or pack.code ~= "en" then return nil end
-    local dictionary = self:dictApi(word)
-    local wiktionary, language_hints = self:wiktionary(word)
-    return mergeResults(dictionary, wiktionary), language_hints
-end
-
-function Pronunciation:saveCache(word, results)
-    local pack = self:selectedLanguagePack()
-    local code = pack and pack.code or "none"
-    local key = "language:" .. code .. "|word:" .. normalizeWord(word)
-    self.cache[key] = results
-    pruneSourcedCache(self.cache, key)
-    self.settings:saveSetting("cache", self.cache)
-    self.settings:saveSetting("cache_version", CACHE_VERSION)
-    self.settings:flush()
-end
-
-function Pronunciation:getGeneratedCache(key)
+function Pronunciation:getGeneratedCache(key, expected)
     local cached = (self.generated_cache or {})[key]
-    if type(cached) == "table" and #cached > 0 then
-        local pack_code = type(key) == "string"
-            and key:match("|pack:([^|]+)|") or nil
-        for _, result in ipairs(cached) do
-            if type(result) ~= "table" or type(result.ipa) ~= "string"
-                    or not wrapIpa(result.ipa)
-                    or result.generated ~= true
-                    or result.language_code ~= pack_code then
-                return nil
+    if type(cached) ~= "table" or #cached == 0 then return nil end
+    for _, result in ipairs(cached) do
+        if type(result) ~= "table" or result.generated ~= true
+                or type(result.ipa) ~= "string" or not wrapIpa(result.ipa) then
+            return nil
+        end
+        if result.ai_generated and (type(result.simple) ~= "string"
+                or trim(result.simple) == ""
+                or type(result.provider_name) ~= "string"
+                or result.provider_name == ""
+                or type(result.model) ~= "string" or result.model == "") then
+            return nil
+        end
+        if expected then
+            for field, value in pairs(expected) do
+                if result[field] ~= value then return nil end
             end
         end
-        return ensureReadables(cached)
     end
+    return cached
 end
 
 function Pronunciation:saveGeneratedCache(key, results)
@@ -2306,6 +2146,42 @@ function Pronunciation:saveGeneratedCache(key, results)
     self.settings:flush()
 end
 
+function Pronunciation:aiLanguage()
+    local code, definition, raw_identity
+    if self.pronunciation_language and self.pronunciation_language ~= "auto" then
+        code = self:normalizePronunciationLanguage(self.pronunciation_language)
+    else
+        code = self:documentPronunciationLanguage()
+        if not code then
+            for _, value in ipairs(self:documentLanguageValues()) do
+                local key = normalizeLanguageKey(value)
+                if key ~= "" and not raw_identity then raw_identity = key end
+                definition = languageDefinition(nil, value)
+                if definition then break end
+            end
+        end
+    end
+    local pack = code and self:discoverLanguagePacks()[code] or nil
+    definition = pack or definition
+    if definition then
+        local prompt_language = definition.code == "en"
+            and "English (standard US English)" or definition.name
+        return definition.code, prompt_language, definition.code,
+            definition.name
+    end
+    return "auto:" .. (raw_identity or "none"), nil, nil, nil
+end
+
+function Pronunciation:aiGenerationCacheKey(word, language_identity,
+        provider_id, model, endpoint_identity)
+    return "generator:" .. GENERATOR_VERSION
+        .. "|mode:ai|language:" .. cachePart(language_identity)
+        .. "|provider:" .. cachePart(provider_id)
+        .. "|model:" .. cachePart(model)
+        .. "|endpoint:" .. cacheHash(endpoint_identity)
+        .. "|word:" .. cachePart(normalizeWord(word))
+end
+
 function Pronunciation:format(original, results, matched)
     local lines = { boldHeading(original) }
     if matched and normalizeWord(original) ~= matched then
@@ -2313,35 +2189,37 @@ function Pronunciation:format(original, results, matched)
     end
     lines[#lines + 1] = ""
     for index, result in ipairs(results) do
-        local location
-        if result.language and result.region then
-            location = result.region .. " " .. result.language
+        if result.ai_generated then
+            lines[#lines + 1] = result.provider_name .. " (" .. result.model .. ")"
+            lines[#lines + 1] = _("IPA") .. ": " .. result.ipa
+            lines[#lines + 1] = _("Pronunciation") .. ": " .. result.simple
         else
-            location = result.language or result.region
-        end
-        local qualifiers = {}
-        if result.generated then qualifiers[#qualifiers + 1] = _("generated") end
-        if location then qualifiers[#qualifiers + 1] = location end
-        local qualifier = #qualifiers > 0
-            and " (" .. table.concat(qualifiers, "; ") .. ")" or ""
-        lines[#lines + 1] = _("IPA") .. qualifier .. ": " .. (result.ipa or "—")
-        if result.simple and result.simple ~= "" then
-            local qualifier = result.simple_approx
-                and " (" .. _("approx.") .. ")" or ""
-            lines[#lines + 1] = _("Readable") .. qualifier .. ": " .. result.simple
-        end
-        if result.source then
-            lines[#lines + 1] = _("Source") .. ": " .. result.source
+            local location
+            if result.language and result.region then
+                location = result.region .. " " .. result.language
+            else
+                location = result.language or result.region
+            end
+            local qualifiers = {}
+            if result.generated then qualifiers[#qualifiers + 1] = _("generated") end
+            if location then qualifiers[#qualifiers + 1] = location end
+            local qualifier = #qualifiers > 0
+                and " (" .. table.concat(qualifiers, "; ") .. ")" or ""
+            lines[#lines + 1] = _("IPA") .. qualifier .. ": "
+                .. (result.ipa or "—")
+            if result.simple and result.simple ~= "" then
+                local readable_qualifier = result.simple_approx
+                    and " (" .. _("approx.") .. ")" or ""
+                lines[#lines + 1] = _("Readable") .. readable_qualifier
+                    .. ": " .. result.simple
+            end
+            if result.source then
+                lines[#lines + 1] = _("Source") .. ": " .. result.source
+            end
         end
         if index < #results then lines[#lines + 1] = "" end
     end
     return table.concat(lines, "\n")
-end
-
-function Pronunciation:getCachedGeneratedForWord(word)
-    if not self.generated_fallback then return nil end
-    local cache_key = self:generationCacheKey(word)
-    return self:getGeneratedCache(cache_key)
 end
 
 function Pronunciation:lookupCached(word)
@@ -2350,45 +2228,142 @@ function Pronunciation:lookupCached(word)
     if results then return results, normalized end
 end
 
-function Pronunciation:generatedForWord(word, online_hints)
-    if not self.generated_fallback then return nil end
-    local cache_key = self:generationCacheKey(word)
-    local cached = self:getGeneratedCache(cache_key)
+function Pronunciation:localGeneratedForWord(word)
+    if self.generated_mode ~= "local" then return nil end
+    local cache_key = self:localGenerationCacheKey(word)
+    local pack = self:generationPack()
+    local expected = {
+        generation_mode = "local",
+        language_code = pack and pack.code or "none",
+    }
+    local cached = self:getGeneratedCache(cache_key, expected)
     if cached then return cached end
-    local generated = self:generatePronunciations(word)
-    if generated then self:saveGeneratedCache(cache_key, generated) end
+    local generated = self:generateLocalPronunciations(word)
+    if generated then
+        for _, result in ipairs(generated) do result.generation_mode = "local" end
+        self:saveGeneratedCache(cache_key, generated)
+    end
     return generated
 end
 
-function Pronunciation:_lookupOnlineAndShow(word, progress)
-    local normalized = normalizeWord(word)
-    local online, language_hints = self:lookupOnline(normalized)
-    local online_match = normalized
-    if not online then
-        local pack = self:selectedLanguagePack()
-        for _, candidate in ipairs(pack and pack.code == "en"
-                and self:candidates(normalized) or {}) do
-            local base = self:lookupOnline(candidate.word)
-            if base then
-                online = self:derive(base, candidate.kind, candidate.word)
-                online_match = candidate.word
-                if online then break end
+function Pronunciation:selectedAIProviderIds()
+    local selected = {}
+    for _, provider in ipairs(aiModule(self).providers) do
+        if self.ai_selected_providers[provider.id] == true then
+            selected[#selected + 1] = provider.id
+        end
+    end
+    return selected
+end
+
+function Pronunciation:aiCacheExpectation(language_identity, provider_id,
+        model, endpoint_identity)
+    return {
+        generation_mode = "ai",
+        ai_generated = true,
+        language_cache = language_identity,
+        provider = provider_id,
+        model = model,
+        endpoint_cache = cacheHash(endpoint_identity),
+    }
+end
+
+function Pronunciation:aiNeedsNetwork(word)
+    local ai = aiModule(self)
+    local language_identity = self:aiLanguage()
+    for _, provider_id in ipairs(self:selectedAIProviderIds()) do
+        local config = self.ai_provider_configs[provider_id]
+        if ai.usableConfig(provider_id, config) then
+            local endpoint_identity = config.format .. "|" .. config.endpoint
+            local key = self:aiGenerationCacheKey(word, language_identity,
+                provider_id, config.model, endpoint_identity)
+            if not self:getGeneratedCache(key,
+                    self:aiCacheExpectation(language_identity, provider_id,
+                        config.model, endpoint_identity)) then
+                return true
             end
         end
     end
-    if online then
-        self:saveCache(normalized, online)
-        showLookupMessage(progress, self:format(word, online, online_match))
-    else
-        local generated = self:generatedForWord(normalized, language_hints)
-        if generated then
-            showLookupMessage(progress, self:format(word, generated, normalized))
+    return false
+end
+
+function Pronunciation:aiGeneratedForWord(word, progress)
+    if self.generated_mode ~= "ai" then return nil end
+    local ai = aiModule(self)
+    local language_identity, prompt_language, language_code, language_name =
+        self:aiLanguage()
+    local results, errors = {}, {}
+    local selected = self:selectedAIProviderIds()
+    if #selected == 0 then
+        return nil, {
+            _("No AI provider selected. Select one in Pronunciation settings → AI settings.")
+        }
+    end
+    for _, provider_id in ipairs(selected) do
+        local provider = ai.provider(provider_id)
+        local config = self.ai_provider_configs[provider_id]
+        if not ai.usableConfig(provider_id, config) then
+            errors[#errors + 1] = provider.name .. ": "
+                .. _("configure an API key, model, and endpoint if required")
         else
-            showLookupMessage(progress,
-                word .. "\n\n"
-                    .. _("No pronunciation found offline or online. Long-press Pronunciation to save your own IPA/readable pronunciation."))
+            local endpoint_identity = config.format .. "|" .. config.endpoint
+            local key = self:aiGenerationCacheKey(word, language_identity,
+                provider_id, config.model, endpoint_identity)
+            local expected = self:aiCacheExpectation(language_identity,
+                provider_id, config.model, endpoint_identity)
+            local cached = self:getGeneratedCache(key, expected)
+            if cached then
+                results[#results + 1] = cached[1]
+            else
+                local request_function
+                if type(self.ai_request) == "function" then
+                    request_function = function(request, request_progress)
+                        return self:ai_request(request, request_progress)
+                    end
+                end
+                local generated, error_message = ai.query(provider_id, config,
+                    word, prompt_language, progress, request_function)
+                if generated then
+                    generated.generated = true
+                    generated.ai_generated = true
+                    generated.generation_mode = "ai"
+                    generated.language_cache = language_identity
+                    generated.endpoint_cache = cacheHash(endpoint_identity)
+                    generated.language_code = language_code
+                    generated.language = language_name
+                    generated.simple_approx = false
+                    generated.source = nil
+                    self:saveGeneratedCache(key, { generated })
+                    results[#results + 1] = generated
+                else
+                    errors[#errors + 1] = provider.name .. ": "
+                        .. (error_message or _("request failed"))
+                    if error_message == "cancelled" then break end
+                end
+            end
         end
     end
+    return #results > 0 and results or nil, errors
+end
+
+function Pronunciation:formatAIOutcome(word, results, errors)
+    local text
+    if results then
+        text = self:format(word, results, normalizeWord(word))
+    else
+        text = word
+    end
+    if errors and #errors > 0 then
+        text = text .. "\n\n" .. table.concat(errors, "\n")
+    elseif not results then
+        text = text .. "\n\n" .. _("No AI pronunciation was returned.")
+    end
+    return text
+end
+
+function Pronunciation:_lookupAIAndShow(word, progress)
+    local results, errors = self:aiGeneratedForWord(normalizeWord(word), progress)
+    showLookupMessage(progress, self:formatAIOutcome(word, results, errors))
 end
 
 function Pronunciation:_lookupAndShow(word, progress)
@@ -2403,16 +2378,41 @@ function Pronunciation:_lookupAndShow(word, progress)
         showLookupMessage(progress, self:format(word, results, matched))
         return
     end
-    if not self.online_fallback then
-        local generated = self:generatedForWord(normalized)
-        if generated then
-            showLookupMessage(progress,
-                self:format(word, generated, normalized))
-            return
-        end
+    if self.generated_mode == "off" then
         showLookupMessage(progress,
             word .. "\n\n"
-                .. _("No offline pronunciation found. Long-press Pronunciation to add a personal override."))
+                .. _("No sourced pronunciation found. Long-press Pronunciation to add a personal override."))
+        return
+    elseif self.generated_mode == "local" then
+        local generated = self:localGeneratedForWord(normalized)
+        if generated then
+            showLookupMessage(progress, self:format(word, generated, normalized))
+        else
+            showLookupMessage(progress,
+                word .. "\n\n"
+                    .. _("No local pronunciation found. Long-press Pronunciation to add a personal override."))
+        end
+        return
+    end
+
+    local selected = self:selectedAIProviderIds()
+    local usable = false
+    local ai = aiModule(self)
+    for _, provider_id in ipairs(selected) do
+        if ai.usableConfig(provider_id,
+                self.ai_provider_configs[provider_id]) then
+            usable = true
+            break
+        end
+    end
+    if #selected == 0 or not usable then
+        local _, errors = self:aiGeneratedForWord(normalized, progress)
+        showLookupMessage(progress, self:formatAIOutcome(word, nil, errors))
+        return
+    end
+
+    if not self:aiNeedsNetwork(normalized) then
+        self:_lookupAIAndShow(word, progress)
         return
     end
 
@@ -2421,19 +2421,16 @@ function Pronunciation:_lookupAndShow(word, progress)
     local progress_closed = false
     NetworkMgr:runWhenOnline(function()
         callback_ran = true
-        -- runWhenOnline calls back immediately when the device is already
-        -- online, so reuse the popup and avoid an extra e-ink refresh. If
-        -- KOReader had to connect first, repaint a fresh popup for HTTP work.
-        local online_progress = progress
-        if progress_closed then online_progress = showLookupProgress() end
+        local ai_progress = progress
+        if progress_closed then ai_progress = showLookupProgress(true) end
         afterLookupProgress(function()
-            runLookupSafely(word, online_progress, function()
-                self:_lookupOnlineAndShow(word, online_progress)
+            runInTrapper(function()
+                runLookupSafely(word, ai_progress, function()
+                    self:_lookupAIAndShow(word, ai_progress)
+                end)
             end)
         end)
     end)
-    -- KOReader owns any Wi-Fi prompt. Do not leave our non-dismissible popup
-    -- behind if the user cancels and the callback is never invoked.
     if not callback_ran then
         progress_closed = true
         closeLookupProgress(progress)
@@ -2448,7 +2445,7 @@ function Pronunciation:lookupAndShow(word)
         showLookupMessage(nil, self:format(word, cached, matched))
         return
     end
-    local progress = showLookupProgress()
+    local progress = showLookupProgress(self.generated_mode == "ai")
     afterLookupProgress(function()
         runLookupSafely(word, progress, function()
             self:_lookupAndShow(word, progress)

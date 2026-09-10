@@ -2,12 +2,13 @@
 
 ## Build and test
 
-Runtime files are plain Lua plus per-language SQLite/readable-converter packs
-and optional per-language G2P models. Build tools require Python 3.10 or newer and Git; they use
-only the Python standard library.
+Runtime files are plain Lua (`main.lua` and the lazy-loaded `ai.lua`) plus
+per-language SQLite/readable-converter packs and optional per-language G2P
+models. Build tools require Python 3.10 or newer and Git; they use only the
+Python standard library.
 
 ```sh
-luac5.1 -p main.lua
+luac5.1 -p main.lua ai.lua
 luajit tests/test_plugin.lua
 lua5.1 tests/test_plugin.lua
 python3 tests/test_database.py
@@ -39,7 +40,7 @@ in `tools/build_release.py`.
 WikiPron TSV inputs are discovered from the release and are not hash-pinned.
 
 Then run the complete validation shown above. The release workflow performs the
-same steps, commits `main.lua`, `tools/build_release.py`,
+same steps, commits `main.lua`, `ai.lua`, `tools/build_release.py`,
 `data/en/pronunciations.sqlite3`, `data/en/readable.tsv`, `data/en/pack.tsv`,
 `data/en/g2p.bin`, and `data/en/g2p.SOURCE.txt`, and publishes the
 versioned archive. `PRAGMA user_version` is the database schema version, not the

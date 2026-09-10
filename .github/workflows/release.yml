@@ -59,7 +59,7 @@ jobs:
       - name: Run release checks
         if: steps.release.outputs.publish == 'true'
         run: |
-          luac5.1 -p main.lua
+          luac5.1 -p main.lua ai.lua
           luajit tests/test_plugin.lua
           lua5.1 tests/test_plugin.lua
           python3 tests/test_database.py
@@ -80,6 +80,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add \
             main.lua \
+            ai.lua \
             tools/build_release.py \
             data/en/pronunciations.sqlite3 \
             data/en/pack.tsv \
