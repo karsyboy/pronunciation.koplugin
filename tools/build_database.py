@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build per-language pronunciation databases from a WikiPron release."""
+"""Build complete pronunciation language packs from WikiPron and MFA."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 import unicodedata
 import urllib.error
 import urllib.request
@@ -20,6 +21,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from build_release import read_plugin_version
+from build_g2p_model import (
+    build_language_g2p,
+    fetch_mfa_models,
+    resolve_mfa_model,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -733,6 +739,10 @@ def default_database_path(data_dir: Path, code: str) -> Path:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "language_codes", nargs="*", metavar="LANGUAGE",
+        help="base language codes to build (ergonomic positional form)",
+    )
+    parser.add_argument(
         "--sources-dir",
         type=Path,
         default=DEFAULT_SOURCES_DIR,
@@ -788,7 +798,21 @@ def main() -> None:
         "--data-dir", type=Path, default=ROOT / "data",
         help="language-pack output root (default: repository data directory)",
     )
+    g2p = parser.add_mutually_exclusive_group()
+    g2p.add_argument(
+        "--no-g2p", action="store_true",
+        help="skip automatic MFA G2P model discovery and download",
+    )
+    g2p.add_argument(
+        "--require-g2p", action="store_true",
+        help="fail if a requested language has no compatible MFA model",
+    )
     args = parser.parse_args()
+
+    if args.language_codes and args.language:
+        parser.error("positional language codes cannot be combined with --language")
+    if args.language_codes and args.all:
+        parser.error("positional language codes cannot be combined with --all")
 
     if args.wikipron_root:
         if not args.wikipron_release or not args.wikipron_revision:
@@ -819,7 +843,7 @@ def main() -> None:
         requested = (
             sorted(languages) if args.all else [
                 resolve_requested_language(value, languages)
-                for value in (args.language or ["en"])
+                for value in (args.language or args.language_codes or ["en"])
             ]
         )
     except ValueError as error:
@@ -827,6 +851,20 @@ def main() -> None:
     requested = list(dict.fromkeys(requested))
     if args.output and len(requested) != 1:
         parser.error("--output can only be used when building one language")
+
+    mfa_models = [] if args.no_g2p else fetch_mfa_models()
+    if args.require_g2p:
+        missing = [
+            code for code in requested
+            if not resolve_mfa_model(code, languages[code].name, mfa_models)
+        ]
+        if missing:
+            parser.error(
+                "no compatible MFA/Pynini G2P model is published for: "
+                + ", ".join(
+                    f"{languages[code].name} ({code})" for code in missing
+                )
+            )
 
     print(
         f"Using WikiPron release {wikipron_release} ({wikipron_revision})"
@@ -844,6 +882,22 @@ def main() -> None:
             supplement=args.supplement if code == "en" else None,
         )
         print(f"built {output}: {headwords} headwords, {records} records")
+        if not args.no_g2p:
+            built = build_language_g2p(
+                code,
+                language.name,
+                args.data_dir,
+                args.sources_dir / "mfa-models",
+                mfa_models,
+                output=output.parent / "g2p.bin",
+            )
+            if not built:
+                message = (
+                    "No compatible MFA/Pynini G2P model is published for "
+                    f"{language.name} ({code}); the database and readable "
+                    "converter were built successfully."
+                )
+                print(f"warning: {message}", file=sys.stderr)
 
 
 if __name__ == "__main__":

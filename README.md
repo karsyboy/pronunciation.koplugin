@@ -81,17 +81,19 @@ lookup merely because a word is absent from it.
 
 ## Optional language packs
 
-The normal release includes only `data/en/pronunciations.sqlite3`. Developers
-can build any language discovered in the selected WikiPron release:
+The normal release includes only the English pack. One command builds a
+complete optional pack—database, readable converter, and an automatically
+downloaded G2P model when MFA publishes a compatible one:
 
 ```sh
-python3 tools/build_database.py --language fr
-python3 tools/build_database.py --language fr --language de
-python3 tools/build_database.py --all
+python3 tools/build_language_pack.py fr
+python3 tools/build_language_pack.py fr de
+python3 tools/build_language_pack.py --all
 ```
 
 Each build also produces `readable.tsv`, a deterministic, language-specific
-IPA-to-readable mapping learned from that language's WikiPron spellings. Copy
+IPA-to-readable mapping learned from that language's WikiPron spellings. No
+model URL or archive path is required. Copy
 the resulting complete `data/<language-code>/` directory into the
 plugin's `data/` directory and restart KOReader. Packs use a common ISO 639-1
 code when one exists and otherwise a stable ISO 639-3 code. Regional profiles
@@ -109,10 +111,10 @@ Full terms, attribution, release provenance, artifact hashes, and modifications 
 
 ## Limitations
 
-Only English is bundled by default. Optional packs include sourced IPA and a
-language-specific readable approximation; generated fallback for such a pack
-requires installing a separately built MFA/Pynini model in the same language
-directory. The readable converter is learned from proportional IPA/spelling
+Only English is bundled by default. Optional packs always include sourced IPA
+and a language-specific readable approximation. Generated fallback is added
+when the official MFA catalog has a compatible model; languages without one
+remain fully usable for database lookup. The readable converter is learned from proportional IPA/spelling
 alignments and is an aid rather than a phonological transliteration standard.
 Spelling alone cannot determine an author's intended pronunciation,
 especially for names and fictional words. Generated IPA and readable spellings

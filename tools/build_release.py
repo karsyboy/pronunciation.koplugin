@@ -35,7 +35,7 @@ VERSION_PATTERN = re.compile(
     r"(?:\+[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?"
 )
 DATABASE_SHA256 = (
-    "1793fd545bdd6b488a277eaabb48744a6c7adde891945d2aa89b681acf6a3fe4"
+    "e293ec21a228c387f6f82d9601b81357cb7d4b5b64cb264097ccf4b00d8b3707"
 )
 G2P_SHA256 = (
     "4056b000fb0b7b6b972a1bebaad89d21556fe1b64b199870608839d3d9d4b22c"
@@ -149,6 +149,9 @@ def validate_inputs() -> None:
             raise RuntimeError("G2P model format is not release-ready")
     if sha256(g2p_path) != G2P_SHA256:
         raise RuntimeError("G2P model failed the release integrity check")
+    g2p_source = (ROOT / "data/en/g2p.SOURCE.txt").read_text(encoding="utf-8")
+    if "Release: g2p-" not in g2p_source or G2P_SHA256 not in g2p_source:
+        raise RuntimeError("G2P model provenance is missing or stale")
 
 
 def build_release(output: Path) -> tuple[int, int]:

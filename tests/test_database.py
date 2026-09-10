@@ -28,7 +28,13 @@ from build_database import (  # noqa: E402
     resolve_requested_language,
     sync_git_release_checkout,
 )
-from build_g2p_model import build_model, parse_phone_symbols  # noqa: E402
+from build_g2p_model import (  # noqa: E402
+    build_language_g2p,
+    build_model,
+    fetch_mfa_models,
+    parse_phone_symbols,
+    resolve_mfa_model,
+)
 from build_release import (  # noqa: E402
     DATABASE_SHA256,
     G2P_SHA256,
@@ -42,6 +48,7 @@ from build_release import (  # noqa: E402
 )
 from prepare_release import (  # noqa: E402
     synchronize_database_hash,
+    synchronize_g2p_hash,
     synchronize_readable_hash,
     synchronize_runtime_version,
 )
@@ -292,6 +299,7 @@ def check_compact_database_build() -> None:
             "--wikipron-release", "v-test",
             "--wikipron-revision", "test-wikipron-revision",
             "--generated-date", "2026-01-01",
+            "--no-g2p",
         ]
         command = [sys.executable, ROOT / "tools" / "build_database.py"]
         default_root = directory / "default-output"
@@ -306,6 +314,13 @@ def check_compact_database_build() -> None:
             "--language", "fr-CA", "--data-dir", str(one_root),
         ], check=True, capture_output=True, text=True)
         assert default_database_path(one_root, "fr").is_file()
+
+        ergonomic_root = directory / "ergonomic-output"
+        subprocess.run([
+            sys.executable, ROOT / "tools" / "build_language_pack.py",
+            "fr-CA", *common, "--data-dir", ergonomic_root,
+        ], check=True, capture_output=True, text=True)
+        assert default_database_path(ergonomic_root, "fr").is_file()
 
         repeated_root = directory / "repeated-output"
         subprocess.run(command + common + [
@@ -436,6 +451,14 @@ def check_release_preparation() -> None:
         assert readable_hash == hashlib.sha256(readable.read_bytes()).hexdigest()
         assert readable_hash in release_builder.read_text(encoding="utf-8")
 
+        g2p = directory / "g2p.bin"
+        g2p.write_bytes(b"test g2p")
+        with release_builder.open("a", encoding="utf-8") as target:
+            target.write('G2P_SHA256 = (\n    "' + "0" * 64 + '"\n)\n')
+        g2p_hash = synchronize_g2p_hash(g2p, release_builder)
+        assert g2p_hash == hashlib.sha256(g2p.read_bytes()).hexdigest()
+        assert g2p_hash in release_builder.read_text(encoding="utf-8")
+
 
 def check_g2p_model() -> None:
     assert not (ROOT / "data" / "cmu_flite_lts.bin").exists()
@@ -487,6 +510,106 @@ def make_test_g2p_archive(path: Path, character: str, phone: str) -> None:
             "fixture/phones.sym", f"<eps>\t0\n{phone}\t1\n<UNK>\t2\n"
         )
         archive.writestr("fixture/model.fst", fst)
+
+
+def check_automatic_g2p_resolution() -> None:
+    def release(tag: str, architecture: str, published: str) -> dict:
+        model_name = tag[4:tag.rfind("-v")]
+        return {
+            "tag_name": tag,
+            "draft": False,
+            "prerelease": False,
+            "published_at": published,
+            "html_url": f"https://example.test/releases/{tag}",
+            "body": (
+                "## Model details\n"
+                "- **Language:** [French](https://example.test/french)\n"
+                f"- **Architecture:** `{architecture}`\n"
+                "- **License:** [CC BY 4.0](https://example.test/license)\n"
+            ),
+            "assets": [{
+                "name": f"{model_name}.zip",
+                "browser_download_url": "https://example.test/french.zip",
+            }],
+        }
+
+    catalog = [
+        release("g2p-french_mfa-v3.0.0", "phonetisaurus", "2024-03-01"),
+        release("g2p-french_mfa-v2.0.0a", "pynini", "2022-06-01"),
+        release("g2p-french_mfa-v2.0.0", "pynini", "2022-04-01"),
+    ]
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+    requests = []
+
+    def catalog_opener(request, timeout):
+        requests.append((request.full_url, timeout))
+        return Response(json.dumps(catalog).encode())
+
+    models = fetch_mfa_models(opener=catalog_opener)
+    assert len(models) == 2
+    selected = resolve_mfa_model("fr", "French", models)
+    assert selected and selected.tag == "g2p-french_mfa-v2.0.0"
+    assert requests == [(
+        "https://api.github.com/repos/MontrealCorpusTools/mfa-models/releases"
+        "?per_page=100&page=1",
+        30,
+    )]
+
+    with tempfile.TemporaryDirectory(prefix="pronunciation-auto-g2p-") as directory:
+        directory = Path(directory)
+        archive = directory / "source.zip"
+        make_test_g2p_archive(archive, "é", "e")
+        archive_bytes = archive.read_bytes()
+
+        def download_opener(request, timeout):
+            assert request.full_url == "https://example.test/french.zip"
+            assert timeout == 120
+            return Response(archive_bytes)
+
+        data_dir = directory / "data"
+        pack = data_dir / "fr"
+        pack.mkdir(parents=True)
+        (pack / "pack.tsv").write_text(
+            "language_code\tfr\nlanguage_name\tFrench\n",
+            encoding="utf-8",
+        )
+        assert build_language_g2p(
+            "fr", "French", data_dir, directory / "sources", models,
+            opener=download_opener,
+        )
+        assert (pack / "g2p.bin").read_bytes()[:8] == b"KPG2P4\0\0"
+        provenance = (pack / "g2p.SOURCE.txt").read_text(encoding="utf-8")
+        assert "Release: g2p-french_mfa-v2.0.0" in provenance
+        assert "License: CC BY 4.0" in provenance
+
+        def unexpected_download(*_args, **_kwargs):
+            raise AssertionError("cached model archive was downloaded again")
+
+        assert build_language_g2p(
+            "fr", "French", data_dir, directory / "sources", models,
+            opener=unexpected_download,
+        )
+        assert not build_language_g2p(
+            "zz", "No Such Language", data_dir, directory / "sources",
+            models, opener=download_opener,
+        )
+
+    def failing_opener(*_args, **_kwargs):
+        raise OSError("offline")
+
+    try:
+        fetch_mfa_models(opener=failing_opener)
+    except RuntimeError as error:
+        assert "--no-g2p" in str(error)
+    else:
+        raise AssertionError("MFA catalog failure was silently ignored")
 
 
 def check_multilingual_g2p_build() -> None:
@@ -611,6 +734,7 @@ if __name__ == "__main__":
     check_source_checkout_update()
     check_release_preparation()
     check_g2p_model()
+    check_automatic_g2p_resolution()
     check_multilingual_g2p_build()
     check_release_build()
     print("database regression tests: OK")

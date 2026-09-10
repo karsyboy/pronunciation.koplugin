@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pack one or more MFA/Pynini G2P archives for the Lua runtime."""
+"""Discover, download, and pack MFA/Pynini G2P models for language packs."""
 
 from __future__ import annotations
 
@@ -11,7 +11,11 @@ import math
 import os
 import re
 import struct
+import sys
+import urllib.error
+import urllib.request
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
@@ -25,6 +29,27 @@ ARC_RECORD_SIZE = 10
 INFINITE_FINAL = 0xFFFF
 STATE_OFFSET_BLOCK = 256
 FINAL_RANK_BLOCK = 256
+MFA_RELEASES_API = (
+    "https://api.github.com/repos/MontrealCorpusTools/mfa-models/releases"
+)
+MFA_MODELS_URL = "https://github.com/MontrealCorpusTools/mfa-models"
+COMPATIBLE_ARCHITECTURES = {"pynini"}
+PREFERRED_MODELS = {"en": "english_us_arpa"}
+
+
+@dataclass(frozen=True)
+class MfaModelRelease:
+    language_name: str
+    model_name: str
+    tag: str
+    architecture: str
+    license: str
+    published_at: str
+    asset_name: str
+    download_url: str
+    release_url: str
+
+
 def read_exact(source: BinaryIO, size: int) -> bytes:
     data = source.read(size)
     if len(data) != size:
@@ -249,6 +274,173 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _body_field(body: str, name: str) -> str:
+    match = re.search(
+        rf"\*\*{re.escape(name)}:\*\*\s*(?:\[([^\]]+)\]|`([^`]+)`|([^\n]+))",
+        body,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    return next((value.strip() for value in match.groups() if value), "")
+
+
+def parse_mfa_release(release: dict) -> MfaModelRelease | None:
+    tag = str(release.get("tag_name") or "")
+    if (release.get("draft") or release.get("prerelease")
+            or not tag.startswith("g2p-") or "-v" not in tag):
+        return None
+    body = str(release.get("body") or "")
+    architecture = _body_field(body, "Architecture").lower()
+    language_name = _body_field(body, "Language")
+    if architecture not in COMPATIBLE_ARCHITECTURES or not language_name:
+        return None
+    model_name = tag[4:tag.rfind("-v")]
+    assets = [
+        asset for asset in release.get("assets") or []
+        if str(asset.get("name") or "").lower().endswith(".zip")
+        and asset.get("browser_download_url")
+    ]
+    asset = next(
+        (item for item in assets if item.get("name") == f"{model_name}.zip"),
+        assets[0] if len(assets) == 1 else None,
+    )
+    if not asset:
+        return None
+    return MfaModelRelease(
+        language_name=language_name,
+        model_name=model_name,
+        tag=tag,
+        architecture=architecture,
+        license=_body_field(body, "License") or "See upstream release",
+        published_at=str(release.get("published_at") or ""),
+        asset_name=str(asset["name"]),
+        download_url=str(asset["browser_download_url"]),
+        release_url=str(release.get("html_url") or ""),
+    )
+
+
+def fetch_mfa_models(
+    opener=urllib.request.urlopen,
+) -> list[MfaModelRelease]:
+    models = []
+    for page in range(1, 11):
+        url = f"{MFA_RELEASES_API}?per_page=100&page={page}"
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "pronunciation.koplugin-language-pack-builder",
+        }
+        github_token = os.environ.get("GITHUB_TOKEN")
+        if github_token:
+            headers["Authorization"] = f"Bearer {github_token}"
+        request = urllib.request.Request(
+            url,
+            headers=headers,
+        )
+        try:
+            with opener(request, timeout=30) as response:
+                releases = json.load(response)
+        except (OSError, ValueError, urllib.error.URLError) as error:
+            raise RuntimeError(
+                "could not query the official MFA model release catalog; "
+                "check network access or use --no-g2p"
+            ) from error
+        if not isinstance(releases, list):
+            raise RuntimeError("GitHub returned an invalid MFA release catalog")
+        for release in releases:
+            model = parse_mfa_release(release)
+            if model:
+                models.append(model)
+        if len(releases) < 100:
+            break
+    else:
+        raise RuntimeError("MFA release catalog pagination exceeded 1,000 releases")
+    return models
+
+
+def _normalized_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+
+def resolve_mfa_model(
+    language_code: str,
+    language_name: str,
+    models: list[MfaModelRelease],
+    preferred_model: str | None = None,
+) -> MfaModelRelease | None:
+    language_key = _normalized_name(language_name)
+    candidates = [
+        model for model in models
+        if _normalized_name(model.language_name) == language_key
+    ]
+    if not candidates:
+        return None
+    preferred = preferred_model or PREFERRED_MODELS.get(language_code)
+    if preferred:
+        matches = [model for model in candidates if model.model_name == preferred]
+        if matches:
+            candidates = matches
+    else:
+        generic_name = re.sub(r"[^a-z0-9]+", "_", language_name.casefold())
+        exact = [
+            model for model in candidates
+            if model.model_name == f"{generic_name}_mfa"
+        ]
+        if exact:
+            candidates = exact
+    stable_versions = [
+        model for model in candidates
+        if re.search(r"-v[0-9]+\.[0-9]+\.[0-9]+$", model.tag)
+    ]
+    if stable_versions:
+        candidates = stable_versions
+    return max(
+        candidates,
+        key=lambda model: (model.published_at, -len(model.model_name), model.tag),
+    )
+
+
+def download_mfa_model(
+    model: MfaModelRelease,
+    sources_dir: Path,
+    opener=urllib.request.urlopen,
+) -> Path:
+    destination = sources_dir / model.tag / model.asset_name
+    if destination.is_file():
+        try:
+            with zipfile.ZipFile(destination) as archive:
+                if archive.testzip() is None:
+                    print(f"Using cached MFA model {model.tag}")
+                    return destination
+        except zipfile.BadZipFile:
+            pass
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    request = urllib.request.Request(
+        model.download_url,
+        headers={"User-Agent": "pronunciation.koplugin-language-pack-builder"},
+    )
+    print(f"Downloading MFA model {model.tag}")
+    try:
+        with opener(request, timeout=120) as response, temporary.open("wb") as target:
+            for block in iter(lambda: response.read(1024 * 1024), b""):
+                target.write(block)
+        with zipfile.ZipFile(temporary) as archive:
+            corrupt = archive.testzip()
+            if corrupt:
+                raise ValueError(f"corrupt member {corrupt!r}")
+        os.replace(temporary, destination)
+    except (OSError, ValueError, zipfile.BadZipFile, urllib.error.URLError) as error:
+        raise RuntimeError(
+            f"could not download usable MFA model {model.tag} from "
+            f"{model.download_url}"
+        ) from error
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return destination
+
+
 def member_name(archive: zipfile.ZipFile, suffix: str) -> str:
     matches = [name for name in archive.namelist() if name.endswith(suffix)]
     if len(matches) != 1:
@@ -313,19 +505,26 @@ def write_source_metadata(
     metadata: dict,
     states: int,
     arcs: int,
+    release: MfaModelRelease | None = None,
 ) -> None:
-    model_name = str(metadata.get("name") or archive.stem)
+    model_name = release.model_name if release else str(
+        metadata.get("name") or archive.stem
+    )
     version = str(metadata.get("version") or "unknown")
+    source_project = release.release_url if release else MFA_MODELS_URL
+    license_name = release.license if release else "See source model metadata"
+    release_lines = [f"Release: {release.tag}"] if release else []
     directory.joinpath("g2p.SOURCE.txt").write_text(
         "\n".join([
             f"Language: {language}",
             f"Model: {model_name}",
             f"Version: {version}",
+            *release_lines,
             "Format: compact pronunciation.koplugin KPG2P4 graph",
             f"Source archive: {archive.name}",
             f"Source archive SHA-256: {source_hash}",
-            "Source project: https://github.com/MontrealCorpusTools/mfa-models",
-            "License: see the source model metadata and LICENSES.txt",
+            f"Source: {source_project}",
+            f"License: {license_name}; see LICENSES.txt when distributing",
             f"Output: {output.name}",
             f"Output size: {output.stat().st_size}",
             f"Output SHA-256: {sha256(output)}",
@@ -337,9 +536,59 @@ def write_source_metadata(
     )
 
 
+def build_language_g2p(
+    language_code: str,
+    language_name: str,
+    data_dir: Path,
+    sources_dir: Path,
+    models: list[MfaModelRelease],
+    *,
+    output: Path | None = None,
+    preferred_model: str | None = None,
+    opener=urllib.request.urlopen,
+) -> bool:
+    model = resolve_mfa_model(
+        language_code, language_name, models, preferred_model
+    )
+    if not model:
+        return False
+    archive = download_mfa_model(model, sources_dir, opener=opener)
+    output = output or data_dir / language_code / "g2p.bin"
+    states, arcs, metadata = build_model(archive, output)
+    source_hash = sha256(archive)
+    write_source_metadata(
+        output.parent, language_code, archive, output, source_hash, metadata,
+        states, arcs, model,
+    )
+    update_pack_metadata(output.parent)
+    print(
+        f"built {output}: {states} states, {arcs} arcs, "
+        f"MFA release {model.tag}, source sha256 {source_hash}"
+    )
+    return True
+
+
+def read_pack_language_name(data_dir: Path, code: str) -> str:
+    path = data_dir / code / "pack.tsv"
+    if not path.is_file():
+        raise ValueError(
+            f"language pack metadata is missing for {code}; build it first "
+            f"with tools/build_language_pack.py {code}"
+        )
+    metadata = dict(
+        line.split("\t", 1)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if "\t" in line
+    )
+    name = metadata.get("language_name", "").strip()
+    if not name:
+        raise ValueError(f"language pack has no language name: {path}")
+    return name
+
+
 def resolve_jobs(
     args: argparse.Namespace, parser: argparse.ArgumentParser
-) -> list[tuple[str, Path]]:
+) -> list[tuple[str, Path | None]]:
     if args.models_dir and not args.all:
         parser.error("--models-dir requires --all")
     if args.all and args.output:
@@ -349,29 +598,38 @@ def resolve_jobs(
             parser.error(
                 "--all cannot be combined with --language or --model-archive"
             )
-        if not args.models_dir:
-            parser.error("--all requires --models-dir")
-        archives = sorted(args.models_dir.glob("*.zip"))
-        if not archives:
-            parser.error(f"no ZIP model archives found in {args.models_dir}")
-        try:
-            return [
-                (normalize_language_code(path.stem), path)
-                for path in archives
-            ]
-        except ValueError as error:
-            parser.error(str(error))
+        if args.models_dir:
+            archives = sorted(args.models_dir.glob("*.zip"))
+            if not archives:
+                parser.error(f"no ZIP model archives found in {args.models_dir}")
+            try:
+                return [
+                    (normalize_language_code(path.stem), path)
+                    for path in archives
+                ]
+            except ValueError as error:
+                parser.error(str(error))
+        if not args.data_dir.is_dir():
+            parser.error(f"language-pack directory does not exist: {args.data_dir}")
+        jobs = [
+            (path.name, None) for path in sorted(args.data_dir.iterdir())
+            if path.is_dir() and re.fullmatch(r"[a-z]{2,3}", path.name)
+            and path.joinpath("pack.tsv").is_file()
+        ]
+        if not jobs:
+            parser.error(f"no language packs found in {args.data_dir}")
+        return jobs
 
     archives = args.model_archive or []
-    if not archives:
-        parser.error("at least one --model-archive is required (or use --all)")
-    languages = args.language or (["en"] if len(archives) == 1 else [])
-    if len(languages) != len(archives):
+    languages = args.language or ["en"]
+    if archives and len(languages) != len(archives):
         parser.error("repeat --language once for each --model-archive")
     try:
         jobs = [
             (normalize_language_code(language), archive)
-            for language, archive in zip(languages, archives, strict=True)
+            for language, archive in zip(
+                languages, archives or [None] * len(languages), strict=True
+            )
         ]
     except ValueError as error:
         parser.error(str(error))
@@ -386,29 +644,35 @@ def main() -> None:
     parser.add_argument(
         "--language",
         action="append",
-        help="base language code; repeat alongside --model-archive",
+        help="installed base language code; may be repeated (default: en)",
     )
     parser.add_argument(
         "--model-archive",
         action="append",
         type=Path,
-        help="official MFA G2P model ZIP containing model.fst and phones.sym",
+        help="local MFA model override; repeat alongside --language",
     )
     parser.add_argument(
         "--all",
         action="store_true",
-        help="build every CODE.zip archive found in --models-dir",
+        help="build models for every installed language pack",
     )
     parser.add_argument(
         "--models-dir",
         type=Path,
-        help="directory used by --all; archive filenames are base codes",
+        help="legacy local overrides for --all, named CODE.zip",
     )
     parser.add_argument(
         "--data-dir",
         type=Path,
         default=ROOT / "data",
         help="language-pack root (default: data)",
+    )
+    parser.add_argument(
+        "--sources-dir",
+        type=Path,
+        default=ROOT / "pronunciation-sources" / "mfa-models",
+        help="download cache for automatically resolved MFA archives",
     )
     parser.add_argument(
         "--output",
@@ -428,7 +692,28 @@ def main() -> None:
     if expected_hashes and len(expected_hashes) != len(jobs):
         parser.error("repeat --expected-sha256 once for each model archive")
 
+    automatic = any(archive is None for _, archive in jobs)
+    if automatic and expected_hashes:
+        parser.error("--expected-sha256 requires local --model-archive inputs")
+    models = fetch_mfa_models() if automatic else []
     for index, (language, archive) in enumerate(jobs):
+        if archive is None:
+            try:
+                language_name = read_pack_language_name(args.data_dir, language)
+            except ValueError as error:
+                parser.error(str(error))
+            built = build_language_g2p(
+                language, language_name, args.data_dir, args.sources_dir,
+                models, output=args.output,
+            )
+            if not built:
+                print(
+                    f"No compatible MFA/Pynini G2P model is published for "
+                    f"{language_name} ({language}); database/readable data "
+                    "remain usable.",
+                    file=sys.stderr,
+                )
+            continue
         if not archive.is_file():
             parser.error(f"model archive does not exist: {archive}")
         source_hash = sha256(archive)

@@ -26,6 +26,10 @@ READABLE_HASH_PATTERN = re.compile(
     r'(READABLE_SHA256\s*=\s*\(\s*")[0-9a-f]{64}("\s*\))',
     flags=re.MULTILINE,
 )
+G2P_HASH_PATTERN = re.compile(
+    r'(G2P_SHA256\s*=\s*\(\s*")[0-9a-f]{64}("\s*\))',
+    flags=re.MULTILINE,
+)
 
 
 def sha256(path: Path) -> str:
@@ -82,6 +86,19 @@ def synchronize_readable_hash(
     return readable_hash
 
 
+def synchronize_g2p_hash(
+    g2p_path: Path = ROOT / "data" / "en" / "g2p.bin",
+    release_builder_path: Path = ROOT / "tools" / "build_release.py",
+) -> str:
+    g2p_hash = sha256(g2p_path)
+    replace_one(
+        release_builder_path,
+        G2P_HASH_PATTERN,
+        lambda match: f"{match.group(1)}{g2p_hash}{match.group(2)}",
+    )
+    return g2p_hash
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -96,7 +113,7 @@ def main() -> None:
     args = parser.parse_args()
 
     version = read_plugin_version()
-    command = [sys.executable, str(ROOT / "tools" / "build_database.py")]
+    command = [sys.executable, str(ROOT / "tools" / "build_language_pack.py")]
     if args.sources_dir is not None:
         command.extend(("--sources-dir", str(args.sources_dir)))
     if args.generated_date is not None:
@@ -106,9 +123,11 @@ def main() -> None:
     synchronize_runtime_version(version)
     database_hash = synchronize_database_hash()
     readable_hash = synchronize_readable_hash()
+    g2p_hash = synchronize_g2p_hash()
     print(
         f"prepared release {version}: synchronized main.lua and database "
-        f"sha256 {database_hash}; readable sha256 {readable_hash}"
+        f"sha256 {database_hash}; readable sha256 {readable_hash}; "
+        f"G2P sha256 {g2p_hash}"
     )
 
 
