@@ -53,7 +53,7 @@ def synchronize_runtime_version(
 
 
 def synchronize_database_hash(
-    database_path: Path = ROOT / "data" / "pronunciations.sqlite3",
+    database_path: Path = ROOT / "data" / "en" / "pronunciations.sqlite3",
     release_builder_path: Path = ROOT / "tools" / "build_release.py",
 ) -> str:
     database_hash = sha256(database_path)

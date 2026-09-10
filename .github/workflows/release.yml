@@ -81,8 +81,8 @@ jobs:
           git add \
             main.lua \
             tools/build_release.py \
-            data/pronunciations.sqlite3 \
-            data/wikipron_sources.tsv
+            data/en/pronunciations.sqlite3 \
+            data/en/pack.tsv
 
           if git diff --cached --quiet; then
             echo "Release inputs are already synchronized."

@@ -56,20 +56,18 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 
-WikiPron-derived US/UK English data (CC BY-SA 4.0)
+WikiPron-derived language-pack data (CC BY-SA 4.0)
 ===================================================
 
-The US and UK English broad-IPA records in data/pronunciations.sqlite3 were
-extracted from the English Wiktionary by WikiPron:
+The bundled US and UK English broad-IPA records in
+data/en/pronunciations.sqlite3 were extracted from the English Wiktionary by
+WikiPron. Optional language packs built under data/<language-code>/ contain
+corresponding Wiktionary records extracted by WikiPron:
 
   WikiPron: https://github.com/CUNY-CL/wikipron
-  Pinned revision: d282e848a211ea31cfd730f0ced8bc8cdab9e83d
-  Inputs:
-    data/scrape/tsv/eng_latn_us_broad.tsv
-    SHA-256: f304b8f0565466e8abfe4c04a30d99421e1590d2aa17c4a08ebfa5942c587e75
-    data/scrape/tsv/eng_latn_uk_broad.tsv
-    SHA-256: f8ca476aa2e96cb22cafbf9099d689b5902a9d321579055081909b2eeafa1b8d
-  Curated source manifest: data/wikipron_sources.tsv
+  Bundled database release: v2.2.0
+  Bundled database revision: d282e848a211ea31cfd730f0ced8bc8cdab9e83d
+  English profiles: eng_latn_us_broad.tsv and eng_latn_uk_broad.tsv
   Wiktionary: https://en.wiktionary.org/
   Wiktionary attribution and license information:
   https://en.wiktionary.org/wiki/Wiktionary:Copyrights
@@ -87,7 +85,10 @@ is bundled in this plugin.
 The pronunciation database is a collection containing CMUdict records under
 their BSD-3-Clause terms, WikiPron/Wiktionary records under CC BY-SA 4.0, and
 original curated records. Each record retains its source label, and the
-database metadata records the exact source revisions and input hash.
+database metadata records the WikiPron release/tag, source revision, language,
+profiles, record counts, and attribution. Individual WikiPron TSV files are
+discovered from the selected stable release and are not SHA-256 pinned. The
+final English SQLite artifact remains SHA-256 checked by the release tooling.
 
 
 Montreal Forced Aligner English US ARPA G2P model (CC BY 4.0)

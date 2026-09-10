@@ -50,6 +50,16 @@ preload("luasettings", {})
 preload("ui/network/manager", NetworkMgr)
 local SQ3 = {}
 preload("lua-ljsqlite3/init", SQ3)
+local lfs_entries = { "en" }
+preload("lfs", {
+    dir = function()
+        local index = 0
+        return function()
+            index = index + 1
+            return lfs_entries[index]
+        end
+    end,
+})
 preload("ui/uimanager", UIManager)
 preload("ui/widget/container/widgetcontainer", {
     extend = function(_, value) return value end,
@@ -74,6 +84,8 @@ preload("gettext", function(value) return value end)
 
 local Plugin = dofile("main.lua")
 Plugin.path = "."
+Plugin.data_path = "./data"
+Plugin.pronunciation_language = "auto"
 Plugin.generated_fallback = true
 
 -- Heavy feature modules stay out of the startup path on memory-limited devices.
@@ -489,13 +501,116 @@ equal(generated_fallback_item.text_func(), "Generated fallback: on",
     "generated fallback label did not update after enabling")
 equal(menu_update_count, 4,
     "fallback toggles did not refresh the open settings menu")
-local language_menu = menu.pronunciation.sub_item_table[3].sub_item_table
+local pronunciation_language_menu =
+    menu.pronunciation.sub_item_table[3].sub_item_table
+equal(#pronunciation_language_menu, 2,
+    "pronunciation-language menu should contain Auto and installed English")
+equal(pronunciation_language_menu[2].text, "English",
+    "English pack appeared with a regional database label")
+pronunciation_language_menu[2].callback()
+equal(Plugin.pronunciation_language, "en",
+    "manual pronunciation-language menu selection was not saved")
+pronunciation_language_menu[1].callback()
+equal(Plugin.pronunciation_language, "auto",
+    "pronunciation-language menu did not return to Auto")
+local language_menu = menu.pronunciation.sub_item_table[4].sub_item_table
 equal(#language_menu, 2,
     "generated-language menu should contain only Auto and US English")
 language_menu[2].callback()
 equal(Plugin.generated_language, "en",
     "generated-language menu did not select US English")
 Plugin.generated_language = "auto"
+
+-- Offline packs are discovered from data/{base-code}/ sidecars without
+-- opening SQLite. Locale and ISO aliases select one base-language database.
+local pack_root = "/tmp/pronunciation-koplugin-pack-test"
+os.execute("mkdir -p " .. pack_root .. "/en " .. pack_root .. "/fr")
+local function writePack(code, name, iso6393, aliases)
+    local sidecar = assert(io.open(pack_root .. "/" .. code .. "/pack.tsv", "w"))
+    sidecar:write("language_code\t", code, "\n")
+    sidecar:write("language_name\t", name, "\n")
+    sidecar:write("iso6393\t", iso6393, "\n")
+    sidecar:write("aliases\t", aliases, "\n")
+    sidecar:write("schema_version\t7\n")
+    sidecar:close()
+    local database = assert(io.open(
+        pack_root .. "/" .. code .. "/pronunciations.sqlite3", "wb"))
+    database:write("fixture")
+    database:close()
+end
+writePack("en", "English", "eng", "en,eng")
+writePack("fr", "French", "fra", "fr,fra,fre")
+lfs_entries = { "en", "fr" }
+Plugin.data_path = pack_root
+Plugin.language_packs = nil
+Plugin.language_pack_aliases = nil
+equal(#Plugin:installedLanguagePacks(), 2,
+    "installed language pack discovery missed a pack")
+equal(Plugin:normalizePronunciationLanguage("en-US"), "en",
+    "en-US did not collapse to en")
+equal(Plugin:normalizePronunciationLanguage("en-GB"), "en",
+    "en-GB did not collapse to en")
+equal(Plugin:normalizePronunciationLanguage("eng"), "en",
+    "eng did not normalize to en")
+equal(Plugin:normalizePronunciationLanguage("fr-CA"), "fr",
+    "fr-CA did not collapse to fr")
+equal(Plugin:normalizePronunciationLanguage("fre"), "fr",
+    "bibliographic French alias did not normalize")
+
+Plugin.ui.document = { getProps = function() return { language = "fr-CA" } end }
+Plugin.pronunciation_language = "auto"
+equal(Plugin:selectedLanguagePack().code, "fr",
+    "Auto did not use document language metadata")
+Plugin.pronunciation_language = "en"
+equal(Plugin:selectedLanguagePack().code, "en",
+    "manual pronunciation language did not override Auto")
+Plugin.pronunciation_language = "auto"
+Plugin.ui.document.getProps = function() return { language = "de-DE" } end
+equal(Plugin:selectedLanguagePack().code, "en",
+    "missing requested pack did not fall back to installed English")
+
+-- A foreign database result remains valid IPA-only and is never passed
+-- through the English-oriented readable-pronunciation converter.
+local foreign_returned = false
+local foreign_statement = {
+    bind = function() end,
+    step = function()
+        if foreign_returned then return nil end
+        foreign_returned = true
+        return { "/bɔ̃.ʒuʁ/", nil, nil, "WikiPron/Wiktionary", 78,
+            nil, 0, "fr", "French" }
+    end,
+    close = function() end,
+}
+local foreign_rows = Plugin:_queryConnection({
+    prepare = function() return foreign_statement end,
+}, "bonjour", nil, { code = "fr", name = "French" })
+equal(foreign_rows[1].language, "French", "foreign result language missing")
+equal(foreign_rows[1].simple, nil,
+    "foreign IPA was forced through the English readable converter")
+local foreign_formatted = Plugin:format("bonjour", foreign_rows, "bonjour")
+truthy(foreign_formatted:find("IPA (French): /bɔ̃.ʒuʁ/", 1, true),
+    "IPA-only foreign result did not render")
+truthy(not foreign_formatted:find("Readable", 1, true),
+    "IPA-only foreign result rendered a fake readable spelling")
+local pack_open = SQ3.open
+Plugin.pronunciation_language = "fr"
+SQ3.open = function() error("corrupt fixture database") end
+equal(Plugin:query("bonjour"), nil,
+    "corrupt selected language pack did not fail gracefully")
+SQ3.open = pack_open
+
+Plugin.data_path = "./data"
+lfs_entries = { "en" }
+Plugin.language_packs = nil
+Plugin.language_pack_aliases = nil
+Plugin.pronunciation_language = "auto"
+Plugin.ui.document = nil
+os.remove(pack_root .. "/en/pack.tsv")
+os.remove(pack_root .. "/en/pronunciations.sqlite3")
+os.remove(pack_root .. "/fr/pack.tsv")
+os.remove(pack_root .. "/fr/pronunciations.sqlite3")
+os.execute("rmdir " .. pack_root .. "/en " .. pack_root .. "/fr " .. pack_root)
 
 -- Manual pronunciation lookup mirrors KOReader's dictionary lookup dialog.
 local menu_lookup_word
@@ -568,7 +683,8 @@ for _, results in pairs(Plugin.cache) do
     equal(results[1].note, nil, "sourced cache retained an unused description")
 end
 truthy(sourced_cache_count <= 256, "sourced cache limit was not enforced")
-truthy(Plugin.cache["cached-current"], "new sourced cache entry was pruned")
+truthy(Plugin.cache["language:en|word:cached-current"],
+    "new language-scoped sourced cache entry was pruned")
 local cached_overrides = Plugin.overrides
 local cached_database_open = SQ3.open
 local cached_database_open_count = 0
@@ -790,7 +906,8 @@ equal(language_hints[1].code, "es", "Spanish etymology code")
 local formatted = Plugin:format("resume", parsed, "resume")
 truthy(formatted:find("<formatted><bold>resume</bold>", 1, true) == 1,
     "queried word was not bolded")
-truthy(formatted:find("IPA (US):", 1, true), "formatted US label missing")
+truthy(formatted:find("IPA (US English):", 1, true),
+    "formatted US English label missing")
 truthy(formatted:find("Readable (approx.):", 1, true),
     "approximate readable label missing")
 truthy(formatted:find("Source: Wiktionary", 1, true),

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import hashlib
 import os
 import re
@@ -21,10 +20,10 @@ RELEASE_FILES = (
     "README.md",
     "LICENSE",
     "LICENSES.txt",
-    "data/pronunciations.sqlite3",
+    "data/en/pronunciations.sqlite3",
+    "data/en/pack.tsv",
     "data/mfa_english_g2p.bin",
     "data/mfa_english_g2p.SOURCE.txt",
-    "data/wikipron_sources.tsv",
 )
 ZIP_TIMESTAMP = (2026, 1, 1, 0, 0, 0)
 VERSION_PATTERN = re.compile(
@@ -35,7 +34,7 @@ VERSION_PATTERN = re.compile(
     r"(?:\+[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?"
 )
 DATABASE_SHA256 = (
-    "85028786aac72b2cc43fa369e6bf42148af052453a84d9793dbf58f324d804ae"
+    "ffa93ff3028abcd18ea9d2107cc860c7b752cbfac41e70a57cb6c9962e87ec11"
 )
 G2P_SHA256 = (
     "9b4d3730a451c530da2a81f2c378a9e4635ec706e14f43d22fee945effd17f84"
@@ -82,16 +81,20 @@ def validate_inputs() -> None:
     if missing:
         raise FileNotFoundError(f"release input(s) missing: {', '.join(missing)}")
 
-    database_path = ROOT / "data/pronunciations.sqlite3"
+    database_path = ROOT / "data/en/pronunciations.sqlite3"
     database = sqlite3.connect(f"{database_path.as_uri()}?mode=ro", uri=True)
     try:
         if database.execute("PRAGMA quick_check").fetchone()[0] != "ok":
             raise RuntimeError("pronunciation database failed quick_check")
-        if database.execute("PRAGMA user_version").fetchone()[0] != 6:
+        if database.execute("PRAGMA user_version").fetchone()[0] != 7:
             raise RuntimeError("pronunciation database schema is not release-ready")
         metadata = dict(database.execute("SELECT key, value FROM metadata"))
         if metadata.get("version") != PLUGIN_VERSION:
             raise RuntimeError("pronunciation database version does not match release")
+        if metadata.get("language_code") != "en":
+            raise RuntimeError("bundled pronunciation database is not English")
+        if not metadata.get("wikipron_release"):
+            raise RuntimeError("pronunciation database lacks WikiPron release provenance")
         headwords, records = database.execute(
             "SELECT COUNT(DISTINCT word), COUNT(*) FROM pronunciations"
         ).fetchone()
@@ -104,27 +107,18 @@ def validate_inputs() -> None:
     if sha256(database_path) != DATABASE_SHA256:
         raise RuntimeError("pronunciation database failed the release integrity check")
 
-    with (ROOT / "data/wikipron_sources.tsv").open(
-        encoding="utf-8", newline=""
-    ) as manifest:
-        reader = csv.DictReader(manifest, delimiter="\t")
-        required = {"source_id", "sha256"}
-        missing_columns = required - set(reader.fieldnames or ())
-        if missing_columns:
-            raise RuntimeError(
-                f"WikiPron manifest is missing columns: {sorted(missing_columns)}"
-            )
-        source_count = 0
-        for row in reader:
-            source_count += 1
-            source_id = row["source_id"].strip()
-            expected = row["sha256"].strip().lower()
-            if metadata.get(f"wikipron_{source_id}_sha256") != expected:
-                raise RuntimeError(
-                    f"database metadata does not match WikiPron source {source_id}"
-                )
-        if source_count == 0:
-            raise RuntimeError("WikiPron release manifest contains no sources")
+    pack_metadata = dict(
+        line.rstrip("\n").split("\t", 1)
+        for line in (ROOT / "data/en/pack.tsv").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    )
+    if (pack_metadata.get("language_code") != "en"
+            or pack_metadata.get("language_name") != "English"
+            or pack_metadata.get("schema_version") != "7"):
+        raise RuntimeError("bundled English pack sidecar is invalid")
+    if pack_metadata.get("aliases") != metadata.get("language_aliases"):
+        raise RuntimeError("bundled pack sidecar does not match database metadata")
 
     if not (ROOT / "LICENSE").read_text(encoding="utf-8").startswith(
         "MIT License\n"

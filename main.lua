@@ -7,7 +7,7 @@ local _ = require("gettext")
 
 -- Keep database, network, JSON, and dialog modules out of the plugin's startup
 -- footprint. They are loaded only when the corresponding feature is used.
-local DictQuickLookup, InfoMessage, InputDialog, JSON, NetworkMgr, SQ3
+local DictQuickLookup, InfoMessage, InputDialog, JSON, LFS, NetworkMgr, SQ3
 local TextBoxWidget
 local ltn12, socket, http, socketutil, url
 
@@ -75,9 +75,9 @@ local function loadOnlineModules()
     url = require("socket.url")
 end
 
-local PLUGIN_VERSION = "0.6.2"
+local PLUGIN_VERSION = "0.7.0"
 local DICTIONARY_BUTTON_ID = "pronunciation_lookup"
-local CACHE_VERSION = 5
+local CACHE_VERSION = 6
 local GENERATOR_VERSION = 3
 local SOURCED_CACHE_LIMIT = 256
 local GENERATED_CACHE_LIMIT = 128
@@ -362,7 +362,8 @@ function Pronunciation:readableFromIpa(ipa)
 end
 
 local function ensureReadable(result)
-    if result and (not result.simple or result.simple == "") and result.ipa then
+    if result and (not result.language or result.language == "English")
+            and (not result.simple or result.simple == "") and result.ipa then
         result.simple = readableFromIpa(result.ipa)
         result.simple_approx = result.simple ~= nil
     end
@@ -423,6 +424,120 @@ local function languageDefinition(name, code)
         end
     end
     return resolve(code) or resolve(name)
+end
+
+local function readPackMetadata(path)
+    local file = io.open(path, "r")
+    if not file then return nil end
+    local metadata = {}
+    for line in file:lines() do
+        local key, value = line:match("^([^\t]+)\t(.*)$")
+        if key and value then metadata[key] = value end
+    end
+    file:close()
+    local code = metadata.language_code
+    local name = metadata.language_name
+    if not code or not code:match("^[a-z][a-z][a-z]?$") or not name
+            or name == "" then return nil end
+    local aliases = {}
+    for alias in (metadata.aliases or code):gmatch("[^,]+") do
+        alias = normalizeLanguageKey(alias)
+        if alias ~= "" then aliases[#aliases + 1] = alias end
+    end
+    return { code = code, name = name, aliases = aliases }
+end
+
+local function fileExists(path)
+    local file = io.open(path, "rb")
+    if not file then return false end
+    file:close()
+    return true
+end
+
+function Pronunciation:discoverLanguagePacks(force)
+    if self.language_packs and not force then return self.language_packs end
+    local packs = {}
+    local data_path = self.data_path or (self.path .. "/data")
+    if not LFS then
+        local ok, module = pcall(require, "lfs")
+        LFS = ok and module or false
+    end
+    local function add(code)
+        if packs[code] then return end
+        local directory = data_path .. "/" .. code
+        local metadata = readPackMetadata(directory .. "/pack.tsv")
+        local database_path = directory .. "/pronunciations.sqlite3"
+        if metadata and metadata.code == code and fileExists(database_path) then
+            metadata.path = database_path
+            packs[code] = metadata
+        end
+    end
+    if LFS and type(LFS.dir) == "function" then
+        local ok, iterator, state = pcall(LFS.dir, data_path)
+        if ok and iterator then
+            for entry in iterator, state do
+                if entry:match("^[a-z][a-z][a-z]?$") then add(entry) end
+            end
+        end
+    end
+    -- English is the bundled baseline even on stripped-down Lua builds
+    -- without LuaFileSystem. Optional pack discovery requires KOReader's
+    -- normal lfs module.
+    add("en")
+    local aliases = {}
+    for code, pack in pairs(packs) do
+        aliases[code] = code
+        for _, alias in ipairs(pack.aliases) do aliases[alias] = code end
+    end
+    self.language_packs = packs
+    self.language_pack_aliases = aliases
+    return packs
+end
+
+function Pronunciation:normalizePronunciationLanguage(value)
+    local key = normalizeLanguageKey(value)
+    if key == "" then return nil end
+    self:discoverLanguagePacks()
+    local aliases = self.language_pack_aliases or {}
+    local code = aliases[key]
+    if code then return code end
+    local base = key:match("^([a-z][a-z][a-z]?)%-")
+    return base and aliases[base] or nil
+end
+
+function Pronunciation:documentPronunciationLanguage()
+    local document = self.ui and self.ui.document
+    if not document or type(document.getProps) ~= "function" then return nil end
+    local ok, properties = pcall(document.getProps, document)
+    if not ok or type(properties) ~= "table"
+            or type(properties.language) ~= "string" then return nil end
+    for value in properties.language:gmatch("[^,;]+") do
+        local code = self:normalizePronunciationLanguage(value)
+        if code then return code end
+    end
+end
+
+function Pronunciation:selectedLanguagePack()
+    local packs = self:discoverLanguagePacks()
+    local code
+    if self.pronunciation_language
+            and self.pronunciation_language ~= "auto" then
+        code = self:normalizePronunciationLanguage(self.pronunciation_language)
+    else
+        code = self:documentPronunciationLanguage()
+    end
+    return packs[code] or packs.en
+end
+
+function Pronunciation:installedLanguagePacks()
+    local packs = self:discoverLanguagePacks(true)
+    local ordered = {}
+    for _, pack in pairs(packs) do ordered[#ordered + 1] = pack end
+    table.sort(ordered, function(left, right)
+        if left.name ~= right.name then return left.name < right.name end
+        return left.code < right.code
+    end)
+    return ordered
 end
 
 local function mergeLanguageHints(...)
@@ -1004,7 +1119,10 @@ function Pronunciation:generationCacheKey(word, hints)
     if #languages == 0 then
         languages[1] = LANGUAGE_DEFINITIONS.english.code
     end
+    local pack = self:selectedLanguagePack()
+    local pack_code = pack and pack.code or "none"
     return "generator:" .. GENERATOR_VERSION
+        .. "|pack:" .. pack_code
         .. "|languages:" .. table.concat(languages, ",")
         .. "|word:" .. normalizeWord(word)
 end
@@ -1062,7 +1180,9 @@ local function pruneGeneratedCache(cache, protected_key)
 end
 
 function Pronunciation:init()
-    self.db_path = self.path .. "/data/pronunciations.sqlite3"
+    self.data_path = self.path .. "/data"
+    self.language_packs = nil
+    self.language_pack_aliases = nil
     self.settings = LuaSettings:open(DataStorage:getSettingsDir() .. "/pronunciation.lua")
     self.overrides = self.settings:readSetting("overrides", {})
     self.cache = self.settings:readSetting("cache", {})
@@ -1072,6 +1192,12 @@ function Pronunciation:init()
     if type(self.generated_cache) ~= "table" then self.generated_cache = {} end
     self.online_fallback = self.settings:readSetting("online_fallback", true)
     self.generated_fallback = self.settings:readSetting("generated_fallback", true)
+    self.pronunciation_language = self.settings:readSetting(
+        "pronunciation_language", "auto")
+    if type(self.pronunciation_language) ~= "string"
+            or self.pronunciation_language == "" then
+        self.pronunciation_language = "auto"
+    end
     self.generated_language = self.settings:readSetting("generated_language", "auto")
     if self.generated_language ~= "auto" then
         local selected = languageDefinition(nil, self.generated_language)
@@ -1284,6 +1410,24 @@ function Pronunciation:onShowPronunciationLookup(selection)
 end
 
 function Pronunciation:addToMainMenu(menu_items)
+    local pronunciation_language_items = {
+        {
+            text = _("Auto (book language)"),
+            checked_func = function()
+                return self.pronunciation_language == "auto"
+            end,
+            callback = function() self:setPronunciationLanguage("auto") end,
+        },
+    }
+    for _, pack in ipairs(self:installedLanguagePacks()) do
+        pronunciation_language_items[#pronunciation_language_items + 1] = {
+            text = pack.name,
+            checked_func = function()
+                return self.pronunciation_language == pack.code
+            end,
+            callback = function() self:setPronunciationLanguage(pack.code) end,
+        }
+    end
     local generated_language_items = {
         {
             text = _("Auto (word or book language)"),
@@ -1351,6 +1495,18 @@ function Pronunciation:addToMainMenu(menu_items)
             },
             {
                 text_func = function()
+                    if self.pronunciation_language == "auto" then
+                        return _("Pronunciation language") .. ": " .. _("Auto")
+                    end
+                    local packs = self:discoverLanguagePacks()
+                    local pack = packs[self.pronunciation_language]
+                    return _("Pronunciation language") .. ": "
+                        .. (pack and pack.name or self.pronunciation_language)
+                end,
+                sub_item_table = pronunciation_language_items,
+            },
+            {
+                text_func = function()
                     if self.generated_language == "auto" then
                         return _("Generated language") .. ": " .. _("Auto")
                     end
@@ -1380,13 +1536,23 @@ function Pronunciation:addToMainMenu(menu_items)
                 text = _("About pronunciation dictionary"),
                 callback = function()
                     UIManager:show(newInfoMessage{
-                        text = _("Offline US/UK IPA, sourced online lookup, and a bundled US English fallback for unfamiliar words. Long-press Pronunciation to save an override.")
+                        text = _("Offline language packs with automatic book-language selection, sourced online lookup, and a bundled US English fallback for unfamiliar words. Long-press Pronunciation to save an override.")
                             .. "\n\n" .. _("Version") .. ": " .. PLUGIN_VERSION,
                     })
                 end,
             },
         },
     }
+end
+
+function Pronunciation:setPronunciationLanguage(code)
+    if code ~= "auto" then
+        code = self:normalizePronunciationLanguage(code)
+        if not code then return end
+    end
+    self.pronunciation_language = code
+    self.settings:saveSetting("pronunciation_language", code)
+    self.settings:flush()
 end
 
 function Pronunciation:setGeneratedLanguage(code)
@@ -1412,7 +1578,14 @@ function Pronunciation:getOverride(word)
 end
 
 function Pronunciation:getCache(word)
-    local cached = (self.cache or {})[normalizeWord(word)]
+    local normalized = normalizeWord(word)
+    local pack = self:selectedLanguagePack()
+    local code = pack and pack.code or "none"
+    local cached = (self.cache or {})[
+        "language:" .. code .. "|word:" .. normalized]
+    -- v0.6 and earlier cached English online results by unscoped word. They
+    -- remain safe to reuse only while the English pack is selected.
+    if not cached and code == "en" then cached = (self.cache or {})[normalized] end
     if type(cached) == "table" and #cached > 0 then
         return ensureReadables(cached)
     end
@@ -1440,13 +1613,14 @@ local function boldHeading(text)
 end
 
 local PRONUNCIATION_QUERY = [[
-    SELECT ipa, arpabet, simple, source, confidence, region, simple_approx
+    SELECT ipa, arpabet, simple, source, confidence, region, simple_approx,
+           language_code, language_name
       FROM pronunciations
      WHERE word = ?
   ORDER BY confidence DESC, source, region, ipa
 ]]
 
-function Pronunciation:_queryConnection(connection, word, statement)
+function Pronunciation:_queryConnection(connection, word, statement, pack)
     local ok, results = pcall(function()
         if statement then
             statement:reset()
@@ -1458,15 +1632,15 @@ function Pronunciation:_queryConnection(connection, word, statement)
         while true do
             local row = statement:step()
             if not row then break end
-            local language = languageDefinition(row[6], nil)
             rows[#rows + 1] = {
                 ipa = row[1],
                 arpabet = row[2],
                 simple = row[3],
                 source = row[4],
                 confidence = tonumber(row[5]) or 0,
-                region = language and nil or row[6],
-                language = language and language.name or nil,
+                region = row[6],
+                language_code = row[8] or (pack and pack.code),
+                language = row[9] or (pack and pack.name),
                 simple_approx = tonumber(row[7]) == 1,
             }
         end
@@ -1478,28 +1652,22 @@ function Pronunciation:_queryConnection(connection, word, statement)
     end
     if #results > 0 then
         ensureReadables(results)
-        -- Prefer an English/curated exact entry over a foreign homograph.
-        -- Foreign-only matches remain available for rare borrowed words.
-        local english = {}
-        for _, result in ipairs(results) do
-            if not result.language or result.language == "English" then
-                english[#english + 1] = result
-            end
-        end
-        return #english > 0 and english or results, nil, statement
+        return results, nil, statement
     end
     return nil, nil, statement
 end
 
 function Pronunciation:query(word)
-    local opened, connection = pcall(openDatabase, self.db_path)
+    local pack = self:selectedLanguagePack()
+    if not pack then return nil end
+    local opened, connection = pcall(openDatabase, pack.path)
     if not opened or not connection then
         logger.err("Pronunciation: database open failed:", connection)
         return nil
     end
     local normalized = normalizeWord(word)
     local results, query_error, statement = self:_queryConnection(connection,
-        normalized)
+        normalized, nil, pack)
     closeSqlResource(statement)
     closeSqlResource(connection)
     if query_error then
@@ -1512,8 +1680,10 @@ function Pronunciation:queryLanguageHints(word)
     local connection
     local statement
     local normalized = normalizeWord(word)
+    local pack = self:selectedLanguagePack()
+    if not pack then return {} end
     local ok, results = pcall(function()
-        connection = openDatabase(self.db_path)
+        connection = openDatabase(pack.path)
         statement = connection:prepare([[
             SELECT language_code, language_name, source
               FROM language_hints
@@ -1697,7 +1867,9 @@ function Pronunciation:lookupOffline(word)
     -- Reuse one SQLite connection while checking the exact word and all
     -- possible inflection bases. Opening the bundled database repeatedly is
     -- noticeably expensive on low-memory e-ink devices.
-    local opened, connection = pcall(openDatabase, self.db_path)
+    local pack = self:selectedLanguagePack()
+    local opened, connection = false, nil
+    if pack then opened, connection = pcall(openDatabase, pack.path) end
     if not opened or not connection then
         logger.err("Pronunciation: database open failed:", connection)
         connection = nil
@@ -1706,7 +1878,7 @@ function Pronunciation:lookupOffline(word)
     local function queryDatabase(candidate_word)
         if not connection then return nil end
         local rows, query_error, reusable_statement = self:_queryConnection(
-            connection, candidate_word, statement)
+            connection, candidate_word, statement, pack)
         if reusable_statement then
             statement = reusable_statement
         elseif query_error then
@@ -1732,7 +1904,8 @@ function Pronunciation:lookupOffline(word)
     results = queryDatabase(word)
     if results then return finish(results, word) end
 
-    for _, candidate in ipairs(self:candidates(word)) do
+    for _, candidate in ipairs(pack and pack.code == "en"
+            and self:candidates(word) or {}) do
         local base = self:getOverride(candidate.word)
             or self:getCache(candidate.word)
             or queryDatabase(candidate.word)
@@ -1883,6 +2056,8 @@ function Pronunciation:parseDictionaryApi(decoded)
             ipa = ipa,
             simple = readableFromIpa(ipa),
             simple_approx = true,
+            language_code = "en",
+            language = "English",
             region = region,
             source = "Free Dictionary API",
             confidence = 75,
@@ -1984,6 +2159,8 @@ function Pronunciation:parseWiktionaryHtml(html)
             ipa = ipa,
             simple = readableFromIpa(ipa),
             simple_approx = true,
+            language_code = "en",
+            language = "English",
             region = region,
             source = "Wiktionary",
             confidence = 85,
@@ -2027,7 +2204,9 @@ function Pronunciation:lookupOnline(word)
 end
 
 function Pronunciation:saveCache(word, results)
-    local key = normalizeWord(word)
+    local pack = self:selectedLanguagePack()
+    local code = pack and pack.code or "none"
+    local key = "language:" .. code .. "|word:" .. normalizeWord(word)
     self.cache[key] = results
     pruneSourcedCache(self.cache, key)
     self.settings:saveSetting("cache", self.cache)
@@ -2059,8 +2238,8 @@ function Pronunciation:format(original, results, matched)
     lines[#lines + 1] = ""
     for index, result in ipairs(results) do
         local location
-        if result.language == "English" and result.region then
-            location = result.region .. " English"
+        if result.language and result.region then
+            location = result.region .. " " .. result.language
         else
             location = result.language or result.region
         end
