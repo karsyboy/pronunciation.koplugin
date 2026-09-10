@@ -1,11 +1,17 @@
 # Contributing
 
-## Build and test
+## Requirements
 
-Runtime files are plain Lua (`main.lua` and the lazy-loaded `ai.lua`) plus
-per-language SQLite/readable-converter packs and optional per-language G2P
-models. Build tools require Python 3.10 or newer and Git; they use only the
-Python standard library.
+- Python 3.10 or newer
+- Git
+- Lua 5.1 and/or LuaJIT for runtime tests
+
+The runtime is plain Lua plus per-language SQLite, readable-converter, and
+optional G2P files. Python build tools use only the standard library.
+
+## Test the project
+
+Run these commands from the repository root:
 
 ```sh
 luac5.1 -p main.lua ai.lua
@@ -15,80 +21,58 @@ python3 tests/test_database.py
 python3 tools/build_release.py
 ```
 
-The Lua regression suite mocks pronunciation and model-list API responses; it
-must not make paid live-provider calls.
+AI requests are mocked. Automated tests must never call paid live providers.
+The release archive is written to `dist/` and is reproducible from identical
+inputs.
 
-The release builder validates versions, the bundled English database's schema,
-metadata and final SHA-256, the readable converter and G2P model SHA-256,
-required licenses, and
-archive contents. Output is `dist/pronunciation.koplugin-<version>.zip`, using
-the semantic version in `_meta.lua`. Repeated builds from identical inputs are
-byte-identical. `--output PATH` selects another archive path;
-`--print-version` prints the validated version.
+## Important files
 
-## Prepare and publish a release
+- `main.lua`: KOReader integration, lookup order, settings, and UI
+- `ai.lua`: AI providers, requests, validation, and model discovery
+- `tools/build_language_pack.py`: complete language-pack builder
+- `tools/build_database.py`: database builder and compatible all-in-one entry
+- `tools/build_g2p_model.py`: lower-level G2P-only builder
+- `tests/`: Lua runtime and Python database/release coverage
 
-`_meta.lua` is the source of truth for the plugin version. Change its `version`
-and run:
+## Build language packs
 
-```sh
-python3 tools/prepare_release.py
-```
-
-Preparation resolves the latest stable, non-prerelease GitHub Release from
-WikiPron, checks out that exact release tag, rebuilds the complete English
-language pack, synchronizes `PLUGIN_VERSION`, and refreshes
-the SHA-256 values of the finalized bundled database, converter, and G2P model
-in `tools/build_release.py`.
-WikiPron TSV inputs are discovered from the release and are not hash-pinned.
-
-Then run the complete validation shown above. The release workflow performs the
-same steps, commits `main.lua`, `ai.lua`, `tools/build_release.py`,
-`data/en/pronunciations.sqlite3`, `data/en/readable.tsv`, `data/en/pack.tsv`,
-`data/en/g2p.bin`, and `data/en/g2p.SOURCE.txt`, and publishes the
-versioned archive. `PRAGMA user_version` is the database schema version, not the
-plugin version.
-
-## Build pronunciation language packs
-
-The default command rebuilds the complete bundled English pack:
+Build English, selected languages, or every available language:
 
 ```sh
 python3 tools/build_language_pack.py
-```
-
-The builder queries GitHub's latest-release API for
-[WikiPron](https://github.com/CUNY-CL/wikipron), checks out that exact stable
-tag, discovers all usable TSV/profile files, and prefers broad IPA data. If a
-language has no broad file, available narrow IPA is used. The project
-supplement is added only to English; CMUdict is not used. It also queries the
-official MFA release catalog, chooses the newest stable compatible Pynini G2P model
-for each requested language, downloads it, and packs it for the Lua runtime.
-
-Build one or more optional packs by listing their language codes:
-
-```sh
-python3 tools/build_language_pack.py fr
 python3 tools/build_language_pack.py fr de
-```
-
-Or build every usable base language in the release:
-
-```sh
 python3 tools/build_language_pack.py --all
 ```
 
-Outputs use `data/<base-code>/pronunciations.sqlite3`, a generated
-`readable.tsv` IPA-to-readable converter, an automatic `g2p.bin` when
-available, provenance in `g2p.SOURCE.txt`, and a small `pack.tsv` sidecar used
-for lazy runtime discovery. Locale variants and WikiPron dialect
-profiles merge into one base-language pack. ISO 639-1 is preferred where it
-exists; otherwise the WikiPron ISO 639-3 code is used. A normal plugin release
-still packages only `data/en/`, regardless of optional packs in a developer's
-local `data/` directory.
+The builder downloads the latest stable
+[WikiPron](https://github.com/CUNY-CL/wikipron) release and a compatible
+Montreal Forced Aligner Pynini model when available. Each pack is written to
+`data/<base-code>/` and contains:
 
-For a deterministic offline build, provide the WikiPron release TSV directory,
-its language metadata, release/tag, and commit provenance:
+- `pronunciations.sqlite3`: sourced IPA records
+- `readable.tsv`: IPA-to-readable conversion data
+- `g2p.bin`: optional local generation model
+- `pack.tsv`: runtime metadata
+- `g2p.SOURCE.txt`: model provenance, when G2P is available
+
+Regional profiles merge into one base-language pack. English-only supplemental
+records are not added to other languages. Normal releases package only
+`data/en/`, even when optional packs exist locally.
+
+Useful options:
+
+- `--no-g2p`: build only database and readable data
+- `--require-g2p`: fail if no compatible model exists
+- `--sources-dir PATH`: choose the download/cache directory
+- `--data-dir PATH`: choose the language-pack output directory
+- `--output PATH`: write one database to a custom location
+
+Set `GITHUB_TOKEN` if anonymous GitHub API limits are too restrictive. Network,
+API, and Git failures stop the build instead of silently using stale data.
+
+### Offline or pinned builds
+
+Pass a local WikiPron checkout and its provenance:
 
 ```sh
 python3 tools/build_database.py \
@@ -101,55 +85,34 @@ python3 tools/build_database.py \
   --no-g2p
 ```
 
-`tools/build_database.py --language CODE` remains a backwards-compatible
-spelling of the same all-in-one command.
+`tools/build_database.py --language CODE` remains compatible with the complete
+language-pack workflow.
 
-Use `--sources-dir PATH` to relocate automatic checkouts, `--data-dir PATH` to
-relocate pack outputs, or `--output PATH` for a single database. Network/API or
-Git failures stop with an actionable error rather than silently using stale
-WikiPron or MFA data. `--no-g2p` explicitly builds only database/readable
-assets, while `--require-g2p` fails if MFA has no compatible model. A missing
-published model is otherwise a warning and does not discard the useful
-database pack. Exact downloaded MFA release archives are cached below the
-selected `--sources-dir`; set `GITHUB_TOKEN` if anonymous API rate limits are
-too restrictive.
+### G2P-only builds
 
-English readable spellings use deterministic English phonetic mappings and
-syllabification so spelling irregularities cannot teach corrupt phone values.
-Other languages derive an independent converter from their selected WikiPron
-profiles. Those proportional segment-to-grapheme alignments are deterministic
-and intentionally displayed as approximations. An unrecognized IPA phone
-suppresses readable output instead of silently dropping part of a pronunciation.
-
-## Advanced G2P-only builds
-
-The all-in-one database command is recommended. The lower-level model builder
-can refresh models for packs that already exist; it also discovers and
-downloads official archives automatically:
+Prefer the complete language-pack builder. To refresh only existing G2P files:
 
 ```sh
-python3 tools/build_g2p_model.py \
-  --language en
-```
-
-Build multiple installed language models with repeatable arguments:
-
-```sh
-python3 tools/build_g2p_model.py \
-  --language en --language fr
-```
-
-Or refresh every installed pack for which a compatible model exists:
-
-```sh
+python3 tools/build_g2p_model.py --language en --language fr
 python3 tools/build_g2p_model.py --all
 ```
 
-`--model-archive` and `--models-dir` remain available as deterministic local
-overrides for development or offline rebuilds.
+Use `--model-archive` or `--models-dir` for pinned local model files. Preserve
+the license and provenance of every added model.
 
-The selected model release, source hash, dimensions, packed format, and
-conversion notes are in
-[`data/en/g2p.SOURCE.txt`](data/en/g2p.SOURCE.txt). For other languages,
-review and preserve the license carried by each selected upstream model. This
-project-owned release-artifact integrity check is intentionally retained.
+## Prepare a release
+
+1. Update `version` in `_meta.lua`.
+2. Run `python3 tools/prepare_release.py`.
+3. Run the complete test sequence above.
+4. Commit and push the version change to `main`.
+
+Preparation refreshes the bundled English pack, synchronizes the runtime
+version, and updates the database, readable-data, and G2P hashes used by the
+release validator. The release workflow repeats those checks, commits refreshed
+artifacts when needed, and publishes the version tag and archive. `_meta.lua`
+is the plugin-version source of truth; SQLite's `PRAGMA user_version` is only
+the database schema version.
+
+`python3 tools/build_release.py --print-version` prints the release version.
+Use `--output PATH` to choose a different archive path.
