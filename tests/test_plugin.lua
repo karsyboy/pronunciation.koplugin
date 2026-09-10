@@ -360,6 +360,8 @@ equal(derive("[bɑks]", "plural").ipa, "/bɑksɪz/", "bracket stripping")
 equal(derive("/weɪt/", "past").ipa, "/weɪtɪd/", "alveolar past")
 equal(derive("/wɔk/", "past").ipa, "/wɔkt/", "voiceless past")
 truthy(derive("/bɑks/", "plural").simple, "derived readable is missing")
+equal(Plugin:derive({{ ipa = "/qɑq/" }}, "plural", "qaq"), nil,
+    "unknown final phone received a guessed inflection suffix")
 equal(Plugin:derive({{
     ipa = "/mendi/",
     language = "Spanish",
@@ -370,8 +372,10 @@ equal(Plugin:readableFromIpa("/ˈkæt/"), "KAT", "cat readable")
 equal(Plugin:readableFromIpa("/ɪˈpɪtəmi/"), "ih-PIT-uh-mee",
     "epitome readable")
 equal(Plugin:readableFromIpa("/həˈloʊ/"), "huh-LOH", "hello readable")
-equal(Plugin:readableFromIpa("/laminak/"), "lah-mee-nahk",
+equal(Plugin:readableFromIpa("/laminak/"), "LAH-mee-nahk",
     "generic IPA readable")
+equal(Plugin:readableFromIpa("/qɑ/"), nil,
+    "unknown IPA phone was silently dropped from readable output")
 -- The bundled, pure-Lua weighted G2P path handles arbitrary spellings without
 -- an installed executable or a dictionary entry.
 local fantasy = Plugin:generatePronunciations("zyrathion", {})
@@ -391,6 +395,9 @@ local laminak = Plugin:generatePronunciations("laminak", {})
 truthy(laminak and laminak[1], "laminak G2P regression is missing")
 equal(laminak[1].arpabet, "L AE1 M AH0 N AH0 K",
     "laminak diverged from the pinned MFA/Pynini output")
+local medical = Plugin:generatePronunciations("otorhinolaryngological", {})
+truthy(medical and medical[1] and medical[1].ipa and medical[1].simple,
+    "long unfamiliar English word lost G2P IPA or readable output")
 
 local accented_fantasy = Plugin:generatePronunciations("Faërun", {})
 truthy(accented_fantasy and accented_fantasy[1].ipa,
@@ -424,15 +431,37 @@ Plugin.lookupOffline = function() return nil end
 Plugin.online_fallback = false
 Plugin.generated_cache = {}
 Plugin:_lookupAndShow("Zyrathion")
+local repeated_offline_checks = 0
 Plugin.lookupOffline = function()
-    error("cached generated result reached the offline database lookup")
+    repeated_offline_checks = repeated_offline_checks + 1
+    return nil
 end
 Plugin:_lookupAndShow("“ZYRATHION”")
 equal(cached_g2p_calls, 1,
     "offline generated fallback did not reuse its cached result")
+equal(repeated_offline_checks, 1,
+    "cached generation bypassed a newer exact database lookup")
 local normalized_generated_key = Plugin:generationCacheKey("zyrathion")
 truthy(Plugin.generated_cache[normalized_generated_key],
     "offline generated fallback did not save its result")
+truthy(normalized_generated_key:find("|model:4056b000", 1, true),
+    "generated cache identity omitted the G2P artifact hash")
+Plugin.generated_cache[Plugin:generationCacheKey("priority")] = {{
+    ipa = "/pɹaɪɔɹəti/", source = "generated fixture", generated = true,
+    language_code = "en", language = "English",
+}}
+Plugin.lookupOffline = function()
+    return {{
+        ipa = "/pɹaɪˈɔɹəti/", source = "exact database fixture",
+        confidence = 78, language_code = "en", language = "English",
+    }}, "priority"
+end
+shown_widget = nil
+Plugin:_lookupAndShow("priority")
+truthy(shown_widget.text:find("Source: exact database fixture", 1, true),
+    "cached generated pronunciation outranked an exact database row")
+truthy(not shown_widget.text:find("Source: generated fixture", 1, true),
+    "exact database lookup displayed cached generation")
 Plugin._g2pPhones = cached_g2p_method
 Plugin.lookupOffline = cached_lookup_offline
 Plugin.online_fallback = cached_online_fallback
@@ -497,6 +526,7 @@ local function writePack(code, name, iso6393, aliases)
     sidecar:write("aliases\t", aliases, "\n")
     sidecar:write("schema_version\t8\n")
     sidecar:write("readable_converter\treadable.tsv\n")
+    sidecar:write("readable_sha256\t", string.rep("0", 64), "\n")
     sidecar:close()
     local database = assert(io.open(
         pack_root .. "/" .. code .. "/pronunciations.sqlite3", "wb"))
@@ -509,6 +539,12 @@ local function writePack(code, name, iso6393, aliases)
 end
 writePack("en", "English", "eng", "en,eng")
 writePack("fr", "French", "fra", "fr,fra,fre")
+local english_g2p = assert(io.open(pack_root .. "/en/g2p.bin", "wb"))
+english_g2p:write("fixture")
+english_g2p:close()
+local french_sidecar = assert(io.open(pack_root .. "/fr/pack.tsv", "a"))
+french_sidecar:write("g2p_model\t../en/g2p.bin\n")
+french_sidecar:close()
 lfs_entries = { "en", "fr" }
 Plugin.data_path = pack_root
 Plugin.language_packs = nil
@@ -538,10 +574,23 @@ Plugin.ui.document.getProps = function() return { language = "de-DE" } end
 equal(Plugin:selectedLanguagePack().code, "en",
     "missing requested pack did not fall back to installed English")
 local french_pack = Plugin:discoverLanguagePacks().fr
+equal(french_pack.g2p_path, nil,
+    "foreign sidecar escaped its pack directory to reuse English G2P")
 equal(Plugin:_readableFromPhones(french_pack, { "b", "ɔ̃", "ʒ", "u", "ʁ" }),
     "bonjour", "foreign readable converter did not use its language pack")
 equal(Plugin:_readableFromPackIpa(french_pack, "/bɔ̃ʒuʁ/"), "bonjour",
     "foreign IPA fallback did not use its language-pack converter")
+local corrupt_readable = assert(io.open(french_pack.readable_path, "w"))
+corrupt_readable:write("not a converter\n")
+corrupt_readable:close()
+Plugin.readable_converters.fr = nil
+equal(Plugin:_readableFromPhones(french_pack, { "b" }), nil,
+    "malformed optional readable converter was accepted")
+local restored_readable = assert(io.open(french_pack.readable_path, "w"))
+restored_readable:write(
+    "ipa\treadable\nb\tb\nɔ̃\ton\nʒ\tj\nu\tou\nʁ\tr\n")
+restored_readable:close()
+Plugin.readable_converters.fr = nil
 
 -- A foreign database result remains valid IPA-only when a readable value is
 -- unavailable; language-pack converters are applied during database builds.
@@ -567,6 +616,58 @@ truthy(foreign_formatted:find("IPA (French): /bɔ̃.ʒuʁ/", 1, true),
     "IPA-only foreign result did not render")
 truthy(not foreign_formatted:find("Readable", 1, true),
     "IPA-only foreign result rendered a fake readable spelling")
+local mismatched_returned = false
+local mismatched_rows = Plugin:_queryConnection({
+    prepare = function()
+        return {
+            bind = function() end,
+            step = function()
+                if mismatched_returned then return nil end
+                mismatched_returned = true
+                return { "/kæt/", nil, "KAT", "bad pack", 99,
+                    nil, 0, "en", "English" }
+            end,
+            close = function() end,
+        }
+    end,
+}, "cat", nil, { code = "fr", name = "French" })
+equal(mismatched_rows, nil,
+    "foreign database row was allowed to identify itself as English")
+
+Plugin.overrides = {
+    ["language:en|word:chat"] = { ipa = "/tʃæt/", simple = "CHAT" },
+    ["language:fr|word:chat"] = { ipa = "/ʃa/", simple = "sha" },
+    legacy = { ipa = "/lɛɡəsi/", simple = "LEG-uh-see" },
+}
+Plugin.pronunciation_language = "fr"
+equal(Plugin:getOverride("chat")[1].ipa, "/ʃa/",
+    "French override did not use its language scope")
+equal(Plugin:getOverride("legacy"), nil,
+    "legacy English override contaminated a foreign lookup")
+equal(Plugin:generationPack(), nil,
+    "foreign pack without G2P fell through to the English model")
+equal(Plugin:generatePronunciations("bonjour"), nil,
+    "English G2P generated a foreign-language pronunciation")
+Plugin.cache = { ["language:fr|word:cache-test"] = {{
+    ipa = "/bɔ̃ʒuʁ/", language_code = "fr", source = "foreign fixture",
+}} }
+equal(Plugin:getCache("cache-test")[1].simple, nil,
+    "foreign cache entry used the English readable converter")
+Plugin.cache = {}
+local foreign_online_calls = 0
+local saved_dict_api, saved_wiktionary = Plugin.dictApi, Plugin.wiktionary
+Plugin.dictApi = function() foreign_online_calls = foreign_online_calls + 1 end
+Plugin.wiktionary = function() foreign_online_calls = foreign_online_calls + 1 end
+equal(Plugin:lookupOnline("bonjour"), nil,
+    "foreign lookup returned English online data")
+equal(foreign_online_calls, 0,
+    "foreign lookup contacted English-only online services")
+Plugin.dictApi, Plugin.wiktionary = saved_dict_api, saved_wiktionary
+Plugin.pronunciation_language = "en"
+equal(Plugin:getOverride("chat")[1].ipa, "/tʃæt/",
+    "English override was contaminated by the French override")
+equal(Plugin:getOverride("legacy")[1].ipa, "/lɛɡəsi/",
+    "legacy English-only override migration stopped working")
 local pack_open = SQ3.open
 Plugin.pronunciation_language = "fr"
 SQ3.open = function() error("corrupt fixture database") end
@@ -580,9 +681,27 @@ Plugin.language_packs = nil
 Plugin.language_pack_aliases = nil
 Plugin.pronunciation_language = "auto"
 Plugin.ui.document = nil
+local lfs_module = require("lfs")
+local normal_lfs_dir = lfs_module.dir
+local iteration_count = 0
+lfs_module.dir = function()
+    return function()
+        iteration_count = iteration_count + 1
+        if iteration_count == 1 then return "fr" end
+        error("optional pack iteration failure")
+    end
+end
+Plugin.language_packs = nil
+Plugin.language_pack_aliases = nil
+truthy(Plugin:discoverLanguagePacks().en,
+    "optional pack discovery failure prevented bundled English fallback")
+lfs_module.dir = normal_lfs_dir
+Plugin.language_packs = nil
+Plugin.language_pack_aliases = nil
 os.remove(pack_root .. "/en/pack.tsv")
 os.remove(pack_root .. "/en/pronunciations.sqlite3")
 os.remove(pack_root .. "/en/readable.tsv")
+os.remove(pack_root .. "/en/g2p.bin")
 os.remove(pack_root .. "/fr/pack.tsv")
 os.remove(pack_root .. "/fr/pronunciations.sqlite3")
 os.remove(pack_root .. "/fr/readable.tsv")
@@ -627,9 +746,13 @@ Plugin.lookupAndShow = menu_lookup
 -- history must not grow the startup settings table without bound.
 Plugin.generated_cache = { ["generator:2|old"] = {{ ipa = "/oʊld/" }} }
 for index = 1, 140 do
-    Plugin.generated_cache["generator:4|test:" .. index] = {{ ipa = "/tɛst/" }}
+    Plugin.generated_cache["generator:4|pack:en|test:" .. index] = {{
+        ipa = "/tɛst/", generated = true, language_code = "en",
+    }}
 end
-Plugin:saveGeneratedCache("generator:4|test:current", {{ ipa = "/kɝənt/" }})
+Plugin:saveGeneratedCache("generator:4|pack:en|test:current", {{
+    ipa = "/kɝənt/", generated = true, language_code = "en",
+}})
 local generated_cache_count = 0
 for key in pairs(Plugin.generated_cache) do
     generated_cache_count = generated_cache_count + 1
@@ -637,7 +760,7 @@ for key in pairs(Plugin.generated_cache) do
         "stale generator cache version survived pruning")
 end
 truthy(generated_cache_count <= 128, "generated cache limit was not enforced")
-truthy(Plugin.generated_cache["generator:4|test:current"],
+truthy(Plugin.generated_cache["generator:4|pack:en|test:current"],
     "new generated cache entry was pruned")
 
 -- Online results are recoverable, so their settings cache is bounded and
@@ -675,8 +798,8 @@ truthy(cached_sourced and cached_sourced[1],
     "offline lookup did not reuse the normalized sourced cache entry")
 equal(cached_sourced_match, "cached-current",
     "sourced cache returned the wrong normalized match")
-equal(cached_database_open_count, 0,
-    "sourced cache was checked after opening the database")
+equal(cached_database_open_count, 1,
+    "sourced cache bypassed a newer exact database pronunciation")
 Plugin.overrides = cached_overrides
 SQ3.open = cached_database_open
 
@@ -956,14 +1079,14 @@ local ticks_before_cached_lookup = next_tick_count
 Plugin:lookupAndShow("“ZYRATHION”")
 equal(online_g2p_calls, 1,
     "online missing-word flow regenerated an existing cached pronunciation")
-equal(online_lookup_calls, 1,
-    "cached generated result repeated the online source lookup")
-equal(#shown_widgets, shown_before_cached_lookup + 1,
-    "cached generated result showed a progress popup")
-equal(repaint_count, repaint_before_cached_lookup,
-    "cached generated result triggered an extra repaint")
-equal(next_tick_count, ticks_before_cached_lookup,
-    "cached generated result deferred work to the event loop")
+equal(online_lookup_calls, 2,
+    "cached generation bypassed a newly available online source")
+equal(#shown_widgets, shown_before_cached_lookup + 2,
+    "source-priority recheck did not show progress and result")
+equal(repaint_count, repaint_before_cached_lookup + 1,
+    "source-priority recheck did not repaint its progress popup")
+equal(next_tick_count, ticks_before_cached_lookup + 2,
+    "source-priority recheck did not yield around online work")
 Plugin._g2pPhones = online_g2p_method
 
 -- A canceled Wi-Fi prompt never runs its callback, so the first progress

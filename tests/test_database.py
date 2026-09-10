@@ -24,6 +24,7 @@ from build_database import (  # noqa: E402
     build_database,
     default_database_path,
     discover_wikipron_languages,
+    english_readable_from_ipa,
     latest_github_release,
     resolve_requested_language,
     sync_git_release_checkout,
@@ -98,6 +99,15 @@ def check_database() -> None:
             ).fetchall()
 
         assert any(ipa == "/kæt/" and simple for ipa, simple in pronunciations("cat"))
+        assert ("/θɔt/", "THAWT") in pronunciations("thought")
+        assert ("/θɹu/", "THROO") in pronunciations("through")
+        assert ("/ðoʊ/", "THOH") in pronunciations("though")
+        assert ("/ɹʌf/", "RUHF") in pronunciations("rough")
+        assert ("/kɔf/", "KAWF") in pronunciations("cough")
+        assert ("/kju/", "KYOO") in pronunciations("queue")
+        assert ("/ɹɪðm̩/", "RIH-thuhm") in pronunciations("rhythm")
+        assert ("/kɝnl̩/", "KER-nuhl") in pronunciations("colonel")
+        assert ("/wɛnzdeɪ/", "WEHNZ-day") in pronunciations("wednesday")
         assert any(ipa == "/ɪpɪtəmi/" and simple
                    for ipa, simple in pronunciations("epitome"))
         assert any(ipa == "/ˈklʊərɪkɔːnz/"
@@ -133,7 +143,10 @@ def check_database() -> None:
             for key in metadata
         )
         assert metadata["converter"] == (
-            "tools/build_database.py discovery profile schema v5"
+            "tools/build_database.py discovery profile schema v6"
+        )
+        assert metadata["readable_converter_method"] == (
+            "English-specific deterministic IPA syllabification"
         )
         assert database.stat().st_size < 18_000_000
         readable = ROOT / "data" / "en" / "readable.tsv"
@@ -290,9 +303,17 @@ def check_compact_database_build() -> None:
         assert "fre" in sidecar["aliases"].split(",")
         assert sidecar["readable_converter"] == "readable.tsv"
         converter = french_output.parent / "readable.tsv"
+        assert sidecar["readable_sha256"] == hashlib.sha256(
+            converter.read_bytes()
+        ).hexdigest()
         assert converter.read_text(encoding="utf-8").startswith(
             "ipa\treadable\n"
         )
+
+        assert english_readable_from_ipa("/ˈkæt/") == "KAT"
+        assert english_readable_from_ipa("/θɹu/") == "THROO"
+        assert english_readable_from_ipa("/kʌmftəbəl/") == "KUHMF-tuh-buhl"
+        assert english_readable_from_ipa("/qɑ/") is None
 
         common = [
             "--wikipron-root", str(tsv),
@@ -314,6 +335,17 @@ def check_compact_database_build() -> None:
             "--language", "fr-CA", "--data-dir", str(one_root),
         ], check=True, capture_output=True, text=True)
         assert default_database_path(one_root, "fr").is_file()
+        stale_pack = one_root / "fr"
+        (stale_pack / "g2p.bin").write_bytes(b"stale")
+        (stale_pack / "g2p.SOURCE.txt").write_text("stale\n", encoding="utf-8")
+        with (stale_pack / "pack.tsv").open("a", encoding="utf-8") as sidecar:
+            sidecar.write("g2p_model\tg2p.bin\n")
+        subprocess.run(command + common + [
+            "--language", "fr", "--data-dir", str(one_root),
+        ], check=True, capture_output=True, text=True)
+        assert not (stale_pack / "g2p.bin").exists()
+        assert not (stale_pack / "g2p.SOURCE.txt").exists()
+        assert "g2p_model" not in (stale_pack / "pack.tsv").read_text()
 
         ergonomic_root = directory / "ergonomic-output"
         subprocess.run([
@@ -329,6 +361,18 @@ def check_compact_database_build() -> None:
         ], check=True, capture_output=True, text=True)
         assert default_database_path(repeated_root, "fr").is_file()
         assert default_database_path(repeated_root, "de").is_file()
+        old_database = default_database_path(repeated_root, "de").read_bytes()
+        (tsv / "deu_latn_broad.tsv").write_text(
+            "invalid line without a tab\n", encoding="utf-8"
+        )
+        failed = subprocess.run(command + common + [
+            "--language", "de", "--data-dir", str(repeated_root),
+        ], capture_output=True, text=True)
+        assert failed.returncode != 0
+        assert default_database_path(repeated_root, "de").read_bytes() == old_database
+        (tsv / "deu_latn_broad.tsv").write_text(
+            "hallo\th a l oː\n", encoding="utf-8"
+        )
 
         all_root = directory / "all-output"
         subprocess.run(command + common + [
@@ -553,7 +597,7 @@ def check_automatic_g2p_resolution() -> None:
         return Response(json.dumps(catalog).encode())
 
     models = fetch_mfa_models(opener=catalog_opener)
-    assert len(models) == 2
+    assert len(models) == 1
     selected = resolve_mfa_model("fr", "French", models)
     assert selected and selected.tag == "g2p-french_mfa-v2.0.0"
     assert requests == [(
@@ -643,7 +687,12 @@ def check_multilingual_g2p_build() -> None:
         for code in ("en", "fr"):
             assert (packs / code / "g2p.bin").read_bytes()[:8] == b"KPG2P4\0\0"
             assert (packs / code / "g2p.SOURCE.txt").is_file()
-            assert "g2p_model\tg2p.bin" in (packs / code / "pack.tsv").read_text()
+            sidecar = (packs / code / "pack.tsv").read_text()
+            assert "g2p_model\tg2p.bin" in sidecar
+            model_hash = hashlib.sha256(
+                (packs / code / "g2p.bin").read_bytes()
+            ).hexdigest()
+            assert f"g2p_sha256\t{model_hash}" in sidecar
 
         all_packs = directory / "all-packs"
         subprocess.run([

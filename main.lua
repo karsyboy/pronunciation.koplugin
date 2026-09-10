@@ -77,7 +77,7 @@ end
 
 local PLUGIN_VERSION = "0.9.0"
 local DICTIONARY_BUTTON_ID = "pronunciation_lookup"
-local CACHE_VERSION = 6
+local CACHE_VERSION = 7
 local GENERATOR_VERSION = 4
 local SOURCED_CACHE_LIMIT = 256
 local GENERATED_CACHE_LIMIT = 128
@@ -235,6 +235,17 @@ local function tokenizeIpa(ipa)
     local pending_stress
     local pending_break = false
 
+    local ignorable = {
+        ["."] = true, ["-"] = true, [" "] = true,
+        ["("] = true, [")"] = true, ["|"] = true, ["‿"] = true,
+        ["ː"] = true, ["ˑ"] = true, ["̆"] = true,
+        ["ʰ"] = true, ["ʲ"] = true, ["ʷ"] = true,
+        ["ᵊ"] = true, ["ⁿ"] = true, ["ʼ"] = true,
+        ["̚"] = true, ["̠"] = true, ["̪"] = true, ["̻"] = true,
+        ["̝"] = true, ["̞"] = true, ["̯"] = true, ["̤"] = true,
+        ["̥"] = true, ["̬"] = true, ["̃"] = true,
+    }
+
     while position <= #core do
         local rest = core:sub(position)
         if rest:sub(1, #"ˈ") == "ˈ" then
@@ -272,7 +283,12 @@ local function tokenizeIpa(ipa)
                 if character == "." or character == "-" or character == " " then
                     pending_break = true
                 end
-                -- Ignore punctuation, optional-phone markers, length marks and diacritics.
+                -- Known separators, optional-phone markers, length marks, and
+                -- phonetic diacritics do not contribute a readable segment.
+                -- Any other symbol is a phone we do not understand; failing
+                -- the whole conversion is safer than displaying a plausible
+                -- but materially incomplete pronunciation.
+                if not ignorable[character] then return nil end
                 position = position + #character
             end
         end
@@ -313,7 +329,7 @@ end
 
 local function readableFromIpa(ipa)
     local phones = tokenizeIpa(ipa)
-    if #phones == 0 then return nil end
+    if not phones or #phones == 0 then return nil end
 
     local vowels = {}
     for i, phone in ipairs(phones) do
@@ -334,6 +350,10 @@ local function readableFromIpa(ipa)
     end
 
     local syllables = {}
+    local has_stress = false
+    for _, phone in ipairs(phones) do
+        if phone.stress then has_stress = true break end
+    end
     for s = 1, #starts do
         local first = starts[s]
         local last = (starts[s + 1] or (#phones + 1)) - 1
@@ -348,7 +368,7 @@ local function readableFromIpa(ipa)
             if phones[i].stress then stress = phones[i].stress end
         end
         local text = table.concat(spelling)
-        if stress == 1 or (#starts == 1 and not stress) then
+        if stress == 1 or (not has_stress and s == 1) then
             text = text:upper()
         end
         if text ~= "" then syllables[#syllables + 1] = text end
@@ -362,8 +382,10 @@ function Pronunciation:readableFromIpa(ipa)
 end
 
 local function ensureReadable(result)
-    if result and (not result.language or result.language == "English")
-            and (not result.simple or result.simple == "") and result.ipa then
+    local english = result and (result.language_code == "en"
+        or (not result.language_code
+            and (not result.language or result.language == "English")))
+    if english and (not result.simple or result.simple == "") and result.ipa then
         result.simple = readableFromIpa(result.ipa)
         result.simple_approx = result.simple ~= nil
     end
@@ -449,7 +471,9 @@ local function readPackMetadata(path)
         name = name,
         aliases = aliases,
         readable_converter = metadata.readable_converter,
+        readable_sha256 = metadata.readable_sha256,
         g2p_model = metadata.g2p_model,
+        g2p_sha256 = metadata.g2p_sha256,
     }
 end
 
@@ -476,21 +500,38 @@ function Pronunciation:discoverLanguagePacks(force)
         if metadata and metadata.code == code and fileExists(database_path) then
             metadata.directory = directory
             metadata.path = database_path
-            local readable_name = metadata.readable_converter or "readable.tsv"
-            local readable_path = directory .. "/" .. readable_name
-            if fileExists(readable_path) then metadata.readable_path = readable_path end
-            local g2p_name = metadata.g2p_model or "g2p.bin"
-            local g2p_path = directory .. "/" .. g2p_name
-            if fileExists(g2p_path) then metadata.g2p_path = g2p_path end
+            -- Pack assets have fixed names. Never follow a malformed sidecar
+            -- path into another language directory.
+            if (not metadata.readable_converter
+                    or metadata.readable_converter == "readable.tsv")
+                    and type(metadata.readable_sha256) == "string"
+                    and metadata.readable_sha256:match("^[0-9a-f]+$")
+                    and #metadata.readable_sha256 == 64 then
+                local readable_path = directory .. "/readable.tsv"
+                if fileExists(readable_path) then
+                    metadata.readable_path = readable_path
+                end
+            end
+            if (not metadata.g2p_model or metadata.g2p_model == "g2p.bin")
+                    and type(metadata.g2p_sha256) == "string"
+                    and metadata.g2p_sha256:match("^[0-9a-f]+$")
+                    and #metadata.g2p_sha256 == 64 then
+                local g2p_path = directory .. "/g2p.bin"
+                if fileExists(g2p_path) then metadata.g2p_path = g2p_path end
+            end
             packs[code] = metadata
         end
     end
     if LFS and type(LFS.dir) == "function" then
-        local ok, iterator, state = pcall(LFS.dir, data_path)
-        if ok and iterator then
+        local ok, error_message = pcall(function()
+            local iterator, state = LFS.dir(data_path)
             for entry in iterator, state do
                 if entry:match("^[a-z][a-z][a-z]?$") then add(entry) end
             end
+        end)
+        if not ok then
+            logger.warn("Pronunciation: language-pack discovery failed:",
+                error_message)
         end
     end
     -- English is the bundled baseline even on stripped-down Lua builds
@@ -1088,11 +1129,22 @@ function Pronunciation:_readableConverter(pack)
         return nil
     end
     local converter = {}
+    local header = file:read("*l")
+    if header ~= "ipa\treadable" then
+        file:close()
+        logger.warn("Pronunciation: invalid readable converter for", pack.code)
+        self.readable_converters[pack.code] = false
+        return nil
+    end
     for line in file:lines() do
         local ipa, readable = line:match("^([^\t]+)\t(.*)$")
-        if ipa and ipa ~= "ipa" and readable ~= "" then
-            converter[ipa] = readable
+        if not ipa or readable == "" or converter[ipa] then
+            file:close()
+            logger.warn("Pronunciation: invalid readable converter for", pack.code)
+            self.readable_converters[pack.code] = false
+            return nil
         end
+        converter[ipa] = readable
     end
     file:close()
     self.readable_converters[pack.code] = converter
@@ -1107,11 +1159,10 @@ function Pronunciation:_readableFromPhones(pack, phones)
         local phone = original
         local stressed = phone:find("ˈ", 1, true) or phone:find("ˌ", 1, true)
         phone = phone:gsub("ˈ", ""):gsub("ˌ", "")
-        local readable = converter[phone] or phone
-        if readable then
-            if stressed and #chunks > 0 then chunks[#chunks + 1] = "-" end
-            chunks[#chunks + 1] = readable
-        end
+        local readable = converter[phone]
+        if not readable then return nil end
+        if stressed and #chunks > 0 then chunks[#chunks + 1] = "-" end
+        chunks[#chunks + 1] = readable
     end
     local result = table.concat(chunks):gsub("%-+", "-")
     return result ~= "" and result or nil
@@ -1142,6 +1193,11 @@ function Pronunciation:_readableFromPackIpa(pack, ipa)
             else
                 local character = nextUtf8Character(core, position)
                 if not character then return nil end
+                if character ~= "." and character ~= "-"
+                        and character ~= " " and character ~= "ː"
+                        and character ~= "(" and character ~= ")" then
+                    return nil
+                end
                 position = position + #character
             end
         end
@@ -1154,8 +1210,6 @@ end
 function Pronunciation:generationPack()
     local selected = self:selectedLanguagePack()
     if selected and selected.g2p_path then return selected end
-    local english = self:discoverLanguagePacks().en
-    if english and english.g2p_path then return english end
 end
 
 function Pronunciation:generatePronunciations(word)
@@ -1175,6 +1229,7 @@ function Pronunciation:generatePronunciations(word)
         arpabet = output_format == 1 and table.concat(phones, " ") or nil,
         simple = simple,
         simple_approx = simple ~= nil,
+        language_code = pack.code,
         language = pack.name,
         region = pack.code == "en" and "US" or nil,
         source = "MFA/Pynini " .. pack.name .. " G2P",
@@ -1186,8 +1241,12 @@ end
 function Pronunciation:generationCacheKey(word)
     local pack = self:generationPack()
     local pack_code = pack and pack.code or "none"
+    local model_hash = pack and pack.g2p_sha256 or "none"
+    local readable_hash = pack and pack.readable_sha256 or "none"
     return "generator:" .. GENERATOR_VERSION
         .. "|pack:" .. pack_code
+        .. "|model:" .. model_hash
+        .. "|readable:" .. readable_hash
         .. "|word:" .. normalizeWord(word)
 end
 
@@ -1576,7 +1635,14 @@ function Pronunciation:setPronunciationLanguage(code)
 end
 
 function Pronunciation:getOverride(word)
-    local override = (self.overrides or {})[normalizeWord(word)]
+    local normalized = normalizeWord(word)
+    local pack = self:selectedLanguagePack()
+    local code = pack and pack.code or "none"
+    local overrides = self.overrides or {}
+    local override = overrides["language:" .. code .. "|word:" .. normalized]
+    -- Pre-language-pack settings were English-only. Preserve those personal
+    -- entries for English, but never reuse them in another language.
+    if not override and code == "en" then override = overrides[normalized] end
     if type(override) == "table" then
         return {{
             ipa = wrapIpa(override.ipa),
@@ -1598,6 +1664,15 @@ function Pronunciation:getCache(word)
     -- remain safe to reuse only while the English pack is selected.
     if not cached and code == "en" then cached = (self.cache or {})[normalized] end
     if type(cached) == "table" and #cached > 0 then
+        for _, result in ipairs(cached) do
+            if type(result) ~= "table"
+                    or type(result.ipa) ~= "string"
+                    or not wrapIpa(result.ipa)
+                    or (result.language_code and result.language_code ~= code)
+                    or (code ~= "en" and not result.language_code) then
+                return nil
+            end
+        end
         return ensureReadables(cached)
     end
 end
@@ -1643,17 +1718,20 @@ function Pronunciation:_queryConnection(connection, word, statement, pack)
         while true do
             local row = statement:step()
             if not row then break end
-            rows[#rows + 1] = {
-                ipa = row[1],
-                arpabet = row[2],
-                simple = row[3],
-                source = row[4],
-                confidence = tonumber(row[5]) or 0,
-                region = row[6],
-                language_code = row[8] or (pack and pack.code),
-                language = row[9] or (pack and pack.name),
-                simple_approx = tonumber(row[7]) == 1,
-            }
+            local row_language = row[8] or (pack and pack.code)
+            if not pack or row_language == pack.code then
+                rows[#rows + 1] = {
+                    ipa = row[1],
+                    arpabet = row[2],
+                    simple = row[3],
+                    source = row[4],
+                    confidence = tonumber(row[5]) or 0,
+                    region = row[6],
+                    language_code = row_language,
+                    language = row[9] or (pack and pack.name),
+                    simple_approx = tonumber(row[7]) == 1,
+                }
+            end
         end
         return rows
     end)
@@ -1706,7 +1784,7 @@ end
 
 local function lastIpaPhone(ipa)
     local phones = tokenizeIpa(ipa)
-    return phones[#phones] and phones[#phones].symbol or nil
+    return phones and phones[#phones] and phones[#phones].symbol or nil
 end
 
 local SIBILANTS = {
@@ -1754,11 +1832,12 @@ function Pronunciation:derive(base_results, kind, shown_base)
     for _, base in ipairs(base_results) do
         if not base.language or base.language == "English" then
             local suffix
-            if kind == "plural" or kind == "possessive" then
-                suffix = pluralSuffix(finalPhone(base))
-            elseif kind == "past" then
-                suffix = pastSuffix(finalPhone(base))
-            elseif kind == "ing" then
+            local phone = finalPhone(base)
+            if (kind == "plural" or kind == "possessive") and phone then
+                suffix = pluralSuffix(phone)
+            elseif kind == "past" and phone then
+                suffix = pastSuffix(phone)
+            elseif kind == "ing" and phone then
                 suffix = "ɪŋ"
             end
             local ipa = suffix and appendIpa(base.ipa, suffix)
@@ -1768,6 +1847,7 @@ function Pronunciation:derive(base_results, kind, shown_base)
                     simple = readableFromIpa(ipa),
                     simple_approx = true,
                     region = base.region,
+                    language_code = base.language_code,
                     language = base.language,
                     source = (base.source or "Offline") .. " + derived inflection",
                     confidence = math.max(50, (base.confidence or 70) - 10),
@@ -1846,9 +1926,6 @@ function Pronunciation:lookupOffline(word)
     word = normalizeWord(word)
     local results = self:getOverride(word)
     if results then return results, word end
-    results = self:getCache(word)
-    if results then return results, word end
-
     -- Reuse one SQLite connection while checking the exact word and all
     -- possible inflection bases. Opening the bundled database repeatedly is
     -- noticeably expensive on low-memory e-ink devices.
@@ -1892,13 +1969,15 @@ function Pronunciation:lookupOffline(word)
     for _, candidate in ipairs(pack and pack.code == "en"
             and self:candidates(word) or {}) do
         local base = self:getOverride(candidate.word)
-            or self:getCache(candidate.word)
             or queryDatabase(candidate.word)
+            or self:getCache(candidate.word)
         if base then
             local derived = self:derive(base, candidate.kind, candidate.word)
             if derived then return finish(derived, candidate.word) end
         end
     end
+    results = self:getCache(word)
+    if results then return finish(results, word) end
     return finish()
 end
 
@@ -2183,6 +2262,8 @@ function Pronunciation:wiktionary(word)
 end
 
 function Pronunciation:lookupOnline(word)
+    local pack = self:selectedLanguagePack()
+    if not pack or pack.code ~= "en" then return nil end
     local dictionary = self:dictApi(word)
     local wiktionary, language_hints = self:wiktionary(word)
     return mergeResults(dictionary, wiktionary), language_hints
@@ -2202,6 +2283,16 @@ end
 function Pronunciation:getGeneratedCache(key)
     local cached = (self.generated_cache or {})[key]
     if type(cached) == "table" and #cached > 0 then
+        local pack_code = type(key) == "string"
+            and key:match("|pack:([^|]+)|") or nil
+        for _, result in ipairs(cached) do
+            if type(result) ~= "table" or type(result.ipa) ~= "string"
+                    or not wrapIpa(result.ipa)
+                    or result.generated ~= true
+                    or result.language_code ~= pack_code then
+                return nil
+            end
+        end
         return ensureReadables(cached)
     end
 end
@@ -2257,10 +2348,6 @@ function Pronunciation:lookupCached(word)
     local normalized = normalizeWord(word)
     local results = self:getOverride(normalized)
     if results then return results, normalized end
-    results = self:getCache(normalized)
-    if results then return results, normalized end
-    results = self:getCachedGeneratedForWord(normalized)
-    if results then return results, normalized end
 end
 
 function Pronunciation:generatedForWord(word, online_hints)
@@ -2278,7 +2365,9 @@ function Pronunciation:_lookupOnlineAndShow(word, progress)
     local online, language_hints = self:lookupOnline(normalized)
     local online_match = normalized
     if not online then
-        for _, candidate in ipairs(self:candidates(normalized)) do
+        local pack = self:selectedLanguagePack()
+        for _, candidate in ipairs(pack and pack.code == "en"
+                and self:candidates(normalized) or {}) do
             local base = self:lookupOnline(candidate.word)
             if base then
                 online = self:derive(base, candidate.kind, candidate.word)
@@ -2353,7 +2442,7 @@ end
 
 function Pronunciation:lookupAndShow(word)
     word = trim(word)
-    if word == "" then return end
+    if word == "" or normalizeWord(word) == "" then return end
     local cached, matched = self:lookupCached(word)
     if cached then
         showLookupMessage(nil, self:format(word, cached, matched))
@@ -2370,8 +2459,14 @@ end
 function Pronunciation:editOverride(word)
     word = normalizeWord(word)
     if word == "" then return end
-    local existing = type(self.overrides[word]) == "table"
-        and self.overrides[word] or {}
+    local pack = self:selectedLanguagePack()
+    local code = pack and pack.code or "none"
+    local override_key = "language:" .. code .. "|word:" .. word
+    local existing = self.overrides[override_key]
+    if type(existing) ~= "table" and code == "en" then
+        existing = self.overrides[word]
+    end
+    if type(existing) ~= "table" then existing = {} end
     local dialog
     if not InputDialog then InputDialog = require("ui/widget/inputdialog") end
     dialog = InputDialog:new{
@@ -2388,7 +2483,8 @@ function Pronunciation:editOverride(word)
             {
                 text = _("Delete"),
                 callback = function()
-                    self.overrides[word] = nil
+                    self.overrides[override_key] = nil
+                    if code == "en" then self.overrides[word] = nil end
                     self.settings:saveSetting("overrides", self.overrides)
                     self.settings:flush()
                     UIManager:close(dialog)
@@ -2401,12 +2497,14 @@ function Pronunciation:editOverride(word)
                     local ipa, simple = text:match("([^\n]*)\n?(.*)")
                     ipa, simple = trim(ipa), trim(simple)
                     if ipa ~= "" or simple ~= "" then
-                        self.overrides[word] = {
+                        self.overrides[override_key] = {
                             ipa = ipa ~= "" and wrapIpa(ipa) or nil,
                             simple = simple ~= "" and simple or nil,
                         }
+                        if code == "en" then self.overrides[word] = nil end
                     else
-                        self.overrides[word] = nil
+                        self.overrides[override_key] = nil
+                        if code == "en" then self.overrides[word] = nil end
                     end
                     self.settings:saveSetting("overrides", self.overrides)
                     self.settings:flush()

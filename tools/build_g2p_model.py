@@ -288,7 +288,7 @@ def _body_field(body: str, name: str) -> str:
 def parse_mfa_release(release: dict) -> MfaModelRelease | None:
     tag = str(release.get("tag_name") or "")
     if (release.get("draft") or release.get("prerelease")
-            or not tag.startswith("g2p-") or "-v" not in tag):
+            or not re.fullmatch(r"g2p-.+-v[0-9]+\.[0-9]+\.[0-9]+", tag)):
         return None
     body = str(release.get("body") or "")
     architecture = _body_field(body, "Architecture").lower()
@@ -468,8 +468,12 @@ def build_model(model_archive: Path, output: Path) -> tuple[int, int, dict]:
 
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_suffix(output.suffix + ".tmp")
-    temporary.write_bytes(packed)
-    os.replace(temporary, output)
+    try:
+        temporary.write_bytes(packed)
+        os.replace(temporary, output)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
     return states, arcs, metadata
 
 
@@ -480,20 +484,27 @@ def normalize_language_code(value: str) -> str:
     return code
 
 
-def update_pack_metadata(directory: Path) -> None:
+def update_pack_metadata(directory: Path, model_hash: str) -> None:
     path = directory / "pack.tsv"
     rows: list[tuple[str, str]] = []
     if path.exists():
         for line in path.read_text(encoding="utf-8").splitlines():
             if "\t" in line:
                 key, value = line.split("\t", 1)
-                if key != "g2p_model":
+                if key not in {"g2p_model", "g2p_sha256"}:
                     rows.append((key, value))
     rows.append(("g2p_model", "g2p.bin"))
-    path.write_text(
-        "".join(f"{key}\t{value}\n" for key, value in rows),
-        encoding="utf-8",
-    )
+    rows.append(("g2p_sha256", model_hash))
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        temporary.write_text(
+            "".join(f"{key}\t{value}\n" for key, value in rows),
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def write_source_metadata(
@@ -514,8 +525,10 @@ def write_source_metadata(
     source_project = release.release_url if release else MFA_MODELS_URL
     license_name = release.license if release else "See source model metadata"
     release_lines = [f"Release: {release.tag}"] if release else []
-    directory.joinpath("g2p.SOURCE.txt").write_text(
-        "\n".join([
+    source_path = directory / "g2p.SOURCE.txt"
+    temporary = source_path.with_suffix(source_path.suffix + ".tmp")
+    try:
+        temporary.write_text("\n".join([
             f"Language: {language}",
             f"Model: {model_name}",
             f"Version: {version}",
@@ -531,9 +544,11 @@ def write_source_metadata(
             f"States: {states}",
             f"Arcs: {arcs}",
             "",
-        ]),
-        encoding="utf-8",
-    )
+        ]), encoding="utf-8")
+        os.replace(temporary, source_path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def build_language_g2p(
@@ -560,7 +575,8 @@ def build_language_g2p(
         output.parent, language_code, archive, output, source_hash, metadata,
         states, arcs, model,
     )
-    update_pack_metadata(output.parent)
+    output_hash = sha256(output)
+    update_pack_metadata(output.parent, output_hash)
     print(
         f"built {output}: {states} states, {arcs} arcs, "
         f"MFA release {model.tag}, source sha256 {source_hash}"
@@ -731,7 +747,7 @@ def main() -> None:
             directory, language, archive, output, source_hash, metadata,
             states, arcs,
         )
-        update_pack_metadata(directory)
+        update_pack_metadata(directory, sha256(output))
         print(
             f"built {output}: {states} states, {arcs} arcs, "
             f"source sha256 {source_hash}"

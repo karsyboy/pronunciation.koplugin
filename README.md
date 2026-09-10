@@ -54,7 +54,7 @@ Settings are under **Search → Settings → Pronunciation settings**:
 
 - **Online fallback** enables Dictionary API and Wiktionary lookup.
 - **Generated fallback** enables the selected pack's unfamiliar-word model,
-  falling back to the bundled English model when no matching model is installed.
+  when that language pack includes a compatible model.
 - **Pronunciation language** offers **Auto** plus every installed offline pack.
   Auto normalizes locales such as `en-US` or `fr-CA` to their base language
   and uses English when the requested pack is unavailable.
@@ -65,19 +65,20 @@ Settings are under **Search → Settings → Pronunciation settings**:
 ## Lookup order
 
 1. Personal override
-2. Cached sourced or generated result
-3. The selected installed language pack (the bundled English pack contains
+2. The selected installed language pack (the bundled English pack contains
    US/UK WikiPron data plus the project supplement)
-4. English inflection derived from a known base
-5. Dictionary API and the English section of Wiktionary
-6. The selected pack's G2P estimate, or the clearly labeled bundled
-   US-English G2P estimate when that pack has no model
+3. English inflection derived from a known base
+4. A cached sourced result
+5. Dictionary API and the English section of Wiktionary (English only)
+6. The selected pack's cached or newly generated G2P estimate
 
-Personal overrides and cached results return immediately. On a cache miss,
-sourced results take priority over generated estimates. Generated entries are
-labeled `generated`, and readable text derived from IPA is labeled `approx.`
+Personal overrides return immediately. Current offline sourced data is checked
+before reusable online or generated cache entries, so pack updates cannot be
+masked by stale approximations. Generated entries are labeled `generated`, and
+readable text derived from IPA is labeled `approx.`
 An installed foreign-language pack is not followed by an English-database
-lookup merely because a word is absent from it.
+lookup, English online lookup, or English G2P estimate merely because a word is
+absent from it.
 
 ## Optional language packs
 
@@ -91,8 +92,9 @@ python3 tools/build_language_pack.py fr de
 python3 tools/build_language_pack.py --all
 ```
 
-Each build also produces `readable.tsv`, a deterministic, language-specific
-IPA-to-readable mapping learned from that language's WikiPron spellings. No
+Each build also produces `readable.tsv`. English uses deterministic
+English-specific phonetic mappings and syllabification; optional languages use
+an independent mapping learned from that language's WikiPron spellings. No
 model URL or archive path is required. Copy
 the resulting complete `data/<language-code>/` directory into the
 plugin's `data/` directory and restart KOReader. Packs use a common ISO 639-1

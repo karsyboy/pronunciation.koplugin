@@ -110,9 +110,12 @@ database pack. Exact downloaded MFA release archives are cached below the
 selected `--sources-dir`; set `GITHUB_TOKEN` if anonymous API rate limits are
 too restrictive.
 
-The generated readable converter is derived independently for every language
-from the selected WikiPron profiles. Its proportional segment-to-grapheme
-alignment is deterministic and intentionally displayed as an approximation.
+English readable spellings use deterministic English phonetic mappings and
+syllabification so spelling irregularities cannot teach corrupt phone values.
+Other languages derive an independent converter from their selected WikiPron
+profiles. Those proportional segment-to-grapheme alignments are deterministic
+and intentionally displayed as approximations. An unrecognized IPA phone
+suppresses readable output instead of silently dropping part of a pronunciation.
 
 ## Advanced G2P-only builds
 

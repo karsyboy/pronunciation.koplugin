@@ -4,4 +4,6 @@ iso6393	eng
 aliases	en,eng
 schema_version	8
 readable_converter	readable.tsv
+readable_sha256	2c180bcfdedaf654fa622c61847634d7c441f3c4a0cf6bed48d2c1afbb42a874
 g2p_model	g2p.bin
+g2p_sha256	4056b000fb0b7b6b972a1bebaad89d21556fe1b64b199870608839d3d9d4b22c

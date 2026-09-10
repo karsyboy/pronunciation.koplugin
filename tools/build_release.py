@@ -35,13 +35,13 @@ VERSION_PATTERN = re.compile(
     r"(?:\+[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?"
 )
 DATABASE_SHA256 = (
-    "e293ec21a228c387f6f82d9601b81357cb7d4b5b64cb264097ccf4b00d8b3707"
+    "b46a194b6b655c2f200dc737fe755bd6fdc775fa4e5ef22b84379befbd166541"
 )
 G2P_SHA256 = (
     "4056b000fb0b7b6b972a1bebaad89d21556fe1b64b199870608839d3d9d4b22c"
 )
 READABLE_SHA256 = (
-    "3505d7c55e1a0a0cb2fec298e08856248c109d3153e9b085939f023ed18bbf0a"
+    "2c180bcfdedaf654fa622c61847634d7c441f3c4a0cf6bed48d2c1afbb42a874"
 )
 
 
@@ -106,6 +106,36 @@ def validate_inputs() -> None:
             raise RuntimeError("pronunciation database headword metadata is stale")
         if metadata.get("records") != str(records):
             raise RuntimeError("pronunciation database record metadata is stale")
+        if database.execute(
+            "SELECT COUNT(*) FROM pronunciations WHERE language_code != 'en'"
+        ).fetchone()[0]:
+            raise RuntimeError("bundled English database contains another language")
+        expected_readables = {
+            "cat": "KAT",
+            "colonel": "KER-nuhl",
+            "cough": "KAWF",
+            "queue": "KYOO",
+            "rhythm": "RIH-thuhm",
+            "rough": "RUHF",
+            "though": "THOH",
+            "thought": "THAWT",
+            "through": "THROO",
+            "wednesday": "WEHNZ-day",
+        }
+        for word, readable in expected_readables.items():
+            if not database.execute(
+                "SELECT 1 FROM pronunciations WHERE word=? AND simple=? LIMIT 1",
+                (word, readable),
+            ).fetchone():
+                raise RuntimeError(
+                    f"bundled English readable regression for {word!r}"
+                )
+        readable_count = database.execute(
+            "SELECT COUNT(*) FROM pronunciations "
+            "WHERE simple IS NOT NULL AND simple != ''"
+        ).fetchone()[0]
+        if readable_count < records * 0.99:
+            raise RuntimeError("bundled English readable coverage is below 99%")
     finally:
         database.close()
     if sha256(database_path) != DATABASE_SHA256:
@@ -121,7 +151,9 @@ def validate_inputs() -> None:
             or pack_metadata.get("language_name") != "English"
             or pack_metadata.get("schema_version") != "8"
             or pack_metadata.get("readable_converter") != "readable.tsv"
-            or pack_metadata.get("g2p_model") != "g2p.bin"):
+            or pack_metadata.get("readable_sha256") != READABLE_SHA256
+            or pack_metadata.get("g2p_model") != "g2p.bin"
+            or pack_metadata.get("g2p_sha256") != G2P_SHA256):
         raise RuntimeError("bundled English pack sidecar is invalid")
     if pack_metadata.get("aliases") != metadata.get("language_aliases"):
         raise RuntimeError("bundled pack sidecar does not match database metadata")
@@ -136,10 +168,19 @@ def validate_inputs() -> None:
         raise RuntimeError("runtime version does not match release")
 
     readable_path = ROOT / "data/en/readable.tsv"
-    if not readable_path.read_text(encoding="utf-8").startswith(
-        "ipa\treadable\n"
-    ):
+    readable_lines = readable_path.read_text(encoding="utf-8").splitlines()
+    if not readable_lines or readable_lines[0] != "ipa\treadable":
         raise RuntimeError("bundled readable converter is invalid")
+    mappings = {}
+    for line in readable_lines[1:]:
+        if line.count("\t") != 1:
+            raise RuntimeError("bundled readable converter has a malformed row")
+        ipa, readable = line.split("\t")
+        if not ipa or not readable or ipa in mappings:
+            raise RuntimeError("bundled readable converter has an invalid mapping")
+        mappings[ipa] = readable
+    if mappings.get("θ") != "th" or mappings.get("ð") != "th":
+        raise RuntimeError("bundled English dental-fricative mappings are invalid")
     if sha256(readable_path) != READABLE_SHA256:
         raise RuntimeError("readable converter failed the release integrity check")
 

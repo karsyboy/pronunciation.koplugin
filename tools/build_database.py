@@ -10,9 +10,11 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import unicodedata
 import urllib.error
 import urllib.request
@@ -103,6 +105,161 @@ IPA_READABLE_FALLBACK = {
     "tʃ": "ch", "dʒ": "j", "ts": "ts", "dz": "dz",
 }
 
+# English readable pronunciation is a primary output, so it uses a stable
+# phonetic mapping instead of learning letter chunks from English spelling.
+# The latter turns common digraphs into misleading values (for example,
+# learning "h" for both /θ/ and /ð/). Longest entries must remain first.
+ENGLISH_IPA_PHONE_SPECS = (
+    ("tʃ", "ch", False), ("dʒ", "j", False),
+    ("aɪ", "eye", True), ("aʊ", "ow", True),
+    ("eɪ", "ay", True), ("oʊ", "oh", True),
+    ("əʊ", "oh", True), ("ɔɪ", "oy", True),
+    ("ɪə", "ear", True), ("eə", "air", True),
+    ("ɛə", "air", True), ("ʊə", "oor", True),
+    ("iː", "ee", True), ("uː", "oo", True),
+    ("ɑː", "ah", True), ("ɔː", "aw", True),
+    ("ɜː", "er", True), ("ɝː", "er", True),
+    ("n̩", "uhn", True), ("l̩", "uhl", True),
+    ("m̩", "uhm", True),
+    ("i", "ee", True), ("ɪ", "ih", True),
+    ("e", "eh", True), ("ɛ", "eh", True),
+    ("æ", "a", True), ("a", "ah", True),
+    ("ə", "uh", True), ("ɐ", "uh", True),
+    ("ʌ", "uh", True), ("ɜ", "er", True),
+    ("ɝ", "er", True), ("ɚ", "er", True),
+    ("ɑ", "ah", True), ("ɒ", "ah", True),
+    ("ɔ", "aw", True), ("o", "oh", True),
+    ("ʊ", "uu", True), ("u", "oo", True),
+    ("ɵ", "uh", True), ("ɞ", "ur", True),
+    ("p", "p", False), ("b", "b", False),
+    ("t", "t", False), ("d", "d", False),
+    ("k", "k", False), ("ɡ", "g", False), ("g", "g", False),
+    ("f", "f", False), ("v", "v", False),
+    ("θ", "th", False), ("ð", "th", False),
+    ("s", "s", False), ("z", "z", False),
+    ("ʃ", "sh", False), ("ʒ", "zh", False),
+    ("h", "h", False), ("x", "kh", False),
+    ("m", "m", False), ("n", "n", False),
+    ("ɲ", "ny", False), ("ŋ", "ng", False),
+    ("l", "l", False), ("ɫ", "l", False), ("ʎ", "ly", False),
+    ("ɹ", "r", False), ("r", "r", False),
+    ("ɻ", "r", False), ("ɾ", "r", False), ("ʁ", "r", False),
+    ("j", "y", False), ("w", "w", False),
+    ("ɟ", "gy", False), ("β", "v", False), ("ɣ", "gh", False),
+    ("ʍ", "hw", False), ("ʔ", "", False),
+)
+ENGLISH_IPA_ONSETS = {
+    "pr", "pl", "pj", "br", "bl", "bj", "tr", "tw", "tj",
+    "dr", "dw", "dj", "kr", "kl", "kw", "kj", "ɡr", "ɡl",
+    "ɡw", "ɡj", "gr", "gl", "gw", "gj", "fr", "fl", "fj",
+    "vr", "vj", "θr", "ʃr", "tʃr", "dʒr", "sp", "st", "sk",
+    "sm", "sn", "sl", "sw", "spr", "spl", "str", "skr", "skw",
+}
+ENGLISH_IPA_LAX_VOWELS = {"ɪ", "ɛ", "æ", "ə", "ʌ", "ʊ"}
+ENGLISH_IPA_IGNORABLE = {
+    ".", "-", " ", "(", ")", "|", "‿", "ː", "ˑ", "̆",
+    "ʰ", "ʲ", "ʷ", "ᵊ", "ⁿ", "ʼ", "̚", "̠", "̪", "̻",
+    "̝", "̞", "̯", "̤", "̥", "̬", "̃",
+}
+
+
+def english_readable_from_ipa(ipa: str) -> str | None:
+    """Convert English IPA without silently discarding unknown phones."""
+    core = ipa.strip()
+    if core[:1] in {"/", "["}:
+        core = core[1:]
+    if core[-1:] in {"/", "]"}:
+        core = core[:-1]
+    core = core.replace("͡", "")
+    phones: list[dict] = []
+    position = 0
+    pending_stress: int | None = None
+    pending_break = False
+    while position < len(core):
+        character = core[position]
+        if character == "ˈ":
+            pending_stress = 1
+            position += 1
+            continue
+        if character == "ˌ":
+            pending_stress = 2
+            position += 1
+            continue
+        matched = next(
+            (spec for spec in ENGLISH_IPA_PHONE_SPECS
+             if core.startswith(spec[0], position)),
+            None,
+        )
+        if matched:
+            symbol, readable, vowel = matched
+            phone = {
+                "symbol": symbol,
+                "readable": readable,
+                "vowel": vowel,
+                "break_before": pending_break,
+                "stress": pending_stress if vowel else None,
+            }
+            if vowel:
+                pending_stress = None
+            pending_break = False
+            phones.append(phone)
+            position += len(symbol)
+            continue
+        if character in {".", "-", " "}:
+            pending_break = True
+        if character not in ENGLISH_IPA_IGNORABLE:
+            return None
+        position += 1
+
+    vowels = [index for index, phone in enumerate(phones) if phone["vowel"]]
+    if not phones or not vowels:
+        return None
+    starts = [0]
+    for previous_vowel, vowel_index in zip(vowels, vowels[1:]):
+        explicit = next((
+            index for index in range(vowel_index, previous_vowel, -1)
+            if phones[index]["break_before"]
+        ), None)
+        if explicit is not None:
+            starts.append(explicit)
+            continue
+        cluster_length = vowel_index - previous_vowel - 1
+        maximum = min(3, cluster_length)
+        previous = phones[previous_vowel]
+        if previous["stress"] == 1 and previous["symbol"] in ENGLISH_IPA_LAX_VOWELS:
+            maximum = min(maximum, cluster_length - 1)
+        onset_length = 0
+        for length in range(maximum, 0, -1):
+            first = vowel_index - length
+            onset = "".join(
+                phone["symbol"] for phone in phones[first:vowel_index]
+            )
+            if ((length == 1 and onset != "ŋ")
+                    or (length > 1 and onset in ENGLISH_IPA_ONSETS)):
+                onset_length = length
+                break
+        starts.append(vowel_index - onset_length)
+
+    has_stress = any(phone["stress"] for phone in phones)
+    syllables = []
+    for index, first in enumerate(starts):
+        last = starts[index + 1] if index + 1 < len(starts) else len(phones)
+        syllable_phones = phones[first:last]
+        text = "".join(
+            "i" if phone["symbol"] == "ɪ" and phone["stress"] == 1
+            else phone["readable"]
+            for phone in syllable_phones
+        )
+        stress = next(
+            (phone["stress"] for phone in syllable_phones if phone["stress"]),
+            None,
+        )
+        if stress == 1 or (not has_stress and index == 0):
+            text = text.upper()
+        if text:
+            syllables.append(text)
+    return "-".join(syllables) or None
+
 
 def _graphemes(word: str) -> list[str]:
     graphemes = []
@@ -137,17 +294,26 @@ def _wikipron_pairs(source: WikiPronSource):
 
 def learn_readable_converter(language: WikiPronLanguage) -> dict[str, str]:
     """Learn deterministic IPA-to-readable chunks from WikiPron alignments."""
+    if language.code == "en":
+        return {
+            symbol: readable
+            for symbol, readable, _vowel in ENGLISH_IPA_PHONE_SPECS
+            if readable
+        }
     candidates: dict[str, Counter[str]] = defaultdict(Counter)
     inventory = set()
     for source in language.sources:
         for word, phones in _wikipron_pairs(source):
-            inventory.update(phones)
+            normalized_phones = [phone.lstrip("ˈˌ") for phone in phones]
+            inventory.update(phone for phone in normalized_phones if phone)
             graphemes = _graphemes(word)
             if not graphemes or len(graphemes) > len(phones) * 3:
                 continue
             phone_count = len(phones)
             grapheme_count = len(graphemes)
-            for index, phone in enumerate(phones):
+            for index, phone in enumerate(normalized_phones):
+                if not phone:
+                    continue
                 start = (index * grapheme_count + phone_count // 2) // phone_count
                 finish = (
                     (index + 1) * grapheme_count + phone_count // 2
@@ -214,11 +380,14 @@ def parse_wikipron(source: WikiPronSource, converter: dict[str, str]):
         ipa = "".join(phones)
         if not word or not ipa:
             continue
+        simple = (english_readable_from_ipa(ipa)
+                  if source.language_code == "en"
+                  else readable_from_phones(phones, converter))
         yield (
             word,
             f"/{ipa}/",
             None,
-            readable_from_phones(phones, converter),
+            simple,
             "WikiPron/Wiktionary",
             78,
             f"Exact {source.transcription} {location} IPA mined from "
@@ -611,13 +780,17 @@ def build_database(
 ) -> tuple[int, int]:
     output.parent.mkdir(parents=True, exist_ok=True)
     converter_path = output.parent / "readable.tsv"
-    converter = write_readable_converter(language, converter_path)
+    staged_converter = converter_path.with_name(converter_path.name + ".building")
+    if staged_converter.exists():
+        staged_converter.unlink()
+    converter = write_readable_converter(language, staged_converter)
     temporary = output.with_name(output.name + ".tmp")
     if temporary.exists():
         temporary.unlink()
 
-    connection = sqlite3.connect(temporary)
+    connection = None
     try:
+        connection = sqlite3.connect(temporary)
         connection.execute("PRAGMA journal_mode=OFF")
         connection.execute("PRAGMA synchronous=OFF")
         connection.executescript(SCHEMA)
@@ -663,7 +836,7 @@ def build_database(
             ),
             "headwords": str(headwords),
             "records": str(records),
-            "converter": "tools/build_database.py discovery profile schema v5",
+            "converter": "tools/build_database.py discovery profile schema v6",
             "wikipron_release": wikipron_release,
             "wikipron_revision": wikipron_revision,
             "wikipron_url": WIKIPRON_URL,
@@ -674,6 +847,8 @@ def build_database(
             "wikipron_profiles": str(len(wikipron_sources)),
             "readable_converter": "readable.tsv",
             "readable_converter_method": (
+                "English-specific deterministic IPA syllabification"
+                if language.code == "en" else
                 "WikiPron proportional segment-to-grapheme frequency alignment"
             ),
             "readable_converter_mappings": str(len(converter)),
@@ -699,10 +874,18 @@ def build_database(
         check = connection.execute("PRAGMA quick_check").fetchone()[0]
         if check != "ok":
             raise RuntimeError(f"SQLite quick_check failed: {check}")
+    except BaseException:
+        if temporary.exists():
+            temporary.unlink()
+        if staged_converter.exists():
+            staged_converter.unlink()
+        raise
     finally:
-        connection.close()
+        if connection:
+            connection.close()
 
     os.replace(temporary, output)
+    os.replace(staged_converter, converter_path)
     write_pack_metadata(language, output.parent / "pack.tsv")
     return headwords, records
 
@@ -716,9 +899,11 @@ def write_pack_metadata(language: WikiPronLanguage, output: Path) -> None:
         "aliases": ",".join(language.aliases),
         "schema_version": "8",
         "readable_converter": "readable.tsv",
+        "readable_sha256": sha256(output.with_name("readable.tsv")),
     }
     if output.with_name("g2p.bin").is_file():
         values["g2p_model"] = "g2p.bin"
+        values["g2p_sha256"] = sha256(output.with_name("g2p.bin"))
     temporary = output.with_name(output.name + ".tmp")
     try:
         with temporary.open("w", encoding="utf-8", newline="") as sidecar:
@@ -734,6 +919,28 @@ def write_pack_metadata(language: WikiPronLanguage, output: Path) -> None:
 
 def default_database_path(data_dir: Path, code: str) -> Path:
     return data_dir / code / "pronunciations.sqlite3"
+
+
+def publish_language_pack(staged: Path, destination: Path) -> None:
+    """Replace one complete pack, restoring the old pack on rename failure."""
+    backup = destination.with_name(destination.name + ".previous")
+    if backup.exists():
+        if destination.exists():
+            shutil.rmtree(backup)
+        else:
+            os.replace(backup, destination)
+    moved_old = False
+    try:
+        if destination.exists():
+            os.replace(destination, backup)
+            moved_old = True
+        os.replace(staged, destination)
+    except BaseException:
+        if moved_old and not destination.exists():
+            os.replace(backup, destination)
+        raise
+    if moved_old:
+        shutil.rmtree(backup)
 
 
 def main() -> None:
@@ -871,33 +1078,62 @@ def main() -> None:
     )
     for code in requested:
         language = languages[code]
-        output = args.output or default_database_path(args.data_dir, code)
-        headwords, records = build_database(
-            language,
-            language.sources,
-            output,
-            wikipron_release,
-            wikipron_revision,
-            args.generated_date,
-            supplement=args.supplement if code == "en" else None,
-        )
-        print(f"built {output}: {headwords} headwords, {records} records")
-        if not args.no_g2p:
-            built = build_language_g2p(
-                code,
-                language.name,
-                args.data_dir,
-                args.sources_dir / "mfa-models",
-                mfa_models,
-                output=output.parent / "g2p.bin",
+        # Build the complete default pack beside its destination. A failed
+        # database/model/converter rebuild leaves the previous installed pack
+        # untouched, and a successful no-G2P rebuild cannot retain stale model
+        # files from an earlier version.
+        staged_directory = None
+        if args.output:
+            output = args.output
+        else:
+            args.data_dir.mkdir(parents=True, exist_ok=True)
+            staged_directory = Path(tempfile.mkdtemp(
+                prefix=f".{code}.building-", dir=args.data_dir,
+            ))
+            output = staged_directory / "pronunciations.sqlite3"
+        try:
+            headwords, records = build_database(
+                language,
+                language.sources,
+                output,
+                wikipron_release,
+                wikipron_revision,
+                args.generated_date,
+                supplement=args.supplement if code == "en" else None,
             )
-            if not built:
-                message = (
-                    "No compatible MFA/Pynini G2P model is published for "
-                    f"{language.name} ({code}); the database and readable "
-                    "converter were built successfully."
+            built = False
+            if not args.no_g2p:
+                built = build_language_g2p(
+                    code,
+                    language.name,
+                    args.data_dir,
+                    args.sources_dir / "mfa-models",
+                    mfa_models,
+                    output=output.parent / "g2p.bin",
                 )
-                print(f"warning: {message}", file=sys.stderr)
+                if not built:
+                    message = (
+                        "No compatible MFA/Pynini G2P model is published for "
+                        f"{language.name} ({code}); the database and readable "
+                        "converter were built successfully."
+                    )
+                    print(f"warning: {message}", file=sys.stderr)
+            if args.output and (args.no_g2p or not built):
+                # The explicit single-pack output path cannot use a whole
+                # directory swap, but a completed database-only build must
+                # still stop advertising or retaining an older model.
+                for stale_name in ("g2p.bin", "g2p.SOURCE.txt"):
+                    output.with_name(stale_name).unlink(missing_ok=True)
+                write_pack_metadata(language, output.parent / "pack.tsv")
+            if staged_directory:
+                final_directory = args.data_dir / code
+                publish_language_pack(staged_directory, final_directory)
+                staged_directory = None
+                output = final_directory / "pronunciations.sqlite3"
+            print(f"built {output}: {headwords} headwords, {records} records")
+        finally:
+            if staged_directory and staged_directory.exists():
+                shutil.rmtree(staged_directory)
 
 
 if __name__ == "__main__":
